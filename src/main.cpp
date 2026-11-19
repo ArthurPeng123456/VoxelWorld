@@ -1,4 +1,4 @@
-#include "collision.hpp"
+#include "world.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -88,87 +88,6 @@ Options options(int argc, char** argv) {
     return opts;
 }
 
-struct WorldStats {
-    BuildStats build;
-    double selectMs{}, updateMs{}, physicsLoadMs{};
-};
-
-class World {
-public:
-    World(const Planet& planet, Method method, bool morton)
-        : physics(method, chunks), planet_(planet), method_(method), morton_(morton) {}
-
-    WorldStats update(const std::vector<Vec>& invokers, bool global) {
-        WorldStats stats;
-        const auto start = Clock::now();
-        const auto layout = selectChunks(invokers, global);
-        stats.selectMs = milliseconds(start);
-        for (auto it = chunks.begin(); it != chunks.end();) {
-            const auto found = layout.find(it->first);
-            if (found != layout.end() && it->second->neighborhood == neighborhood(layout, it->first)) {
-                ++it;
-                continue;
-            }
-            const auto tick = Clock::now();
-            physics.removeTerrain(it->first);
-            ++stats.build.removed;
-            it = chunks.erase(it);
-            stats.physicsLoadMs += milliseconds(tick);
-        }
-        for (const auto& entry : layout) {
-            if (chunks.find(entry.first) != chunks.end()) continue;
-            auto chunk = buildChunk(planet_, layout, entry.first, method_, morton_, stats.build);
-            auto inserted = chunks.emplace(entry.first, std::move(chunk));
-            const auto tick = Clock::now();
-            physics.addTerrain(*inserted.first->second);
-            stats.physicsLoadMs += milliseconds(tick);
-        }
-        stats.updateMs = milliseconds(start);
-        return stats;
-    }
-
-    std::array<int, 4> lodCounts() const {
-        std::array<int, 4> result{};
-        for (const auto& entry : chunks) ++result[entry.second->lod];
-        return result;
-    }
-    std::size_t fieldBytes() const {
-        std::size_t result = 0;
-        for (const auto& entry : chunks) if (entry.second->field) result += entry.second->field->bytes();
-        return result;
-    }
-    std::size_t meshBytes() const {
-        std::size_t result = 0;
-        for (const auto& entry : chunks) result += entry.second->mesh.capacity() * sizeof(Triangle);
-        return result;
-    }
-
-    Chunks chunks;
-    Physics physics;
-private:
-    const Planet& planet_;
-    Method method_;
-    bool morton_;
-};
-
-std::vector<Vec> positions(const Planet& planet, int count, int frame) {
-    std::vector<Vec> result;
-    for (int i = 0; i < count; ++i) result.push_back(planet.surface(planet.invokerDirection(i, frame)));
-    return result;
-}
-
-std::array<Vec, 3> frameAt(Vec up) {
-    const Vec reference = std::abs(up.z) < 0.9 ? Vec{0, 0, 1} : Vec{0, 1, 0};
-    const Vec x = unit(cross(reference, up));
-    return {x, cross(up, x), up};
-}
-
-Shape sampleShape(int kind, Vec up) {
-    if (kind == 1) return {ShapeKind::Sphere, {13, 0, 0}, frameAt(up)};
-    if (kind == 2) return {ShapeKind::Capsule, {9, 0, 12}, frameAt(up)};
-    return {ShapeKind::Box, {15, 11, 10}, frameAt(up)};
-}
-
 struct Query { int kind; Vec from, to; Shape shape; };
 
 std::vector<Query> queries(const Planet& planet, const std::vector<Vec>& invokers, int count, int frame,
@@ -226,9 +145,10 @@ std::ofstream createFile(const fs::path& path) {
     return stream;
 }
 
-void exportMesh(const fs::path& path, const Chunks& chunks) {
+void exportMesh(const fs::path& path, const Chunks& chunks, const std::vector<Vec>& invokers) {
     auto out = createFile(path);
     out << "# VoxelWorld Marching Cubes, world coordinates in meters\n";
+    for (const Vec p : invokers) out << "# invoker " << p.x << ' ' << p.y << ' ' << p.z << '\n';
     std::size_t index = 1;
     for (const auto& entry : chunks) {
         const auto& chunk = *entry.second;
@@ -258,7 +178,7 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
                  const QueryResults* meshReference) {
     Planet planet(opts.seed);
     World world(planet, method, opts.morton);
-    auto invokers = positions(planet, opts.invokers, 0);
+    auto invokers = invokerPositions(planet, opts.invokers, 0);
     const WorldStats initial = world.update(invokers, opts.global);
     logBuild(frames, method, -1, initial, world, 0, 0);
     spawn(world, planet, opts.bodies, invokers);
@@ -276,7 +196,7 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
     std::size_t peakCollision = world.fieldBytes() + world.physics.terrainBytes();
     for (int frame = 0; frame < opts.frames; ++frame) {
         WorldStats stats;
-        const auto moving = positions(planet, opts.invokers, frame);
+        const auto moving = invokerPositions(planet, opts.invokers, frame);
         if (frame > 0 && frame % opts.streamEvery == 0) {
             stats = world.update(moving, opts.global);
             updates.push_back(stats.updateMs);
@@ -304,7 +224,10 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
         steps.push_back(elapsed);
         logBuild(frames, method, frame, stats, world, elapsed, contacts);
     }
-    if (opts.obj) exportMesh(opts.output / (std::string(name(method)) + ".obj"), world.chunks);
+    if (opts.obj) {
+        exportMesh(opts.output / (std::string(name(method)) + ".obj"), world.chunks,
+                   invokerPositions(planet, opts.invokers, (opts.frames - 1) / opts.streamEvery * opts.streamEvery));
+    }
 
     int below = 0;
     for (int i = 0; i < opts.bodies; ++i) below += planet.sdf(world.physics.bodyPosition(i)) < -1;
@@ -370,11 +293,11 @@ std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false) 
 
 void selfTest() {
     const Planet planet(42);
-    const auto first = positions(planet, 1, 0), both = positions(planet, 2, 0);
+    const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
     const auto one = selectChunks(first, false), two = selectChunks(both, false);
     check(two.size() > one.size(), "two invokers load additional chunks");
     for (const auto& entry : one) check(two.at(entry.first) <= entry.second, "nearest invoker wins");
-    check(neighborhood(two, keyAt(first[0])) != neighborhood(selectChunks(positions(planet, 2, 25), false),
+    check(neighborhood(two, keyAt(first[0])) != neighborhood(selectChunks(invokerPositions(planet, 2, 25), false),
                                                            keyAt(first[0])), "moving invokers change LOD");
     check(std::abs(planet.sdf(planet.surface(both[0] / length(both[0])))) < 1e-4, "planet surface is zero");
 

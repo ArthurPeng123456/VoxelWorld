@@ -74,7 +74,7 @@ public:
     double elevation(Vec direction) const;
     float sdf(Vec p) const;
     Vec surface(Vec direction) const { return direction * (planetRadius + elevation(direction)); }
-    Vec invokerDirection(int index, int frame) const;
+    Vec invokerDirection(int index, double frame) const;
 private:
     struct Crater { Vec axis; double width, depth, rim; };
     std::vector<Crater> craters_;

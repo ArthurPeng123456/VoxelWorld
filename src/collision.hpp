@@ -25,6 +25,11 @@ struct Hit {
     bool initial{};
 };
 
+struct BodyPose {
+    Vec position;
+    std::array<Vec, 3> axes;
+};
+
 using Chunks = std::map<Key, std::unique_ptr<Chunk>>;
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to);
 Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to);
@@ -37,6 +42,7 @@ public:
     void removeTerrain(Key key);
     std::size_t addBody(Shape shape, Vec position, Vec velocity = {});
     Vec bodyPosition(std::size_t index) const;
+    BodyPose bodyPose(std::size_t index) const;
     double bodySpeed(std::size_t index) const;
     int terrainContacts() const;
     void step(double dt, bool radialGravity, Vec gravity = {0, 0, -9.81});

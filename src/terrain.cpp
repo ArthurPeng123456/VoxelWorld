@@ -78,7 +78,7 @@ float Planet::sdf(Vec p) const {
     return float(std::clamp(r - planetRadius - elevation(unit(p)), -double(background), double(background)));
 }
 
-Vec Planet::invokerDirection(int index, int frame) const {
+Vec Planet::invokerDirection(int index, double frame) const {
     const Vec axis = craters_[std::size_t(index) % craters_.size()].axis;
     const Vec reference = std::abs(axis.z) < 0.9 ? Vec{0, 0, 1} : Vec{0, 1, 0};
     const Vec tangent = unit(cross(reference, axis));

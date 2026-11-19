@@ -599,6 +599,13 @@ std::size_t Physics::addBody(Shape shape, Vec position, Vec velocity) {
 }
 
 Vec Physics::bodyPosition(std::size_t i) const { return voxelVec(impl_->bodies.at(i).body->getWorldTransform().getOrigin()); }
+
+BodyPose Physics::bodyPose(std::size_t index) const {
+    const auto& transform = impl_->bodies.at(index).body->getWorldTransform();
+    const auto& basis = transform.getBasis();
+    return {voxelVec(transform.getOrigin()), {voxelVec(basis.getColumn(0)), voxelVec(basis.getColumn(1)), voxelVec(basis.getColumn(2))}};
+}
+
 double Physics::bodySpeed(std::size_t i) const { return impl_->bodies.at(i).body->getLinearVelocity().length(); }
 
 int Physics::terrainContacts() const {

@@ -11,7 +11,42 @@
 
 场查询与刚体接触共用三线性场。RayCast 按 DDA 遍历单元并求第一个零点。ShapeCast 对平移的球、胶囊和定向盒做时间与空间细分，记录细分后仍不确定的结果。字段刚体碰撞通过自定义 Bullet dispatcher 算法生成持久接触，多点约束、刚体间碰撞和求解交给 Bullet。模拟使用 60 Hz 固定步长和独立施加给每个刚体的径向重力。
 
-## 构建和运行
+## Windows 查看器
+
+双击打包目录里的 `VoxelWorldViewer.exe`。查看器使用 Windows 原生 Direct3D 12，渲染实时生成的 Marching Cubes 网格，并用当前碰撞方案模拟刚体。默认同步两条移动 Invoker 路径。
+
+| 操作 | 快捷键 |
+| --- | --- |
+| 切换 Mesh BVH、VoxelField、HashDAG、OpenVDB | `1`、`2`、`3`、`4` |
+| 切换全星球和地表视角 | `F` |
+| 绕视角中心旋转和缩放 | 左键拖动、滚轮 |
+| 跟随下一个移动 Invoker | `Tab` |
+| 开关 LOD 着色 | `L` |
+| 向当前 Invoker 附近投放一组球、胶囊和盒子 | `B` |
+| 暂停或重置模拟 | `Space`、`R` |
+
+切换后端会从同一种子重建场景和刚体。状态栏显示 LOD 块数、三角形数量、刚体数量和 LOD 更新耗时。命令行可用 `--seed`、`--invokers`、`--scheme` 和 `--morton`。设备创建失败时会尝试 Direct3D 12 的 WARP 软件渲染，也可用 `--warp` 强制启用。受组织应用控制管理的电脑可能需要管理员批准本地生成的可执行文件。
+
+### 在 Windows 上重新构建
+
+安装 Visual Studio 2022 或 2026，选择「使用 C++ 的桌面开发」、Windows SDK 和 CMake。在项目根目录的 PowerShell 中运行构建脚本。首次构建会下载并校验 Bullet3、OpenVDB、oneTBB 和 Imath 源码，编译 Win64 Release 版本。添加 `-Test` 还会执行本机 CTest。 [Visual Studio C++ 安装说明](https://learn.microsoft.com/en-us/cpp/build/vscpp-step-0-installation)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+.\build-windows-native\dist\VoxelWorldViewer.exe
+.\build-windows-native\dist\voxel_world.exe --scheme all --out results-windows
+```
+
+### 浏览器预览
+
+双击生成的 `VoxelWorld.html` 可离线查看同一份 Marching Cubes 网格。支持全星球、地表、Invoker 位置切换和 LOD 着色。此预览展示导出时的地形快照，实时碰撞和动态块更新由原生查看器执行。预览把坐标量化到 1 米以减小文件体积。
+
+```bash
+./build/voxel_world --scheme mesh --global --frames 1 --warmup 0 --bodies 0 --obj --out results-windows-preview
+python scripts/make-preview.py results-windows-preview/mesh.obj results-windows-preview/VoxelWorld.html
+```
+
+### Linux / WSL 的无窗口基准
 
 已验证 Windows 下的 WSL Ubuntu 20.04。默认构建从带 SHA-256 校验的 Bullet3 **3.24** 源码包编译 CPU 库。使用系统 Bullet SDK 时可加 `-DVOXEL_SYSTEM_BULLET=ON`。 [Bullet3 源码](https://github.com/bulletphysics/bullet3) · [Debian 源码包](https://packages.debian.org/source/bookworm/bullet)
 
