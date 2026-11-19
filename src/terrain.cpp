@@ -98,13 +98,10 @@ const char* name(Method method) {
 
 double Cell::value(Vec p) const {
     const Vec t = (p - origin) / spacing;
-    double result = 0;
-    for (int i = 0; i < 8; ++i) {
-        result += values[i] * ((i & 1) ? t.x : 1 - t.x)
-                             * ((i & 2) ? t.y : 1 - t.y)
-                             * ((i & 4) ? t.z : 1 - t.z);
-    }
-    return result;
+    const auto lerp = [](double a, double b, double fraction) { return a + (b - a) * fraction; };
+    const double z0 = lerp(lerp(values[0], values[1], t.x), lerp(values[2], values[3], t.x), t.y);
+    const double z1 = lerp(lerp(values[4], values[5], t.x), lerp(values[6], values[7], t.x), t.y);
+    return lerp(z0, z1, t.z);
 }
 
 Vec Cell::gradient(Vec p) const {
@@ -124,11 +121,7 @@ Vec Cell::gradient(Vec p) const {
 }
 
 Cell Chunk::cell(Key index) const {
-    Cell result{box.lo + asVec(index) * spacing, spacing, {}};
-    for (int i = 0; i < 8; ++i) {
-        result.values[i] = field->get(index.x + (i & 1), index.y + ((i >> 1) & 1), index.z + (i >> 2));
-    }
-    return result;
+    return {box.lo + asVec(index) * spacing, spacing, field->corners(index)};
 }
 
 Key Chunk::cellIndex(Vec p) const {
@@ -289,22 +282,33 @@ void stitchFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
 
 }  // namespace
 
-void meshChunk(Chunk& chunk) {
+void meshChunk(Chunk& chunk, bool indexField) {
     // The table uses VTK's corner order and swaps the final two vertical edges.
     constexpr int corner[8] = {0, 1, 3, 2, 4, 5, 7, 6};
     constexpr int edge[12][2] = {{0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7},
                                   {7, 6}, {6, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    static_assert(fineCells <= 32);
+    if (indexField) chunk.rows.resize(std::size_t(chunk.cells) * chunk.cells);
     for (int z = 0; z < chunk.cells; ++z) for (int y = 0; y < chunk.cells; ++y) {
+        auto* row = indexField ? &chunk.rows[std::size_t(z) * chunk.cells + y] : nullptr;
         for (int x = 0; x < chunk.cells; ++x) {
             const Cell cell = chunk.cell({x, y, z});
             int mask = 0;
             for (int i = 0; i < 8; ++i) if (cell.values[corner[i]] < 0) mask |= 1 << i;
+            if (row) {
+                if (mask == 255 && cell.maximum() < -1e-6) {
+                    row->solid |= std::uint32_t(1) << x;
+                    continue;
+                }
+                if (mask == 0 && cell.minimum() > 1e-6) continue;
+                row->surface |= std::uint32_t(1) << x;
+                const Box active{cell.origin, cell.origin + splat(cell.spacing)};
+                if (chunk.surfaceBounds) {
+                    auto& prior = *chunk.surfaceBounds;
+                    prior = {min(prior.lo, active.lo), max(prior.hi, active.hi)};
+                } else chunk.surfaceBounds = active;
+            }
             if (mask == 0 || mask == 255) continue;
-            const Box active{cell.origin, cell.origin + splat(cell.spacing)};
-            if (chunk.surfaceBounds) {
-                auto& prior = *chunk.surfaceBounds;
-                prior = {min(prior.lo, active.lo), max(prior.hi, active.hi)};
-            } else chunk.surfaceBounds = active;
             const auto& table = marchingCases[mask];
             for (int k = 0; table[k] >= 0; k += 3) {
                 Triangle triangle;
@@ -332,7 +336,7 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     const int count = cells + 1;
     const auto box = bounds(key);
     auto chunk = std::make_unique<Chunk>(Chunk{key, lod, cells, box, chunkSize / cells,
-                                               neighborhood(layout, key), {}, {}, {}});
+                                               neighborhood(layout, key), {}, {}, {}, {}});
     auto start = Clock::now();
     std::vector<float> samples;
     samples.reserve(std::size_t(count) * count * count);
@@ -351,7 +355,7 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     chunk->field = makeStorage(method, count, samples, morton, chunk->spacing, box.lo);
     stats.storageMs += milliseconds(start);
     start = Clock::now();
-    meshChunk(*chunk);
+    meshChunk(*chunk, method != Method::Mesh);
     stitchFaces(*chunk, planet, layout);
     stats.meshMs += milliseconds(start);
     if (method == Method::Mesh) chunk->field.reset();

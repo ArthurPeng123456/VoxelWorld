@@ -7,6 +7,15 @@
 #include <unordered_map>
 
 namespace voxel {
+
+std::array<float, 8> Storage::corners(Key index) const {
+    std::array<float, 8> result{};
+    for (int i = 0; i < 8; ++i) {
+        result[i] = get(index.x + (i & 1), index.y + ((i >> 1) & 1), index.z + (i >> 2));
+    }
+    return result;
+}
+
 namespace {
 
 std::size_t linear(int n, int x, int y, int z) {
@@ -27,6 +36,21 @@ public:
         }
     }
     float get(int x, int y, int z) const override { return values_[index(x, y, z)]; }
+    std::array<float, 8> corners(Key p) const override {
+        if (!morton_) {
+            const auto first = linear(count_, p.x, p.y, p.z);
+            const auto nextZ = first + std::size_t(count_) * count_;
+            return {values_[first], values_[first + 1], values_[first + count_], values_[first + count_ + 1],
+                    values_[nextZ], values_[nextZ + 1], values_[nextZ + count_], values_[nextZ + count_ + 1]};
+        }
+        if (((p.x | p.y | p.z) & 1) == 0) {
+            const auto start = index(p.x, p.y, p.z);
+            std::array<float, 8> result;
+            std::copy_n(values_.data() + start, 8, result.data());
+            return result;
+        }
+        return Storage::corners(p);
+    }
     std::size_t bytes() const override { return sizeof(*this) + values_.capacity() * sizeof(float); }
 private:
     std::size_t index(int x, int y, int z) const {
@@ -86,17 +110,37 @@ public:
         values_.shrink_to_fit();
     }
     float get(int x, int y, int z) const override {
+        return sample(root_, size_ / 2, {x, y, z});
+    }
+    std::array<float, 8> corners(Key p) const override {
+        const int differing = (p.x ^ (p.x + 1)) | (p.y ^ (p.y + 1)) | (p.z ^ (p.z + 1));
         NodeId node = root_;
-        for (int bit = size_ / 2; !(node & leafTag); bit /= 2) {
-            const int child = ((x & bit) != 0) | (((y & bit) != 0) << 1) | (((z & bit) != 0) << 2);
-            node = nodes_[node][child];
+        int bit = size_ / 2;
+        for (; bit > differing && !(node & leafTag); bit /= 2) node = descend(node, bit, p);
+        std::array<float, 8> result;
+        if (node & leafTag) {
+            result.fill(values_[node & ~leafTag]);
+        } else if (bit == 1) {
+            for (int i = 0; i < 8; ++i) result[i] = values_[nodes_[node][i] & ~leafTag];
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                result[i] = sample(node, bit, {p.x + (i & 1), p.y + ((i >> 1) & 1), p.z + (i >> 2)});
+            }
         }
-        return values_[node & ~leafTag];
+        return result;
     }
     std::size_t bytes() const override {
         return sizeof(*this) + nodes_.capacity() * sizeof(Children) + values_.capacity() * sizeof(float);
     }
 private:
+    NodeId descend(NodeId node, int bit, Key p) const {
+        const int child = ((p.x & bit) != 0) | (((p.y & bit) != 0) << 1) | (((p.z & bit) != 0) << 2);
+        return nodes_[node][child];
+    }
+    float sample(NodeId node, int bit, Key p) const {
+        for (; !(node & leafTag); bit /= 2) node = descend(node, bit, p);
+        return values_[node & ~leafTag];
+    }
     static constexpr NodeId leafTag = NodeId(1) << 31;
     std::vector<Children> nodes_;
     std::vector<float> values_;
@@ -128,6 +172,21 @@ public:
         access_ = std::make_unique<ChunkGrid::ConstAccessor>(grid_->getConstAccessor());
     }
     float get(int x, int y, int z) const override { return access_->getValue(openvdb::Coord(x, y, z)); }
+    std::array<float, 8> corners(Key p) const override {
+        using Leaf = ChunkGrid::TreeType::LeafNodeType;
+        if (p.x % Leaf::DIM != Leaf::DIM - 1 && p.y % Leaf::DIM != Leaf::DIM - 1 && p.z % Leaf::DIM != Leaf::DIM - 1) {
+            if (const auto* leaf = access_->probeConstLeaf(openvdb::Coord(p.x, p.y, p.z))) {
+                std::array<float, 8> result;
+                const auto first = Leaf::coordToOffset(openvdb::Coord(p.x, p.y, p.z));
+                for (int i = 0; i < 8; ++i) {
+                    result[i] = leaf->getValue(first + (i & 1) * Leaf::DIM * Leaf::DIM +
+                                               ((i >> 1) & 1) * Leaf::DIM + (i >> 2));
+                }
+                return result;
+            }
+        }
+        return Storage::corners(p);
+    }
     std::size_t bytes() const override { return sizeof(*this) + sizeof(*access_) + grid_->memUsage(); }
 private:
     ChunkGrid::Ptr grid_;

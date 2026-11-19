@@ -42,7 +42,9 @@ std::array<int, 4> World::lodCounts() const {
 
 std::size_t World::fieldBytes() const {
     std::size_t result = 0;
-    for (const auto& entry : chunks) if (entry.second->field) result += entry.second->field->bytes();
+    for (const auto& entry : chunks) {
+        if (entry.second->field) result += entry.second->field->bytes() + entry.second->rows.capacity() * sizeof(CellRow);
+    }
     return result;
 }
 

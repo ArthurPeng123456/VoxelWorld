@@ -24,14 +24,14 @@ struct Options {
     int queries{12};
     int bodies{48};
     int streamEvery{6};
-    bool morton{}, global{}, obj{}, selfTest{}, help{};
+    bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{};
     fs::path output{"results"};
 };
 
 void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
-              << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--self-test]\n"
+              << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
               << "Defaults: 90 frames, 6 warmup, 2 invokers, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -81,6 +81,7 @@ Options options(int argc, char** argv) {
         else if (arg == "--global") opts.global = true;
         else if (arg == "--obj") opts.obj = true;
         else if (arg == "--self-test") opts.selfTest = true;
+        else if (arg == "--capsule-stress") opts.capsuleStress = true;
         else if (arg == "--help" || arg == "-h") opts.help = true;
         else throw std::invalid_argument("Unknown argument: " + arg);
     }
@@ -88,10 +89,12 @@ Options options(int argc, char** argv) {
     return opts;
 }
 
-struct Query { int kind; Vec from, to; Shape shape; };
+struct Query { int kind; Vec from, to; Shape shape; int scenario{-1}; };
+
+constexpr const char* capsuleCases[] = {"tilted", "grazing", "cross_chunk", "clear_miss", "initial_overlap"};
 
 std::vector<Query> queries(const Planet& planet, const std::vector<Vec>& invokers, int count, int frame,
-                           std::uint64_t seed) {
+                           std::uint64_t seed, bool capsuleStress) {
     std::mt19937_64 rng(seed ^ (0xb65944d0259327d3ULL * std::uint64_t(frame + 1)));
     auto random = [&] { return (rng() >> 11) * 0x1p-53; };
     std::vector<Query> list;
@@ -103,6 +106,40 @@ std::vector<Query> queries(const Planet& planet, const std::vector<Vec>& invoker
                                                     + axes[1] * (1100 * (random() - 0.5)));
         const Vec surface = planet.surface(direction);
         const Vec tangent = frameAt(direction)[0] * (20 + 125 * random());
+        if (capsuleStress) {
+            const Vec along = unit(tangent);
+            const double tilt = (0.14 + 1.40 * random()) * (i % 2 == 0 ? 1 : -1);
+            const Vec axis = unit(direction * std::cos(tilt) + along * std::sin(tilt));
+            const Shape shape{ShapeKind::Capsule, {6 + 16 * random(), 0, 8 + 41 * random()}, frameAt(axis)};
+            const double height = shape.size.x + std::abs(dot(axis, direction)) * shape.size.z;
+            const int scenario = (i + frame) % int(std::size(capsuleCases));
+            Vec from, to;
+            switch (scenario) {
+                case 0:
+                    from = surface + direction * (height + 85) - tangent;
+                    to = surface - direction * 65 + tangent;
+                    break;
+                case 1:
+                    from = surface + direction * (height + 5.0) - along * 175;
+                    to = surface + direction * (height - 1.0) + along * 180;
+                    break;
+                case 2:
+                    // The path is longer than a chunk's diagonal.
+                    from = surface + direction * 460 - along * 1550;
+                    to = surface - direction * 115 + along * 1550;
+                    break;
+                case 3:
+                    from = surface + direction * 240 - tangent;
+                    to = surface + direction * 235 + tangent;
+                    break;
+                default:
+                    from = surface + direction * (height * 0.40);
+                    to = surface + direction * 150;
+                    break;
+            }
+            list.push_back({2, from, to, shape, scenario});
+            continue;
+        }
         const double height = i % 5 == 0 ? 750 : 130;
         const Vec from = surface + direction * height;
         const Vec to = (i + frame) % 4 == 0 ? from + tangent * 3 : surface - direction * 85 + tangent;
@@ -136,6 +173,28 @@ struct QueryMetrics {
     std::vector<Outcome> results;
     int hits{}, unresolved{}, initial{};
 };
+
+struct Agreement {
+    int mismatch{}, paired{};
+    double p95Distance{};
+};
+
+Agreement agreement(const QueryMetrics& mesh, const QueryMetrics& other) {
+    Agreement result;
+    std::vector<double> errors;
+    for (std::size_t j = 0; j < other.results.size(); ++j) {
+        const auto a = mesh.results[j], b = other.results[j];
+        if (b.state == Hit::State::Unresolved) continue;
+        result.mismatch += a.state != b.state;
+        if (a.state == Hit::State::Contact && b.state == Hit::State::Contact) {
+            errors.push_back(std::abs(a.pathPosition - b.pathPosition));
+        }
+    }
+    std::sort(errors.begin(), errors.end());
+    result.paired = int(errors.size());
+    result.p95Distance = percentile(errors, 0.95);
+    return result;
+}
 
 std::ofstream createFile(const fs::path& path) {
     std::ofstream stream(path);
@@ -172,10 +231,13 @@ void logBuild(std::ostream& out, Method method, int frame, const WorldStats& sta
         << ',' << stepMs << ',' << contacts << '\n';
 }
 
-using QueryResults = std::array<QueryMetrics, 4>;
+struct QueryResults {
+    std::array<QueryMetrics, 4> types;
+    std::array<QueryMetrics, std::size(capsuleCases)> capsules;
+};
 
 QueryResults run(const Options& opts, Method method, std::ostream& frames, std::ostream& summary,
-                 const QueryResults* meshReference) {
+                 const QueryResults* meshReference, std::ostream* capsuleReport) {
     Planet planet(opts.seed);
     World world(planet, method, opts.morton);
     auto invokers = invokerPositions(planet, opts.invokers, 0);
@@ -183,7 +245,7 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
     logBuild(frames, method, -1, initial, world, 0, 0);
     spawn(world, planet, opts.bodies, invokers);
     for (int i = 0; i < opts.warmup; ++i) {
-        for (const Query& q : queries(planet, invokers, opts.queries, i, opts.seed)) {
+        for (const Query& q : queries(planet, invokers, opts.queries, i, opts.seed, opts.capsuleStress)) {
             if (q.kind == 0) world.physics.ray(q.from, q.to);
             else world.physics.sweep(q.shape, q.from, q.to);
         }
@@ -204,17 +266,26 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
             totalRemoved += stats.build.removed;
             peakCollision = std::max(peakCollision, world.fieldBytes() + world.physics.terrainBytes());
         }
-        const auto workload = queries(planet, moving, opts.queries, frame, opts.seed);
+        const auto workload = queries(planet, moving, opts.queries, frame, opts.seed, opts.capsuleStress);
         for (const auto& q : workload) {
             const auto timer = Clock::now();
             const Hit result = q.kind == 0 ? world.physics.ray(q.from, q.to) : world.physics.sweep(q.shape, q.from, q.to);
             const auto elapsed = milliseconds(timer) * 1000;
-            auto& m = metrics[q.kind];
+            const QueryMetrics::Outcome outcome{result.state, result.fraction * length(q.to - q.from)};
+            auto& m = metrics.types[q.kind];
             m.durations.push_back(elapsed);
-            m.results.push_back({result.state, result.fraction * length(q.to - q.from)});
+            m.results.push_back(outcome);
             m.hits += result.state == Hit::State::Contact;
             m.unresolved += result.state == Hit::State::Unresolved;
             m.initial += result.initial;
+            if (q.scenario >= 0) {
+                auto& c = metrics.capsules[q.scenario];
+                c.durations.push_back(elapsed);
+                c.results.push_back(outcome);
+                c.hits += result.state == Hit::State::Contact;
+                c.unresolved += result.state == Hit::State::Unresolved;
+                c.initial += result.initial;
+            }
         }
         const auto timer = Clock::now();
         world.physics.step(1.0 / 60, true);
@@ -238,26 +309,15 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
               << maxContacts << ", below analytic surface " << below << '\n';
     constexpr const char* labels[] = {"ray", "sphere", "capsule", "box"};
     for (int i = 0; i < 4; ++i) {
-        auto& m = metrics[i];
+        auto& m = metrics.types[i];
+        if (m.durations.empty()) continue;
         std::sort(m.durations.begin(), m.durations.end());
-        int mismatch = 0;
-        std::vector<double> hitErrors;
-        if (meshReference) {
-            for (std::size_t j = 0; j < m.results.size(); ++j) {
-                const auto a = (*meshReference)[i].results[j], b = m.results[j];
-                if (b.state == Hit::State::Unresolved) continue;
-                mismatch += a.state != b.state;
-                if (a.state == Hit::State::Contact && b.state == Hit::State::Contact) {
-                    hitErrors.push_back(std::abs(a.pathPosition - b.pathPosition));
-                }
-            }
-            std::sort(hitErrors.begin(), hitErrors.end());
-        }
+        const Agreement comparison = meshReference ? agreement(meshReference->types[i], m) : Agreement{};
         summary << name(method) << ',' << labels[i] << ',' << (method == Method::Grid && opts.morton ? "morton" : "default")
                 << ',' << opts.seed << ',' << opts.frames << ',' << opts.invokers << ',' << opts.bodies << ',' << opts.global
                 << ',' << opts.warmup << ',' << opts.streamEvery << ',' << m.results.size() << ',' << m.hits << ','
                 << m.initial << ',' << m.unresolved << ',';
-        if (meshReference) summary << mismatch << ',' << hitErrors.size() << ',' << percentile(hitErrors, 0.95);
+        if (meshReference) summary << comparison.mismatch << ',' << comparison.paired << ',' << comparison.p95Distance;
         else summary << ",,";
         summary << ',' << percentile(m.durations, 0.50) << ',' << percentile(m.durations, 0.95) << ','
                 << percentile(m.durations, 0.99) << ','
@@ -267,8 +327,22 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
                 << ',' << peakCollision << ',' << totalBuilt << ',' << totalRemoved << ',' << maxContacts << ',' << below << '\n';
         std::cout << "  " << labels[i] << " P95 " << percentile(m.durations, 0.95) << " us, hits "
                   << m.hits << ", unresolved " << m.unresolved;
-        if (meshReference) std::cout << ", mismatches " << mismatch << ", paired P95 error " << percentile(hitErrors, 0.95) << " m";
+        if (meshReference) std::cout << ", mismatches " << comparison.mismatch << ", paired P95 error " << comparison.p95Distance << " m";
         std::cout << '\n';
+    }
+    if (capsuleReport) {
+        for (std::size_t i = 0; i < metrics.capsules.size(); ++i) {
+            auto& c = metrics.capsules[i];
+            std::sort(c.durations.begin(), c.durations.end());
+            *capsuleReport << name(method) << ',' << capsuleCases[i] << ',' << c.durations.size() << ',' << c.hits << ','
+                           << c.initial << ',' << c.unresolved << ',' << percentile(c.durations, 0.50) << ','
+                           << percentile(c.durations, 0.95) << ',' << percentile(c.durations, 0.99) << ',';
+            if (meshReference) {
+                const auto compared = agreement(meshReference->capsules[i], c);
+                *capsuleReport << compared.mismatch << ',' << compared.paired << ',' << compared.p95Distance;
+            } else *capsuleReport << ",,";
+            *capsuleReport << '\n';
+        }
     }
     return metrics;
 }
@@ -277,16 +351,16 @@ void check(bool condition, const std::string& description) {
     if (!condition) throw std::runtime_error(std::string("Self-test failed: ") + description);
 }
 
-std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false) {
+std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, Key key = {}) {
     const int n = saddle ? 1 : 32;
-    auto chunk = std::make_unique<Chunk>(Chunk{{0, 0, 0}, 0, n, bounds({0, 0, 0}), chunkSize / n, {}, {}, {}, {}});
+    auto chunk = std::make_unique<Chunk>(Chunk{key, 0, n, bounds(key), chunkSize / n, {}, {}, {}, {}, {}});
     std::vector<float> sample;
     for (int z = 0; z <= n; ++z) for (int y = 0; y <= n; ++y) {
         for (int x = 0; x <= n; ++x) {
             sample.push_back(saddle ? float((x - 0.3) * (y - 0.7)) : float(z * chunk->spacing - 797));
         }
     }
-    chunk->field = makeStorage(method, n + 1, sample, morton, chunk->spacing, {});
+    chunk->field = makeStorage(method, n + 1, sample, morton, chunk->spacing, chunk->box.lo);
     meshChunk(*chunk);
     return chunk;
 }
@@ -331,6 +405,19 @@ void selfTest() {
                               std::make_pair(Method::Vdb, false)}) {
         const auto method = option.first;
         std::cout << "Testing " << name(method) << (option.second ? " Morton" : "") << std::endl;
+        constexpr int side = 17;
+        std::vector<float> pattern;
+        for (int i = 0; i < side * side * side; ++i) pattern.push_back(float((i * 17) % 4801 - 2400));
+        const auto lookup = makeStorage(method, side, pattern, option.second, 1, {});
+        for (int z = 0; z < side - 1; ++z) for (int y = 0; y < side - 1; ++y) {
+            for (int x = 0; x < side - 1; ++x) {
+                const auto corners = lookup->corners({x, y, z});
+                for (int i = 0; i < 8; ++i) {
+                    const int at = ((z + (i >> 2)) * side + y + ((i >> 1) & 1)) * side + x + (i & 1);
+                    check(corners[i] == pattern[at], "bulk corner sampling matches across storage boundaries");
+                }
+            }
+        }
         Chunks chunks;
         chunks.emplace(Key{}, fixture(method, option.second));
         const auto& chunk = *chunks.begin()->second;
@@ -371,6 +458,27 @@ void selfTest() {
         const auto tilted = physics.sweep(rotated, origin, {420, 400, 750});
         check(tilted.state == Hit::State::Contact &&
               std::abs(900 - tilted.fraction * 150 - (797 + rotated.extents().z)) < 1.6, "rotated box sweep");
+        const Shape capsule{ShapeKind::Capsule, {9, 0, 29}, frameAt(unit({1, 0.5, 0.8}))};
+        const auto capsuleHit = physics.sweep(capsule, origin, {460, 370, 750});
+        const double contactHeight = 797 + capsule.extents().z;
+        check(capsuleHit.state == Hit::State::Contact && std::abs(900 - capsuleHit.fraction * 150 - contactHeight) < 0.9,
+              "tilted long capsule diagonal sweep has analytic TOI");
+        check(physics.sweep(capsule, {350, 350, contactHeight + 1}, {560, 430, contactHeight + 1}).state == Hit::State::Miss,
+              "tilted capsule near-grazing pass stays clear");
+        if (method != Method::Mesh) {
+            const Vec touching{400, 400, contactHeight};
+            const auto grazing = physics.sweep(capsule, touching, {580, 400, touching.z});
+            check(grazing.state == Hit::State::Contact && grazing.initial, "grazing capsule starts in contact");
+            const Vec overlapping{400, 400, contactHeight - 2};
+            check(physics.sweep(capsule, overlapping, overlapping).initial, "stationary tilted capsule starts overlapped");
+            chunks.emplace(Key{1, 0, 0}, fixture(method, option.second, false, {1, 0, 0}));
+            const auto seam = physics.sweep(capsule, {1575, 400, contactHeight + 25}, {1625, 400, contactHeight - 25});
+            check(seam.state == Hit::State::Contact && std::abs(seam.fraction - 0.5) * length(Vec{50, 0, 50}) < 0.9,
+                  "tilted capsule hits across a chunk seam");
+            const auto diagonal = physics.ray({-6000, -3000, 1500}, {8000, 3000, 200});
+            check(diagonal.state == Hit::State::Contact && std::abs(diagonal.position.z - 797) < 0.02,
+                  "long diagonal ray hits through sparse chunks");
+        }
         physics.addBody(sampleShape(3, {0, 0, 1}), {600, 400, 876});
         for (int i = 0; i < 480; ++i) physics.step(1.0 / 60, false);
         check(physics.terrainContacts() >= 3, "terrain manifolds exist");
@@ -400,6 +508,12 @@ int main(int argc, char** argv) {
         fs::create_directories(opts.output);
         auto frames = createFile(opts.output / "frames.csv");
         auto summary = createFile(opts.output / "summary.csv");
+        std::ofstream capsuleReport;
+        if (opts.capsuleStress) {
+            capsuleReport = createFile(opts.output / "capsule-cases.csv");
+            capsuleReport << "scheme,scenario,queries,hits,initial,unresolved,p50_us,p95_us,p99_us,"
+                             "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m\n";
+        }
         frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,"
                   "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts\n";
         summary << "scheme,query,layout,seed,frames,invokers,bodies,global,warmup,stream_every,queries,hits,initial,unresolved,"
@@ -409,7 +523,8 @@ int main(int argc, char** argv) {
         bool hasMesh = false;
         std::cout << std::fixed << std::setprecision(3);
         for (Method method : opts.methods) {
-            auto result = run(opts, method, frames, summary, hasMesh ? &reference : nullptr);
+            auto result = run(opts, method, frames, summary, hasMesh ? &reference : nullptr,
+                              opts.capsuleStress ? &capsuleReport : nullptr);
             if (method == Method::Mesh) {
                 reference = std::move(result);
                 hasMesh = true;

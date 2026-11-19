@@ -88,6 +88,7 @@ class Storage {
 public:
     virtual ~Storage() = default;
     virtual float get(int x, int y, int z) const = 0;
+    virtual std::array<float, 8> corners(Key index) const;
     virtual std::size_t bytes() const = 0;
 };
 std::unique_ptr<Storage> makeStorage(Method method, int count, const std::vector<float>& values,
@@ -104,6 +105,7 @@ struct Cell {
 };
 
 struct Triangle { std::array<Vec, 3> vertices; };
+struct CellRow { std::uint32_t surface{}, solid{}; };
 struct Chunk {
     Key key;
     int lod;
@@ -114,6 +116,8 @@ struct Chunk {
     std::unique_ptr<Storage> field;
     std::vector<Triangle> mesh;
     std::optional<Box> surfaceBounds;
+    std::vector<CellRow> rows;
+    const CellRow& row(int y, int z) const { return rows[std::size_t(z) * cells + y]; }
     Cell cell(Key index) const;
     Cell cellAt(Vec p) const;
     Key cellIndex(Vec p) const;
@@ -129,6 +133,6 @@ Layout selectChunks(const std::vector<Vec>& invokers, bool global);
 std::array<int, 27> neighborhood(const Layout& layout, Key key);
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
                                   Method method, bool morton, BuildStats& stats);
-void meshChunk(Chunk& chunk);
+void meshChunk(Chunk& chunk, bool indexField = true);
 
 }  // namespace voxel

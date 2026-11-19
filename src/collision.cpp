@@ -8,6 +8,9 @@
 
 #include <limits>
 #include <utility>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace voxel {
 
@@ -39,13 +42,45 @@ constexpr double sweepTolerance = 0.75;
 constexpr int sweepBudget = 12000;
 
 template<class Operation>
-void forChunks(const Chunks& chunks, Box area, Operation operation) {
-    const Key lo = keyAt(area.lo - splat(epsilon));
-    const Key hi = keyAt(area.hi + splat(epsilon));
-    for (int z = lo.z; z <= hi.z; ++z) for (int y = lo.y; y <= hi.y; ++y) {
-        for (int x = lo.x; x <= hi.x; ++x) {
-            auto it = chunks.find({x, y, z});
-            if (it != chunks.end()) operation(*it->second);
+void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation operation) {
+    const Vec pad = extents + splat(epsilon);
+    const Key lo = keyAt(min(from, to) - pad), hi = keyAt(max(from, to) + pad);
+    auto emit = [&](int x, int y, int z) {
+        const auto found = chunks.find({x, y, z});
+        if (found != chunks.end()) operation(*found->second);
+    };
+    if (hi.x - lo.x <= 1 && hi.y - lo.y <= 1 && hi.z - lo.z <= 1) {
+        for (int z = lo.z; z <= hi.z; ++z) for (int y = lo.y; y <= hi.y; ++y) {
+            for (int x = lo.x; x <= hi.x; ++x) emit(x, y, z);
+        }
+        return;
+    }
+    // Clip each candidate row to the swept time interval in the preceding axes.
+    // This keeps a long diagonal cast proportional to its swept tube.
+    const Vec delta = to - from;
+    auto slice = [&](int axis, int index, double& first, double& last) {
+        const double lower = index * chunkSize - pad[axis];
+        const double upper = (index + 1) * chunkSize + pad[axis];
+        if (std::abs(delta[axis]) < 1e-13) return from[axis] >= lower && from[axis] <= upper;
+        const double a = (lower - from[axis]) / delta[axis], b = (upper - from[axis]) / delta[axis];
+        first = std::max(first, std::min(a, b));
+        last = std::min(last, std::max(a, b));
+        return first <= last;
+    };
+    auto range = [&](int axis, double first, double last) {
+        const double a = from[axis] + delta[axis] * first, b = from[axis] + delta[axis] * last;
+        return std::make_pair(int(std::floor((std::min(a, b) - pad[axis]) / chunkSize)),
+                              int(std::floor((std::max(a, b) + pad[axis]) / chunkSize)));
+    };
+    for (int z = lo.z; z <= hi.z; ++z) {
+        double beforeZ = 0, afterZ = 1;
+        if (!slice(2, z, beforeZ, afterZ)) continue;
+        const auto ys = range(1, beforeZ, afterZ);
+        for (int y = ys.first; y <= ys.second; ++y) {
+            double beforeY = beforeZ, afterY = afterZ;
+            if (!slice(1, y, beforeY, afterY)) continue;
+            const auto xs = range(0, beforeY, afterY);
+            for (int x = xs.first; x <= xs.second; ++x) emit(x, y, z);
         }
     }
 }
@@ -59,22 +94,117 @@ void forCells(const Chunk& chunk, Box area, Operation operation) {
     }
 }
 
+int trailingBit(std::uint32_t bits) {
+#if defined(_MSC_VER)
+    unsigned long index;
+    _BitScanForward(&index, bits);
+    return int(index);
+#else
+    return __builtin_ctz(bits);
+#endif
+}
+
+std::uint32_t cellMask(int lo, int hi) { return (0xffffffffu << lo) & (0xffffffffu >> (31 - hi)); }
+
+template<class Operation>
+void forIndexedCells(const Chunk& chunk, Box area, bool solid, Operation operation) {
+    const Key lo = chunk.cellIndex(area.lo - splat(epsilon));
+    const Key hi = chunk.cellIndex(area.hi + splat(epsilon));
+    const auto xMask = cellMask(lo.x, hi.x);
+    for (int z = lo.z; z <= hi.z; ++z) for (int y = lo.y; y <= hi.y; ++y) {
+        const auto& row = chunk.row(y, z);
+        auto cells = xMask & (row.surface | (solid ? row.solid : 0));
+        for (; cells; cells &= cells - 1) operation(Key{trailingBit(cells), y, z});
+    }
+}
+
+template<class Operation>
+void forSweptCells(const Chunk& chunk, Vec from, Vec delta, Vec extents, double first, double last,
+                   Operation operation) {
+    const Vec a = from + delta * first, b = from + delta * last;
+    const Vec pad = extents + splat(epsilon);
+    const Key lo = chunk.cellIndex(min(a, b) - pad), hi = chunk.cellIndex(max(a, b) + pad);
+    auto slab = [&](int axis, int index, double& low, double& high) {
+        const double start = chunk.box.lo[axis] + index * chunk.spacing;
+        const double lower = start - pad[axis], upper = start + chunk.spacing + pad[axis];
+        if (std::abs(delta[axis]) < 1e-13) return from[axis] >= lower && from[axis] <= upper;
+        const double enter = (lower - from[axis]) / delta[axis], exit = (upper - from[axis]) / delta[axis];
+        low = std::max(low, std::min(enter, exit));
+        high = std::min(high, std::max(enter, exit));
+        return low <= high;
+    };
+    auto coord = [&](int axis, double t) { return from[axis] + delta[axis] * t; };
+    auto index = [&](int axis, double value) {
+        return std::clamp(int(std::floor((value - chunk.box.lo[axis]) / chunk.spacing)), 0, chunk.cells - 1);
+    };
+    for (int z = lo.z; z <= hi.z; ++z) {
+        double zFirst = first, zLast = last;
+        if (!slab(2, z, zFirst, zLast)) continue;
+        const int yFirst = index(1, std::min(coord(1, zFirst), coord(1, zLast)) - pad.y);
+        const int yLast = index(1, std::max(coord(1, zFirst), coord(1, zLast)) + pad.y);
+        for (int y = yFirst; y <= yLast; ++y) {
+            const auto& row = chunk.row(y, z);
+            if (!row.surface) continue;
+            double rowFirst = zFirst, rowLast = zLast;
+            if (!slab(1, y, rowFirst, rowLast)) continue;
+            const int xFirst = index(0, std::min(coord(0, rowFirst), coord(0, rowLast)) - pad.x);
+            const int xLast = index(0, std::max(coord(0, rowFirst), coord(0, rowLast)) + pad.x);
+            for (auto mask = row.surface & cellMask(xFirst, xLast); mask; mask &= mask - 1) {
+                const int x = trailingBit(mask);
+                double before = rowFirst, after = rowLast;
+                if (slab(0, x, before, after)) operation(Key{x, y, z}, before, after);
+            }
+        }
+    }
+}
+
 Vec normalAt(const Cell& cell, Vec point) { return unit(cell.gradient(point), unit(point)); }
 
+struct Trilinear {
+    Vec origin, linear;
+    double inverse, constant;
+    double xy, xz, yz, xyz;
+    explicit Trilinear(const Cell& cell) : origin(cell.origin), inverse(1.0 / cell.spacing), constant(cell.values[0]) {
+        const auto v = [&](int index) { return double(cell.values[index]); };
+        linear = {v(1) - constant, v(2) - constant, v(4) - constant};
+        xy = v(3) - v(2) - v(1) + v(0);
+        xz = v(5) - v(4) - v(1) + v(0);
+        yz = v(6) - v(4) - v(2) + v(0);
+        xyz = v(7) - v(6) - v(5) - v(3) + v(4) + v(2) + v(1) - v(0);
+    }
+    Vec local(Vec point) const { return (point - origin) * inverse; }
+    double value(Vec p) const {
+        return constant + linear.y * p.y + p.z * (linear.z + yz * p.y)
+             + p.x * (linear.x + xy * p.y + p.z * (xz + xyz * p.y));
+    }
+    Vec gradient(Vec p) const {
+        return Vec{linear.x + xy * p.y + p.z * (xz + xyz * p.y),
+                   linear.y + xy * p.x + p.z * (yz + xyz * p.x),
+                   linear.z + xz * p.x + p.y * (yz + xyz * p.x)} * inverse;
+    }
+    double lower(Vec p, Vec half) const {
+        const Vec d = half * inverse;
+        const double a = (xy + p.z * xyz) * d.x * d.y;
+        const double b = (xz + p.y * xyz) * d.x * d.z;
+        const double c = (yz + p.x * xyz) * d.y * d.z;
+        return std::min({a + b + c, a - b - c, b - a - c, c - a - b}) - std::abs(xyz) * d.x * d.y * d.z;
+    }
+};
+
 double firstRoot(const Cell& cell, Vec from, Vec to) {
-    const Vec delta = to - from;
-    const double start = cell.value(from);
+    const Trilinear field(cell);
+    const Vec p = field.local(from);
+    const Vec worldDelta = to - from;
+    const Vec d = worldDelta * field.inverse;
+    const double start = field.value(p);
     if (std::abs(start) <= epsilon) return 0;
-    if ((start > 0 && cell.minimum() > epsilon) || (start < 0 && cell.maximum() < -epsilon)) return -1;
     const double sign = start < 0 ? -1 : 1;
     const double f0 = sign * start;
-    // A trilinear field restricted to a line is a cubic. Split it at its stationary points.
-    const double q = 27 * (sign * cell.value(from + delta / 3) - f0);
-    const double r = 27 * (sign * cell.value(from + delta * (2.0 / 3)) - f0);
-    const double ab = (r - 2 * q) / 6;
-    const double c = sign * cell.value(to) - f0 - ab;
-    const double a = (3 * ab + 9 * c - q) / 2;
-    const double b = ab - a;
+    // Substituting the ray in the trilinear polynomial gives a cubic in t.
+    const double c = sign * dot(field.gradient(p), worldDelta);
+    const double b = sign * ((field.xy + p.z * field.xyz) * d.x * d.y + (field.xz + p.y * field.xyz) * d.x * d.z
+                           + (field.yz + p.x * field.xyz) * d.y * d.z);
+    const double a = sign * field.xyz * d.x * d.y * d.z;
     const auto value = [&](double t) { return ((a * t + b) * t + c) * t + f0; };
     std::array<double, 3> splits{1, 1, 1};
     auto addSplit = [&](double t) {
@@ -100,7 +230,19 @@ double firstRoot(const Cell& cell, Vec from, Vec to) {
             lo = hi;
             continue;
         }
-        if (value(hi) >= 0) return hi;
+        const double fHi = value(hi);
+        if (fHi >= 0) return hi;
+        const double fLo = value(lo);
+        double trial = lo + (hi - lo) * (fLo / (fLo - fHi));
+        for (int i = 0; i < 5; ++i) {
+            const double residual = value(trial);
+            if (std::abs(residual) < 1e-10) return trial;
+            if (residual > 0) lo = trial;
+            else hi = trial;
+            const double derivative = (3 * a * trial + 2 * b) * trial + c;
+            const double next = std::abs(derivative) > 1e-12 ? trial - residual / derivative : lo;
+            trial = next > lo && next < hi ? next : (lo + hi) * 0.5;
+        }
         for (int i = 0; i < 28; ++i) {
             const double mid = (lo + hi) * 0.5;
             if (value(mid) > 0) lo = mid;
@@ -112,31 +254,44 @@ double firstRoot(const Cell& cell, Vec from, Vec to) {
 }
 
 void rayChunk(const Chunk& chunk, Vec from, Vec delta, Hit& hit) {
+    if (chunk.box.contains(from)) {
+        const Key start = chunk.cellIndex(from);
+        const auto& row = chunk.row(start.y, start.z);
+        const std::uint32_t bit = std::uint32_t(1) << start.x;
+        if ((row.surface | row.solid) & bit) {
+            const auto cell = chunk.cell(start);
+            if (cell.value(from) <= epsilon) {
+                hit = {Hit::State::Contact, 0, from, normalAt(cell, from), true};
+                return;
+            }
+        }
+    }
+    if (!chunk.surfaceBounds) return;
     double first = 0, last = hit.fraction;
-    if (!clip(chunk.box, from, delta, first, last)) return;
+    if (!clip(*chunk.surfaceBounds, from, delta, first, last)) return;
     const Vec p = from + delta * first;
     Key index = chunk.cellIndex(p);
+    Vec exits = splat(std::numeric_limits<double>::infinity());
+    Vec steps = exits;
     for (int a = 0; a < 3; ++a) {
+        if (std::abs(delta[a]) < 1e-13) continue;
         const double coord = (p[a] - chunk.box.lo[a]) / chunk.spacing;
         if (delta[a] < 0 && std::abs(coord - index[a]) < 1e-9 && index[a] > 0) --index[a];
+        const double edge = chunk.box.lo[a] + (index[a] + (delta[a] > 0)) * chunk.spacing;
+        exits[a] = (edge - from[a]) / delta[a];
+        steps[a] = chunk.spacing / std::abs(delta[a]);
     }
     while (first <= last) {
-        const Cell cell = chunk.cell(index);
-        Vec exits = splat(std::numeric_limits<double>::infinity());
-        for (int a = 0; a < 3; ++a) {
-            if (std::abs(delta[a]) < 1e-13) continue;
-            const double edge = chunk.box.lo[a] + (index[a] + (delta[a] > 0)) * chunk.spacing;
-            exits[a] = (edge - from[a]) / delta[a];
-        }
         const double end = std::max(first, std::min({last, exits.x, exits.y, exits.z}));
-        const Vec cellEntry = from + delta * first;
-        const double fraction = first == 0 && cell.value(cellEntry) < 0
-            ? 0 : firstRoot(cell, cellEntry, from + delta * end);
-        if (fraction >= 0) {
-            const double t = first + (end - first) * fraction;
-            const Vec point = from + delta * t;
-            hit = {Hit::State::Contact, t, point, normalAt(cell, point), t == 0};
-            return;
+        if (chunk.row(index.y, index.z).surface & (std::uint32_t(1) << index.x)) {
+            const auto cell = chunk.cell(index);
+            const double fraction = firstRoot(cell, from + delta * first, from + delta * end);
+            if (fraction >= 0) {
+                const double t = first + (end - first) * fraction;
+                const Vec point = from + delta * t;
+                hit = {Hit::State::Contact, t, point, normalAt(cell, point), t == 0};
+                return;
+            }
         }
         if (end >= last) return;
         bool advanced = false;
@@ -144,6 +299,7 @@ void rayChunk(const Chunk& chunk, Vec from, Vec delta, Hit& hit) {
             if (exits[a] > end + 1e-12) continue;
             index[a] += delta[a] > 0 ? 1 : -1;
             if (index[a] < 0 || index[a] >= chunk.cells) return;
+            exits[a] += steps[a];
             advanced = true;
         }
         if (!advanced) return;
@@ -153,6 +309,35 @@ void rayChunk(const Chunk& chunk, Vec from, Vec delta, Hit& hit) {
 
 Vec corner(Box box, int i) {
     return {(i & 1) ? box.hi.x : box.lo.x, (i & 2) ? box.hi.y : box.lo.y, (i & 4) ? box.hi.z : box.lo.z};
+}
+
+Box zeroBounds(const Cell& cell) {
+    Box local{splat(1), {}};
+    constexpr Box unitCell{{}, {1, 1, 1}};
+    bool found = false;
+    for (int i = 0; i < 8; ++i) {
+        const double a = cell.values[i];
+        if (std::abs(a) < epsilon) {
+            const Vec p = corner(unitCell, i);
+            local.lo = min(local.lo, p);
+            local.hi = max(local.hi, p);
+            found = true;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            const int bit = 1 << axis;
+            if (i & bit) continue;
+            const double b = cell.values[i | bit];
+            if ((a < 0) == (b < 0)) continue;
+            Vec p = corner(unitCell, i);
+            p[axis] = a / (a - b);
+            local.lo = min(local.lo, p);
+            local.hi = max(local.hi, p);
+            found = true;
+        }
+    }
+    const Box region = found ? local : unitCell;
+    return {cell.origin + region.lo * cell.spacing - splat(epsilon),
+            cell.origin + region.hi * cell.spacing + splat(epsilon)};
 }
 
 Vec projectToShape(const Shape& shape, Vec offset) {
@@ -178,71 +363,193 @@ Vec support(const Shape& shape, Vec direction) {
     return axis + unit(direction, {}) * shape.size.x;
 }
 
+double supportRadius(const Shape& shape, Vec axis) {
+    if (shape.kind == ShapeKind::Box) {
+        return std::abs(dot(axis, shape.axes[0])) * shape.size.x + std::abs(dot(axis, shape.axes[1])) * shape.size.y
+             + std::abs(dot(axis, shape.axes[2])) * shape.size.z;
+    }
+    const double sphere = length(axis) * shape.size.x;
+    return shape.kind == ShapeKind::Capsule ? sphere + std::abs(dot(axis, shape.axes[2])) * shape.size.z : sphere;
+}
+
 struct SweepSearch {
+    struct Axis { Vec direction, absolute; double start, slope, radius; };
+
     const Shape& shape;
     Vec from, delta, extents;
     double speed;
     Hit hit;
     double unknown{std::numeric_limits<double>::infinity()};
     int budget{sweepBudget};
+    std::array<Axis, 12> axes{};
+    int axisCount{};
+
+    SweepSearch(const Shape& input, Vec start, Vec end)
+        : shape(input), from(start), delta(end - start), extents(input.extents()), speed(length(delta)) {
+        constexpr Vec world[] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        if (shape.kind == ShapeKind::Box) {
+            for (const auto direction : shape.axes) {
+                addAxis(direction);
+                for (Vec basis : world) addAxis(cross(direction, basis));
+            }
+        } else if (shape.kind == ShapeKind::Capsule) {
+            addAxis(shape.axes[2]);
+            for (Vec basis : world) addAxis(cross(shape.axes[2], basis));
+        }
+    }
+
+    Axis makeAxis(Vec direction) const {
+        return {direction, abs(direction), dot(direction, from), dot(direction, delta), supportRadius(shape, direction)};
+    }
+
+    void addAxis(Vec direction) {
+        if (dot(direction, direction) > 1e-16) axes[axisCount++] = makeAxis(direction);
+    }
+
+    bool clipAxis(const Axis& axis, Vec center, Vec half, double& first, double& last) const {
+        const double origin = axis.start - dot(axis.direction, center);
+        const double range = axis.radius + dot(axis.absolute, half) + epsilon;
+        if (std::abs(axis.slope) < 1e-12) return std::abs(origin) <= range;
+        const double r = range / std::abs(axis.slope);
+        const double middle = -origin / axis.slope;
+        first = std::max(first, middle - r);
+        last = std::min(last, middle + r);
+        return first <= last;
+    }
+
+    bool clipRounded(Box box, Vec center, Vec half, double& first, double& last) const {
+        if (shape.kind == ShapeKind::Box) return true;
+        const double time = speed > 0 ? std::clamp(dot(center - from, delta) / (speed * speed), first, last) : first;
+        const Vec pose = from + delta * time;
+        Vec point = pose;
+        if (shape.kind == ShapeKind::Capsule) {
+            const Vec axis = shape.axes[2];
+            for (int i = 0; i < 2; ++i) {
+                point = pose + axis * std::clamp(dot(box.clamp(point) - pose, axis), -shape.size.z, shape.size.z);
+            }
+        }
+        const Vec separation = point - box.clamp(point);
+        if (dot(separation, separation) < 1e-14) return true;
+        return clipAxis(makeAxis(unit(separation)), center, half, first, last);
+    }
+
+    bool clipPlane(Vec gradient, double threshold, double& first, double& last) const {
+        const double minimum = dot(gradient, from) - supportRadius(shape, gradient);
+        const double slope = dot(gradient, delta);
+        if (std::abs(slope) <= 1e-12) return minimum <= threshold;
+        const double limit = (threshold - minimum) / slope;
+        if (slope < 0) first = std::max(first, limit);
+        else last = std::min(last, limit);
+        return first <= last;
+    }
+
+    bool clipConstrainedPlane(Vec gradient, double threshold, Box box, Vec extreme, double& first, double& last) const {
+        // Combining the tangent plane with a face inequality bounds support outside the cell.
+        // A second pass can combine that constraint with a different face at a cell edge.
+        for (int pass = 0; pass < 2; ++pass) {
+            const Vec center = from + delta * first;
+            const Vec witness = center + extreme;
+            const double scale = length(gradient);
+            Vec next = gradient;
+            double nextThreshold = threshold;
+            bool tightened = false;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double face = std::clamp(witness[axis], box.lo[axis], box.hi[axis]);
+                const double difference = witness[axis] - face;
+                if (std::abs(difference) < 0.01) continue;
+                const double sign = difference > 0 ? 1 : -1;
+                auto test = [&](double adjustment) {
+                    Vec normal = gradient;
+                    normal[axis] += adjustment;
+                    const double limit = threshold + adjustment * face + epsilon;
+                    const double oldFirst = first;
+                    if (!clipPlane(normal, limit, first, last)) return false;
+                    if (first > oldFirst + 1e-10) {
+                        next = normal;
+                        nextThreshold = limit;
+                        tightened = true;
+                    }
+                    return true;
+                };
+                if (shape.kind == ShapeKind::Box) {
+                    for (Vec basis : shape.axes) {
+                        if (std::abs(basis[axis]) < 1e-8) continue;
+                        const double adjustment = -dot(gradient, basis) / basis[axis];
+                        if (adjustment * sign > 0 && !test(adjustment)) return false;
+                    }
+                } else {
+                    Vec tangent = gradient;
+                    tangent[axis] = 0;
+                    const double axial = shape.kind == ShapeKind::Capsule
+                        ? extreme[axis] + gradient[axis] * (scale > 1e-10 ? shape.size.x / scale : 0) : 0;
+                    const double k = face - center[axis] - axial;
+                    if (std::abs(k) < shape.size.x - 1e-7) {
+                        const double adjustment = -k * length(tangent) / std::sqrt(shape.size.x * shape.size.x - k * k) - gradient[axis];
+                        if (adjustment * sign > 0 && !test(adjustment)) return false;
+                    }
+                    if (!test(sign * scale * 0.6) || !test(sign * scale * 1.8)) return false;
+                    if (shape.kind == ShapeKind::Capsule && std::abs(shape.axes[2][axis]) > 1e-8) {
+                        const double adjustment = -dot(gradient, shape.axes[2]) / shape.axes[2][axis];
+                        if (adjustment * sign > 0 && !test(adjustment)) return false;
+                    }
+                }
+            }
+            if (!tightened || pass == 1) break;
+            gradient = next;
+            threshold = nextThreshold;
+            extreme = support(shape, gradient * -1);
+        }
+        return true;
+    }
 
     double cutoff() const {
         return hit.state == Hit::State::Contact && speed > 0
             ? std::max(0.0, hit.fraction - sweepTolerance / speed) : hit.fraction;
     }
 
-    void sample(const Cell& cell, Box box, Vec point, double time) {
+    void sample(const Trilinear& field, Box box, Vec point, double time) {
+        if (time > hit.fraction) return;
         const Vec center = from + delta * time;
         point = center + projectToShape(shape, point - center);
-        if (time > hit.fraction || !box.expanded(splat(epsilon)).contains(point) || cell.value(point) > 2 * epsilon) return;
-        const Vec n = normalAt(cell, point);
+        if (!box.expanded(splat(epsilon)).contains(point)) return;
+        const Vec p = field.local(point);
+        if (field.value(p) > 2 * epsilon) return;
+        const Vec n = unit(field.gradient(p), unit(point));
         hit = {Hit::State::Contact, time, point, n, time == 0};
     }
 
-    void visit(const Cell& cell, Box box, double first, double last, bool seed = false) {
+    void visit(const Cell& cell, const Trilinear& curvature, Box box, double first, double last, bool seed = false) {
         last = std::min(last, cutoff());
         if (first > last || hit.initial || !clip(box.expanded(extents), from, delta, first, last)) return;
+        const double priorSpan = last - first;
         const Vec begin = from + delta * first, end = from + delta * last;
         box.lo = max(box.lo, min(begin, end) - extents - splat(epsilon));
         box.hi = min(box.hi, max(begin, end) + extents + splat(epsilon));
         const Vec center = box.center();
         const Vec dimensions = box.hi - box.lo;
-        const double initialMidpoint = (first + last) * 0.5;
-        const double initialTravel = speed * (last - first);
-        if (shape.distance(center - from - delta * initialMidpoint) > (length(dimensions) + initialTravel) * 0.5 + epsilon) return;
-        const Vec gradient = cell.gradient(center);
-        const double centerValue = cell.value(center);
-        Vec deepest = box.lo;
-        double smallest = std::numeric_limits<double>::infinity();
-        double residual = smallest;
-        for (int i = 0; i < 8; ++i) {
-            const Vec point = corner(box, i);
-            const double value = cell.value(point);
-            residual = std::min(residual, value - centerValue - dot(gradient, point - center));
-            if (value < smallest) {
-                deepest = point;
-                smallest = value;
-            }
-        }
-        if (smallest > epsilon) return;
+        const Vec half = dimensions * 0.5;
+        for (int i = 0; i < axisCount; ++i) if (!clipAxis(axes[i], center, half, first, last)) return;
+        if (!clipRounded(box, center, half, first, last)) return;
+        const Vec local = curvature.local(center);
+        const Vec gradient = curvature.gradient(local);
+        const double centerValue = curvature.value(local);
+        const double residual = curvature.lower(local, half);
+        if (centerValue - dot(abs(gradient), half) + residual > epsilon) return;
+        const Vec deepest{gradient.x >= 0 ? box.lo.x : box.hi.x, gradient.y >= 0 ? box.lo.y : box.hi.y,
+                          gradient.z >= 0 ? box.lo.z : box.hi.z};
         // The residual from the tangent plane is trilinear and bounded at box corners.
         // The shape's support point bounds the tangent plane over every pose on the path.
         const Vec extreme = support(shape, gradient * -1);
-        const double minAtZero = centerValue + dot(gradient, from + extreme - center) + residual;
-        const double slope = dot(gradient, delta);
-        if (std::abs(slope) > 1e-12) {
-            const double limit = (epsilon - minAtZero) / slope;
-            if (slope < 0) first = std::max(first, limit);
-            else last = std::min(last, limit);
-        } else if (minAtZero > epsilon) return;
-        if (first > last) return;
+        const double threshold = dot(gradient, center) - centerValue - residual + epsilon;
+        if (!clipPlane(gradient, threshold, first, last) ||
+            !clipConstrainedPlane(gradient, threshold, box, extreme, first, last)) return;
         if (budget-- <= 0) {
             unknown = std::min(unknown, first);
             return;
         }
-        sample(cell, box, from + delta * first + extreme, first);
-        sample(cell, box, deepest, first);
-        sample(cell, box, center, first);
+        sample(curvature, box, from + delta * first + extreme, first);
+        sample(curvature, box, deepest, first);
+        sample(curvature, box, center, first);
         if (hit.initial || hit.fraction <= first) return;
         if (seed) {
             // Cast a support point to get a confirmed upper bound early. The subdivision
@@ -254,7 +561,7 @@ struct SweepSearch {
                 const double root = cell.value(a) <= 0 ? 0 : firstRoot(cell, a, point + delta * exit);
                 if (root >= 0) {
                     const double time = enter + (exit - enter) * root;
-                    sample(cell, box, point + delta * time, time);
+                    sample(curvature, box, point + delta * time, time);
                 }
             }
         }
@@ -262,25 +569,29 @@ struct SweepSearch {
         if (first > last || hit.initial) return;
         const double midpoint = (first + last) * 0.5;
         const double travel = speed * (last - first);
-        sample(cell, box, from + delta * midpoint + extreme, midpoint);
-        sample(cell, box, deepest, midpoint);
+        if (speed * priorSpan > 2 * sweepTolerance && last - first < priorSpan * 0.4) {
+            visit(cell, curvature, box, first, last);
+            return;
+        }
+        sample(curvature, box, from + delta * midpoint + extreme, midpoint);
+        sample(curvature, box, deepest, midpoint);
         const int axis = dimensions.x >= dimensions.y && dimensions.x >= dimensions.z ? 0
                        : dimensions.y >= dimensions.z ? 1 : 2;
         if (travel <= sweepTolerance && dimensions[axis] <= sweepTolerance) {
-            sample(cell, box, deepest, last);
-            sample(cell, box, center, midpoint);
+            sample(curvature, box, deepest, last);
+            sample(curvature, box, center, midpoint);
             unknown = std::min(unknown, first);
             return;
         }
         if (travel > sweepTolerance && travel >= dimensions[axis]) {
-            visit(cell, box, first, midpoint);
-            visit(cell, box, midpoint, last);
+            visit(cell, curvature, box, first, midpoint);
+            visit(cell, curvature, box, midpoint, last);
         } else {
             Box low = box, high = box;
             low.hi[axis] = high.lo[axis] = center[axis];
             if (delta[axis] < 0) std::swap(low, high);
-            visit(cell, low, first, last);
-            visit(cell, high, first, last);
+            visit(cell, curvature, low, first, last);
+            visit(cell, curvature, high, first, last);
         }
     }
 };
@@ -289,36 +600,55 @@ struct SweepSearch {
 
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to) {
     Hit hit;
-    forChunks(chunks, {min(from, to), max(from, to)}, [&](const Chunk& chunk) {
-        if (!hit.initial) rayChunk(chunk, from, to - from, hit);
+    const Vec delta = to - from;
+    forChunks(chunks, from, to, {}, [&](const Chunk& chunk) {
+        if (!hit.initial) rayChunk(chunk, from, delta, hit);
     });
     return hit;
 }
 
 Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
-    SweepSearch search{shape, from, to - from, shape.extents(), length(to - from), {}};
+    SweepSearch search(shape, from, to);
+    // A ray through any point fixed on the shape supplies a verified upper bound.
+    // The interval search below still rules out earlier contacts elsewhere on the shape.
+    const Hit center = fieldRay(chunks, from, to);
+    if (center.initial) return center;
+    if (center.state == Hit::State::Contact) {
+        const Vec offset = support(shape, center.normal * -1);
+        const Hit extreme = fieldRay(chunks, from + offset, to + offset);
+        search.hit = extreme.fraction < center.fraction ? extreme : center;
+        if (search.hit.initial) return search.hit;
+    }
     struct Candidate { Cell cell; Box box; double first, last; };
     std::vector<Candidate> candidates;
-    const Box sweep = Box{min(from, to), max(from, to)}.expanded(search.extents);
-    forChunks(chunks, sweep, [&](const Chunk& chunk) {
-        double first = 0, last = search.hit.fraction;
-        if (!clip(chunk.box.expanded(search.extents), from, search.delta, first, last)) return;
-        const Vec start = from + search.delta * first, end = from + search.delta * last;
-        forCells(chunk, Box{min(start, end), max(start, end)}.expanded(search.extents), [&](const Cell& cell) {
-            if (cell.minimum() > epsilon) return;
-            const Box box{cell.origin, cell.origin + splat(cell.spacing)};
-            double enter = first, exit = last;
+    const Box initial = Box{from, from}.expanded(search.extents);
+    const Vec limit = from + search.delta * search.cutoff();
+    forChunks(chunks, from, limit, search.extents, [&](const Chunk& chunk) {
+        if (search.hit.initial) return;
+        double first = 0, last = search.cutoff();
+        if (chunk.box.expanded(search.extents).contains(from)) {
+            forIndexedCells(chunk, initial, true, [&](Key key) {
+                if (search.hit.initial) return;
+                const auto cell = chunk.cell(key);
+                search.visit(cell, Trilinear(cell), {cell.origin, cell.origin + splat(cell.spacing)}, 0, 0);
+            });
+        }
+        if (search.hit.initial || !chunk.surfaceBounds ||
+            !clip(chunk.surfaceBounds->expanded(search.extents), from, search.delta, first, last)) return;
+        forSweptCells(chunk, from, search.delta, search.extents, first, last, [&](Key key, double enter, double exit) {
+            const Cell cell = chunk.cell(key);
+            const Box box = zeroBounds(cell);
             if (clip(box.expanded(search.extents), from, search.delta, enter, exit)) {
                 candidates.push_back({cell, box, enter, exit});
             }
         });
     });
-    std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         return a.first < b.first;
     });
     for (const auto& candidate : candidates) {
         if (search.hit.initial || candidate.first > search.cutoff()) break;
-        search.visit(candidate.cell, candidate.box, candidate.first, candidate.last, true);
+        search.visit(candidate.cell, Trilinear(candidate.cell), candidate.box, candidate.first, candidate.last, true);
     }
     if (!search.hit.initial && std::isfinite(search.unknown)) {
         if (search.hit.state == Hit::State::Miss || (search.hit.fraction - search.unknown) * search.speed > 2 * sweepTolerance) {
@@ -641,11 +971,21 @@ Hit Physics::ray(Vec from, Vec to) const {
 
 Hit Physics::sweep(const Shape& shape, Vec from, Vec to) const {
     if (impl_->method != Method::Mesh) return fieldSweep(impl_->chunks, shape, from, to);
-    const auto convex = bulletShape(shape);
     btCollisionWorld::ClosestConvexResultCallback callback(bullet(from), bullet(to));
     callback.m_collisionFilterGroup = bodyGroup;
     callback.m_collisionFilterMask = terrainGroup;
-    impl_->world.convexSweepTest(convex.get(), pose(shape, from), pose(shape, to), callback);
+    const auto start = pose(shape, from), end = pose(shape, to);
+    if (shape.kind == ShapeKind::Sphere) {
+        const btSphereShape convex{btScalar(shape.size.x)};
+        impl_->world.convexSweepTest(&convex, start, end, callback);
+    } else if (shape.kind == ShapeKind::Capsule) {
+        const btCapsuleShapeZ convex{btScalar(shape.size.x), btScalar(2 * shape.size.z)};
+        impl_->world.convexSweepTest(&convex, start, end, callback);
+    } else {
+        btBoxShape convex{bullet(shape.size)};
+        convex.setMargin(btScalar(contactMargin));
+        impl_->world.convexSweepTest(&convex, start, end, callback);
+    }
     if (!callback.hasHit()) return {};
     return {Hit::State::Contact, callback.m_closestHitFraction, voxelVec(callback.m_hitPointWorld), voxelVec(callback.m_hitNormalWorld),
             callback.m_closestHitFraction == 0};
