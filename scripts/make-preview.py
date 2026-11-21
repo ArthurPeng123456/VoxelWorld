@@ -11,6 +11,8 @@ import sys
 def package_mesh(mesh_path, out_path):
     vertices = []
     invokers = []
+    windows = []
+    camera = None
     positions = array("h")
     levels = bytearray()
     level = 3
@@ -18,6 +20,11 @@ def package_mesh(mesh_path, out_path):
         for line in mesh:
             if line.startswith("# invoker "):
                 invokers.append([float(value) for value in line.split()[2:5]])
+            elif line.startswith("# camera_invoker "):
+                camera = [float(value) for value in line.split()[2:5]]
+            elif line.startswith("# clipmap "):
+                _, _, invoker, lod, *coords = line.split()
+                windows.append([int(invoker), int(lod), *map(float, coords)])
             elif line.startswith("o "):
                 level = int(line.rsplit("_LOD", 1)[1])
             elif line.startswith("v "):
@@ -36,6 +43,8 @@ def package_mesh(mesh_path, out_path):
     template = (Path(__file__).parent / "preview.html").read_text(encoding="utf-8")
     data = {
         "invokers": invokers,
+        "camera": camera,
+        "windows": windows,
         "positions": b64encode(positions).decode("ascii"),
         "levels": b64encode(levels).decode("ascii"),
     }

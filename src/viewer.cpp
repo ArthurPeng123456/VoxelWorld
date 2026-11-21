@@ -23,7 +23,14 @@ constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe };
+
+struct ToolbarButton { const wchar_t* label; int width; };
+constexpr std::array<ToolbarButton, Wireframe> toolbarButtons{{
+    {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
+    {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
+    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}
+}};
 
 struct Options {
     int method{1};
@@ -183,10 +190,8 @@ public:
         if (!window_) throw std::runtime_error("Create the viewer window failed");
         viewport_ = CreateWindowExW(0, viewportClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, window_, nullptr, instance, this);
         if (!viewport_) throw std::runtime_error("Create the Direct3D viewport failed");
-        constexpr const wchar_t* labels[] = {L"1  Mesh BVH", L"2  VoxelField", L"3  HashDAG", L"4  OpenVDB",
-                                              L"Surface [F]", L"LOD [L]", L"Pause", L"Drop [B]", L"Reset"};
-        for (int i = 0; i < int(std::size(labels)); ++i) {
-            buttons_[i] = CreateWindowExW(0, L"BUTTON", labels[i], WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        for (int i = 0; i < int(toolbarButtons.size()); ++i) {
+            buttons_[i] = CreateWindowExW(0, L"BUTTON", toolbarButtons[i].label, WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
                                            0, 0, 1, 1, window_, reinterpret_cast<HMENU>(INT_PTR(i + 1)), instance, nullptr);
             if (!buttons_[i]) throw std::runtime_error("Create viewer toolbar failed");
             SendMessageW(buttons_[i], WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
@@ -202,7 +207,7 @@ public:
         if (!opts_.captures.empty()) return captureAll();
         MSG message{};
         auto previous = Clock::now();
-        double accumulator = 0, statsElapsed = 0;
+        double accumulator = 0, statsElapsed = 0, streamElapsed = 0;
         while (!closed_) {
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                 if (message.message == WM_QUIT) return int(message.wParam);
@@ -229,10 +234,12 @@ public:
                     tick();
                     accumulator -= dt;
                 }
-                if (simulationTime_ >= nextStream_) {
-                    refreshTerrain(false);
-                    nextStream_ = simulationTime_ + 0.45;
-                }
+            }
+            // The camera keeps moving while simulation is paused.
+            streamElapsed += elapsed;
+            if (const auto published = world_->pollUpdate()) applyTerrain(*published, false);
+            if (streamElapsed >= 0.15 && world_->requestUpdate(invokers_, true, camera().eye)) {
+                streamElapsed = 0;
             }
             fps_ = fps_ * 0.94 + 0.06 / std::max(0.001, elapsed);
             statsElapsed += elapsed;
@@ -251,7 +258,6 @@ private:
 
     void rebuild() {
         simulationTime_ = 0;
-        nextStream_ = 0.45;
         shapes_.clear();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton);
         refreshTerrain(true);
@@ -283,8 +289,16 @@ private:
 
     void refreshTerrain(bool force) {
         invokers_ = invokerPositions(planet_, opts_.invokers, simulationTime_ * 2.0);
-        const auto stats = world_->update(invokers_, true);
+        updateTerrain(force);
+    }
+
+    void updateTerrain(bool force) {
+        applyTerrain(world_->update(invokers_, true, camera().eye), force);
+    }
+
+    void applyTerrain(const WorldStats& stats, bool force) {
         streamMs_ = stats.updateMs;
+        if (showRanges_) refreshRanges();
         if (!force && stats.build.built == 0 && stats.build.removed == 0) return;
         std::vector<Vertex> geometry;
         geometry.reserve(world_->meshBytes() / sizeof(Triangle) * 3);
@@ -305,6 +319,26 @@ private:
         }
         triangles_ = geometry.size() / 3;
         renderer_->setTerrain(geometry);
+    }
+
+    void refreshRanges() {
+        std::vector<Vertex> lines;
+        if (showRanges_) {
+            constexpr Vec shades[] = {{0.25, 0.91, 1}, {0.40, 1, 0.54}, {1, 0.76, 0.28}, {0.81, 0.53, 1}};
+            for (const auto& w : world_->clipmapWindows()) {
+                const auto tint = color(shades[w.lod], 255);
+                for (int i = 0; i < 8; ++i) for (int axis = 0; axis < 3; ++axis) {
+                    if (i & (1 << axis)) continue;
+                    const Vec a{(i & 1) ? w.box.hi.x : w.box.lo.x, (i & 2) ? w.box.hi.y : w.box.lo.y,
+                                (i & 4) ? w.box.hi.z : w.box.lo.z};
+                    Vec b = a;
+                    b[axis] = w.box.hi[axis];
+                    lines.push_back(vertex(a, {0, 0, 1}, tint));
+                    lines.push_back(vertex(b, {0, 0, 1}, tint));
+                }
+            }
+        }
+        renderer_->setClipmapLines(lines);
     }
 
     void buildObjects() {
@@ -347,7 +381,7 @@ private:
             nearPlane = std::max(12.0, (orbitDistance_ - planetRadius) * 0.03);
         }
         const Vec forward = unit(center - eye), right = unit(cross(forward, nominalUp), basis[0]);
-        return {eye, right, unit(cross(right, forward)), forward, nearPlane, 270000.0, lodTint_};
+        return {eye, right, unit(cross(right, forward)), forward, nearPlane, 270000.0, lodTint_, wireframe_};
     }
 
     int captureAll() {
@@ -358,6 +392,7 @@ private:
         for (int i = 0; i < int(methods.size()); ++i) {
             method_ = i;
             selected_ = 0;
+            surface_ = false;
             rebuild();
             MSG message{};
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -379,8 +414,17 @@ private:
             // Center the surface capture on the test bodies' original drop location.
             invokers_ = invokerPositions(planet_, opts_.invokers, 0);
             surface_ = true;
+            updateTerrain(false);
             buildObjects();
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-surface.bmp"));
+            action(Wireframe);
+            renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-wireframe.bmp"));
+            action(Wireframe);
+            showRanges_ = true;
+            refreshRanges();
+            renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-ranges.bmp"));
+            showRanges_ = false;
+            refreshRanges();
             report << prefix << " triangles=" << triangles_ << " invokers=" << opts_.invokers << " bodies=" << shapes_.size()
                    << " peak_contacts=" << maxContacts << '\n';
             if (maxContacts == 0) throw std::runtime_error("Capture scenario did not observe terrain contact");
@@ -396,6 +440,11 @@ private:
             }
         } else if (command == View) surface_ = !surface_;
         else if (command == Tint) lodTint_ = !lodTint_;
+        else if (command == Wireframe) wireframe_ = !wireframe_;
+        else if (command == Ranges) {
+            showRanges_ = !showRanges_;
+            refreshRanges();
+        }
         else if (command == Pause) paused_ = !paused_;
         else if (command == Drop) {
             surface_ = true;
@@ -425,6 +474,8 @@ private:
         if (code >= '1' && code <= '4') action(int(code - '1' + Mesh));
         else if (code == 'F') action(View);
         else if (code == 'L') action(Tint);
+        else if (code == 'K') action(Ranges);
+        else if (code == 'W') action(Wireframe);
         else if (code == 'B') action(Drop);
         else if (code == 'R') action(Reset);
         else if (code == VK_SPACE) action(Pause);
@@ -443,7 +494,7 @@ private:
         MoveWindow(viewport_, 0, toolbarHeight, client.right, height, TRUE);
         int x = 12;
         for (int i = 0; i < int(buttons_.size()); ++i) {
-            const int width = i < 4 ? 108 : i == 4 ? 116 : 84;
+            const int width = toolbarButtons[i].width;
             MoveWindow(buttons_[i], x, 9, width, 34, TRUE);
             x += width + (i == 3 ? 21 : 6);
         }
@@ -451,15 +502,15 @@ private:
     }
 
     void repaintButtons() {
-        SetWindowTextW(buttons_[4], surface_ ? L"Orbit [F]" : L"Surface [F]");
-        SetWindowTextW(buttons_[6], paused_ ? L"Resume" : L"Pause");
+        SetWindowTextW(buttons_[View - 1], surface_ ? L"Orbit [F]" : L"Surface [F]");
+        SetWindowTextW(buttons_[Pause - 1], paused_ ? L"Resume" : L"Pause");
         for (auto button : buttons_) InvalidateRect(button, nullptr, TRUE);
     }
 
     void updateFooter() {
         const auto counts = world_->lodCounts();
         std::wostringstream info;
-        info << methodLabels[method_] << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers
+        info << methodLabels[method_] << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
              << L"   |   LOD 0/1/2/3  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3]
              << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
              << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update";
@@ -487,7 +538,7 @@ private:
         SetTextColor(dc, RGB(152, 170, 193));
         row.top += 22;
         row.bottom += 22;
-        const wchar_t* controls = lodTint_
+        const wchar_t* controls = lodTint_ || showRanges_
             ? L"LOD 0 Cyan 50 m   /   LOD 1 Green 100 m   /   LOD 2 Gold 200 m   /   LOD 3 Violet 400 m"
             : L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
         DrawTextW(dc, controls, -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -497,7 +548,8 @@ private:
     void paintButton(const DRAWITEMSTRUCT& item) const {
         const int button = int(item.CtlID);
         const bool active = button == method_ + Mesh || (button == View && surface_) ||
-                            (button == Tint && lodTint_) || (button == Pause && paused_);
+                            (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
+                            (button == Wireframe && wireframe_) || (button == Pause && paused_);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -590,7 +642,7 @@ private:
     Planet planet_;
     int method_, pending_{};
     HWND window_{}, viewport_{};
-    std::array<HWND, 9> buttons_{};
+    std::array<HWND, toolbarButtons.size()> buttons_{};
     HFONT font_{};
     HBRUSH background_{};
     std::unique_ptr<Dx12Renderer> renderer_;
@@ -600,9 +652,9 @@ private:
     std::vector<Vertex> objects_;
     std::size_t selected_{}, triangles_{};
     std::wstring status_;
-    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, paused_{};
+    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
     POINT mouse_{};
-    double simulationTime_{}, nextStream_{}, streamMs_{}, fps_{};
+    double simulationTime_{}, streamMs_{}, fps_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{64100}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
 };
 

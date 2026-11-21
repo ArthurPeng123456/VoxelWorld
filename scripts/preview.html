@@ -28,6 +28,7 @@
   <button id="surface" aria-pressed="false">地表</button>
   <button id="invoker">下一个 Invoker</button>
   <button id="tint" aria-pressed="false">LOD 着色</button>
+  <button id="ranges" aria-pressed="false">LOD 范围</button>
 </header>
 <main><canvas id="scene" aria-label="可旋转和缩放的星球网格"></canvas><div id="error" hidden></div></main>
 <footer><span id="status" role="status">正在加载网格</span><span>拖动旋转 · 滚轮缩放</span></footer>
@@ -72,9 +73,16 @@ function start() {
     in vec3 world;
     flat in uint lod;
     uniform vec3 sun, forward;
-    uniform bool useTint;
+    uniform bool useTint, wireMode;
     out vec4 color;
     void main() {
+      if (wireMode) {
+        if (lod == 0u) color = vec4(.25,.91,1,1);
+        if (lod == 1u) color = vec4(.40,1,.54,1);
+        if (lod == 2u) color = vec4(1,.76,.28,1);
+        if (lod == 3u) color = vec4(.81,.53,1,1);
+        return;
+      }
       vec3 radial = normalize(world);
       vec3 n = normalize(cross(dFdx(world), dFdy(world)));
       if (dot(n,radial) < 0.0) n = -n;
@@ -97,7 +105,7 @@ function start() {
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
   gl.useProgram(program);
   const uniforms = {};
-  for (const key of ['eye','right','up','forward','projection','sun','useTint']) {
+  for (const key of ['eye','right','up','forward','projection','sun','useTint','wireMode']) {
     uniforms[key] = gl.getUniformLocation(program, key);
   }
   const decode = (encoded) => Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
@@ -114,6 +122,25 @@ function start() {
   gl.vertexAttribPointer(0, 3, gl.SHORT, false, 0, 0);
   attribute(1, levels);
   gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_BYTE, 0, 0);
+  const wires = gl.createVertexArray();
+  const linePoints = [], lineLevels = [];
+  const ranges = document.querySelector('#ranges');
+  for (const [, lod, x0, y0, z0, x1, y1, z1] of mesh.windows ?? []) {
+    for (let i = 0; i < 8; ++i) for (let a = 0; a < 3; ++a) {
+      if (i & (1 << a)) continue;
+      const start = [i & 1 ? x1 : x0, i & 2 ? y1 : y0, i & 4 ? z1 : z0];
+      const end = start.slice();
+      end[a] = [x1, y1, z1][a];
+      linePoints.push(...start, ...end);
+      lineLevels.push(lod, lod);
+    }
+  }
+  ranges.disabled = lineLevels.length === 0;
+  gl.bindVertexArray(wires);
+  attribute(0, new Float32Array(linePoints));
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  attribute(1, new Uint8Array(lineLevels));
+  gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_BYTE, 0, 0);
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0,0,0,0);
 
@@ -125,6 +152,7 @@ function start() {
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo,x));
   const initial = new URLSearchParams(location.hash.slice(1));
   let local = initial.get('view') === 'surface', useTint = initial.get('lod') === '1';
+  let showRanges = initial.get('ranges') === '1' && lineLevels.length !== 0;
   let selected = clamp((parseInt(initial.get('invoker'), 10) || 1) - 1, 0, mesh.invokers.length - 1);
   let yaw = .13, pitch = .16, distance = 64100;
   let bearing = .42, elevation = .90, surfaceDistance = 1950;
@@ -161,7 +189,16 @@ function start() {
     for (const [key, value] of Object.entries({eye,right,up,forward,sun})) gl.uniform3fv(uniforms[key], value);
     gl.uniform4f(uniforms.projection, 1.92*height/width, 1.92, (far+near)/(far-near), -2*near*far/(far-near));
     gl.uniform1i(uniforms.useTint, useTint ? 1 : 0);
+    gl.uniform1i(uniforms.wireMode, 0);
+    gl.bindVertexArray(vao);
     gl.drawArrays(gl.TRIANGLES, 0, levels.length);
+    if (showRanges) {
+      gl.disable(gl.DEPTH_TEST);
+      gl.uniform1i(uniforms.wireMode, 1);
+      gl.bindVertexArray(wires);
+      gl.drawArrays(gl.LINES, 0, lineLevels.length);
+      gl.enable(gl.DEPTH_TEST);
+    }
     canvas.dataset.state = 'rendered';
   }
   function schedule() {
@@ -171,13 +208,16 @@ function start() {
     orbit.setAttribute('aria-pressed', String(!local));
     surface.setAttribute('aria-pressed', String(local));
     tint.setAttribute('aria-pressed', String(useTint));
-    const legend = useTint ? ' · 青 50 m / 绿 100 m / 金 200 m / 紫 400 m' : '';
-    status.textContent = `25.6 km 基准半径 · ${count} 个三角形 · Invoker ${selected + 1}/${mesh.invokers.length}${legend}`;
+    ranges.setAttribute('aria-pressed', String(showRanges));
+    const legend = useTint || showRanges ? ' · 青 50 m / 绿 100 m / 金 200 m / 紫 400 m' : '';
+    const camera = mesh.camera ? ' + 导出摄像机' : '';
+    status.textContent = `25.6 km 基准半径 · ${count} 个三角形 · Invoker ${selected + 1}/${mesh.invokers.length}${camera}${legend}`;
     schedule();
   }
   orbit.onclick = () => { local = false; updateControls(); };
   surface.onclick = () => { local = true; updateControls(); };
   tint.onclick = () => { useTint = !useTint; updateControls(); };
+  ranges.onclick = () => { showRanges = !showRanges; updateControls(); };
   document.querySelector('#invoker').onclick = () => { selected = (selected + 1) % mesh.invokers.length; updateControls(); };
   canvas.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;

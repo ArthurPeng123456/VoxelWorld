@@ -17,7 +17,7 @@ struct Vertex {
 struct Camera {
     Vec eye, right, up, forward;
     double nearPlane, farPlane;
-    bool lodTint;
+    bool lodTint, wireframe;
 };
 
 class Dx12Renderer {
@@ -25,6 +25,7 @@ public:
     Dx12Renderer(HWND window, bool forceWarp);
     ~Dx12Renderer();
     void setTerrain(const std::vector<Vertex>& terrain);
+    void setClipmapLines(const std::vector<Vertex>& lines);
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {});
     bool isWarp() const;
 private:

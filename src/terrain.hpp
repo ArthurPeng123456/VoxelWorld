@@ -62,11 +62,13 @@ struct Key {
     int x{}, y{}, z{};
     int operator[](int axis) const { return axis == 0 ? x : axis == 1 ? y : z; }
     int& operator[](int axis) { return axis == 0 ? x : axis == 1 ? y : z; }
+    bool operator==(Key b) const { return x == b.x && y == b.y && z == b.z; }
     bool operator<(Key b) const { return std::tie(x, y, z) < std::tie(b.x, b.y, b.z); }
 };
 inline Vec asVec(Key key) { return {double(key.x), double(key.y), double(key.z)}; }
 Key keyAt(Vec p);
 Box bounds(Key key);
+bool intersectsPlanetShell(Key key);
 
 class Planet {
 public:

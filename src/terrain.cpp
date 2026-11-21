@@ -135,13 +135,18 @@ Key Chunk::cellIndex(Vec p) const {
 
 Cell Chunk::cellAt(Vec p) const { return cell(cellIndex(p)); }
 
+bool intersectsPlanetShell(Key key) {
+    const auto box = bounds(key);
+    const double rMin = length(box.clamp({}));
+    const double rMax = length(max(abs(box.lo), abs(box.hi)));
+    return rMin <= planetRadius + 1000 && rMax >= planetRadius - 1000;
+}
+
 Layout selectChunks(const std::vector<Vec>& invokers, bool global) {
     Layout result;
     auto offer = [&](Key key) {
         const Box box = bounds(key);
-        const double rMin = length(box.clamp({}));
-        const double rMax = length(max(abs(box.lo), abs(box.hi)));
-        if (rMin > planetRadius + 1000 || rMax < planetRadius - 1000) return;
+        if (!intersectsPlanetShell(key)) return;
         double distance = std::numeric_limits<double>::infinity();
         for (Vec invoker : invokers) distance = std::min(distance, length(box.clamp(invoker) - invoker));
         if (!global && distance > 2.3 * chunkSize) return;
@@ -167,11 +172,13 @@ Layout selectChunks(const std::vector<Vec>& invokers, bool global) {
 
 std::array<int, 27> neighborhood(const Layout& layout, Key key) {
     std::array<int, 27> result;
+    const int lod = layout.at(key);
     int i = 0;
     for (int z = -1; z <= 1; ++z) for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             auto found = layout.find({key.x + x, key.y + y, key.z + z});
-            result[i++] = found == layout.end() ? -1 : found->second;
+            // Only a coarser neighbor constrains the boundary samples or stitching of this chunk.
+            result[i++] = found == layout.end() ? lod : std::max(lod, found->second);
         }
     }
     return result;

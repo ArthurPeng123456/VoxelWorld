@@ -279,12 +279,20 @@ struct Dx12Renderer::Impl {
         state.SampleDesc.Count = 1;
         require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(surfacePipeline.GetAddressOf())), "Create surface pipeline");
 
+        state.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(wireframePipeline.GetAddressOf())), "Create wireframe pipeline");
+        state.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+
+        state.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        state.DepthStencilState.DepthEnable = FALSE;
+        state.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(linePipeline.GetAddressOf())), "Create clipmap line pipeline");
+
         const auto skyVs = compile("skyVS", "vs_5_0"), skyPs = compile("skyPS", "ps_5_0");
         state.VS = {skyVs->GetBufferPointer(), skyVs->GetBufferSize()};
         state.PS = {skyPs->GetBufferPointer(), skyPs->GetBufferSize()};
         state.InputLayout = {};
-        state.DepthStencilState.DepthEnable = FALSE;
-        state.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        state.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(skyPipeline.GetAddressOf())), "Create sky pipeline");
     }
 
@@ -361,11 +369,17 @@ struct Dx12Renderer::Impl {
         };
         list->SetGraphicsRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
         list->DrawInstanced(3, 1, 0, 0);
-        list->SetPipelineState(surfacePipeline.Get());
+        list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get());
         for (const auto* batch : {&terrain, &objects}) {
             if (batch->count == 0) continue;
             list->IASetVertexBuffers(0, 1, &batch->view);
             list->DrawInstanced(batch->count, 1, 0, 0);
+        }
+        if (clipmapLines.count) {
+            list->SetPipelineState(linePipeline.Get());
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+            list->IASetVertexBuffers(0, 1, &clipmapLines.view);
+            list->DrawInstanced(clipmapLines.count, 1, 0, 0);
         }
 
         ComPtr<ID3D12Resource> readback;
@@ -418,16 +432,17 @@ struct Dx12Renderer::Impl {
     std::array<ComPtr<ID3D12Resource>, buffers> back;
     ComPtr<ID3D12Resource> depth;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> skyPipeline, surfacePipeline;
+    ComPtr<ID3D12PipelineState> skyPipeline, surfacePipeline, wireframePipeline, linePipeline;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
-    Upload terrain, objects;
+    Upload terrain, objects, clipmapLines;
 };
 
 Dx12Renderer::Dx12Renderer(HWND target, bool forceWarp) : impl_(std::make_unique<Impl>(target, forceWarp)) {}
 Dx12Renderer::~Dx12Renderer() = default;
 void Dx12Renderer::setTerrain(const std::vector<Vertex>& terrain) { impl_->upload(impl_->terrain, terrain); }
+void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
 void Dx12Renderer::draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture) {
     impl_->draw(camera, objects, capture);
 }

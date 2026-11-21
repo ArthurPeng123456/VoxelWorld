@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -9,6 +10,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace voxel {
 namespace {
@@ -32,7 +34,7 @@ void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
-              << "Defaults: 90 frames, 6 warmup, 2 invokers, 12 queries per type per frame,\n"
+              << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
 
@@ -169,7 +171,7 @@ double percentile(std::vector<double>& sorted, double percent) {
 
 struct QueryMetrics {
     std::vector<double> durations;
-    struct Outcome { Hit::State state; double pathPosition; };
+    struct Outcome { Hit::State state; double pathPosition; bool initial; };
     std::vector<Outcome> results;
     int hits{}, unresolved{}, initial{};
 };
@@ -204,12 +206,18 @@ std::ofstream createFile(const fs::path& path) {
     return stream;
 }
 
-void exportMesh(const fs::path& path, const Chunks& chunks, const std::vector<Vec>& invokers) {
+void exportMesh(const fs::path& path, const World& world, const std::vector<Vec>& invokers, Vec camera) {
     auto out = createFile(path);
     out << "# VoxelWorld Marching Cubes, world coordinates in meters\n";
     for (const Vec p : invokers) out << "# invoker " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+    out << "# camera_invoker " << camera.x << ' ' << camera.y << ' ' << camera.z << '\n';
+    for (const auto& window : world.clipmapWindows()) {
+        const auto& b = window.box;
+        out << "# clipmap " << window.invoker << ' ' << window.lod << ' '
+            << b.lo.x << ' ' << b.lo.y << ' ' << b.lo.z << ' ' << b.hi.x << ' ' << b.hi.y << ' ' << b.hi.z << '\n';
+    }
     std::size_t index = 1;
-    for (const auto& entry : chunks) {
+    for (const auto& entry : world.chunks) {
         const auto& chunk = *entry.second;
         if (chunk.mesh.empty()) continue;
         out << "o chunk_" << chunk.key.x << '_' << chunk.key.y << '_' << chunk.key.z << "_LOD" << chunk.lod << '\n';
@@ -221,14 +229,20 @@ void exportMesh(const fs::path& path, const Chunks& chunks, const std::vector<Ve
     }
 }
 
-void logBuild(std::ostream& out, Method method, int frame, const WorldStats& stats, const World& world,
-              double stepMs, int contacts) {
+void logBuild(std::ostream& out, Method method, int frame, const WorldStats& stats, const std::array<int, 4>& lodCounts,
+              const TerrainMemory& memory, double stepMs, int contacts, bool scheduled) {
     out << name(method) << ',' << frame << ',' << stats.updateMs << ',' << stats.selectMs << ','
         << stats.build.sampleMs << ',' << stats.build.storageMs << ',' << stats.build.meshMs << ','
         << stats.physicsLoadMs << ',' << stats.build.built << ',' << stats.build.removed;
-    for (int count : world.lodCounts()) out << ',' << count;
-    out << ',' << world.fieldBytes() << ',' << world.physics.terrainBytes() << ',' << world.meshBytes()
-        << ',' << stepMs << ',' << contacts << '\n';
+    for (int count : lodCounts) out << ',' << count;
+    out << ',' << memory.fields << ',' << memory.physics << ',' << memory.meshes << ',' << stepMs << ',' << contacts
+        << ',' << scheduled << ',' << stats.windowVisits << ',' << stats.changedOwners << ',' << memory.metadata
+        << ',' << memory.total() << ',' << stats.stagingBytes << '\n';
+}
+
+Vec replayCamera(Vec target, int frame) {
+    const Vec up = unit(target);
+    return target + up * 1450 + frameAt(up)[0] * (1100 + 850 * std::sin(0.06 * frame));
 }
 
 struct QueryResults {
@@ -236,13 +250,16 @@ struct QueryResults {
     std::array<QueryMetrics, std::size(capsuleCases)> capsules;
 };
 
-QueryResults run(const Options& opts, Method method, std::ostream& frames, std::ostream& summary,
-                 const QueryResults* meshReference, std::ostream* capsuleReport) {
+QueryResults run(const Options& opts, Method method, std::ostream& frames, std::ostream& summary, std::ostream& streaming,
+                 const QueryResults* meshReference, const QueryResults* fieldReference, std::ostream* capsuleReport) {
     Planet planet(opts.seed);
     World world(planet, method, opts.morton);
     auto invokers = invokerPositions(planet, opts.invokers, 0);
-    const WorldStats initial = world.update(invokers, opts.global);
-    logBuild(frames, method, -1, initial, world, 0, 0);
+    Vec camera = replayCamera(invokers.front(), 0);
+    const WorldStats initial = world.update(invokers, opts.global, camera);
+    auto memory = world.terrainMemory();
+    auto lodCounts = world.lodCounts();
+    logBuild(frames, method, -1, initial, lodCounts, memory, 0, 0, true);
     spawn(world, planet, opts.bodies, invokers);
     for (int i = 0; i < opts.warmup; ++i) {
         for (const Query& q : queries(planet, invokers, opts.queries, i, opts.seed, opts.capsuleStress)) {
@@ -253,25 +270,44 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
     }
 
     QueryResults metrics;
-    std::vector<double> steps, updates;
+    std::vector<double> steps, updates, changedUpdates, stationaryUpdates, changedSelect;
     int totalBuilt = 0, totalRemoved = 0, maxContacts = 0;
-    std::size_t peakCollision = world.fieldBytes() + world.physics.terrainBytes();
+    std::size_t peakCollision = memory.fields + memory.physics;
+    std::size_t peakResident = memory.total(), peakOverlap = memory.total();
+    std::size_t peakStaged = initial.stagingBytes, peakFields = memory.fields, peakMeshes = memory.meshes;
+    std::size_t visited = 0, changedOwners = 0;
     for (int frame = 0; frame < opts.frames; ++frame) {
         WorldStats stats;
         const auto moving = invokerPositions(planet, opts.invokers, frame);
-        if (frame > 0 && frame % opts.streamEvery == 0) {
-            stats = world.update(moving, opts.global);
+        const bool scheduled = frame > 0 && frame % opts.streamEvery == 0;
+        if (scheduled) {
+            camera = replayCamera(moving.front(), frame);
+            stats = world.update(moving, opts.global, camera);
+            if (stats.build.built || stats.build.removed) {
+                changedUpdates.push_back(stats.updateMs);
+                changedSelect.push_back(stats.selectMs);
+            } else stationaryUpdates.push_back(stats.updateMs);
             updates.push_back(stats.updateMs);
             totalBuilt += stats.build.built;
             totalRemoved += stats.build.removed;
-            peakCollision = std::max(peakCollision, world.fieldBytes() + world.physics.terrainBytes());
+            visited += stats.windowVisits;
+            changedOwners += stats.changedOwners;
+            peakOverlap = std::max(peakOverlap, memory.total() + stats.stagingBytes);
+            memory = world.terrainMemory();
+            lodCounts = world.lodCounts();
+            peakResident = std::max(peakResident, memory.total());
+            peakOverlap = std::max(peakOverlap, memory.total());
+            peakStaged = std::max(peakStaged, stats.stagingBytes);
+            peakCollision = std::max(peakCollision, memory.fields + memory.physics);
+            peakFields = std::max(peakFields, memory.fields);
+            peakMeshes = std::max(peakMeshes, memory.meshes);
         }
         const auto workload = queries(planet, moving, opts.queries, frame, opts.seed, opts.capsuleStress);
         for (const auto& q : workload) {
             const auto timer = Clock::now();
             const Hit result = q.kind == 0 ? world.physics.ray(q.from, q.to) : world.physics.sweep(q.shape, q.from, q.to);
             const auto elapsed = milliseconds(timer) * 1000;
-            const QueryMetrics::Outcome outcome{result.state, result.fraction * length(q.to - q.from)};
+            const QueryMetrics::Outcome outcome{result.state, result.fraction * length(q.to - q.from), result.initial};
             auto& m = metrics.types[q.kind];
             m.durations.push_back(elapsed);
             m.results.push_back(outcome);
@@ -293,17 +329,27 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
         const int contacts = world.physics.terrainContacts();
         maxContacts = std::max(maxContacts, contacts);
         steps.push_back(elapsed);
-        logBuild(frames, method, frame, stats, world, elapsed, contacts);
+        logBuild(frames, method, frame, stats, lodCounts, memory, elapsed, contacts, scheduled);
     }
     if (opts.obj) {
-        exportMesh(opts.output / (std::string(name(method)) + ".obj"), world.chunks,
-                   invokerPositions(planet, opts.invokers, (opts.frames - 1) / opts.streamEvery * opts.streamEvery));
+        exportMesh(opts.output / (std::string(name(method)) + ".obj"), world,
+                   invokerPositions(planet, opts.invokers, (opts.frames - 1) / opts.streamEvery * opts.streamEvery), camera);
     }
 
     int below = 0;
     for (int i = 0; i < opts.bodies; ++i) below += planet.sdf(world.physics.bodyPosition(i)) < -1;
     std::sort(steps.begin(), steps.end());
     std::sort(updates.begin(), updates.end());
+    std::sort(changedUpdates.begin(), changedUpdates.end());
+    std::sort(stationaryUpdates.begin(), stationaryUpdates.end());
+    std::sort(changedSelect.begin(), changedSelect.end());
+    streaming << name(method) << ',' << opts.seed << ',' << opts.invokers << ",1," << opts.global
+              << ',' << initial.updateMs << ',' << updates.size() << ',' << changedUpdates.size()
+              << ',' << percentile(changedUpdates, 0.50) << ',' << percentile(changedUpdates, 0.95)
+              << ',' << percentile(changedUpdates, 1.0) << ',' << percentile(changedSelect, 0.95)
+              << ',' << percentile(stationaryUpdates, 0.95) << ',' << totalBuilt << ',' << totalRemoved
+              << ',' << visited << ',' << changedOwners << ',' << peakResident << ',' << peakOverlap << ',' << peakStaged
+              << ',' << peakFields << ',' << peakMeshes << ',' << peakCollision << '\n';
     std::cout << name(method) << " initial " << initial.updateMs << " ms, step P95 " << percentile(steps, 0.95)
               << " ms, peak collision " << (double(peakCollision) / 1048576) << " MiB, max contacts "
               << maxContacts << ", below analytic surface " << below << '\n';
@@ -324,7 +370,16 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
                 << (m.durations.size() * 1e6 / std::accumulate(m.durations.begin(), m.durations.end(), 0.0))
                 << ',' << initial.updateMs << ',' << percentile(updates, 0.95)
                 << ',' << percentile(steps, 0.50) << ',' << percentile(steps, 0.95) << ',' << percentile(steps, 0.99)
-                << ',' << peakCollision << ',' << totalBuilt << ',' << totalRemoved << ',' << maxContacts << ',' << below << '\n';
+                << ',' << peakCollision << ',' << totalBuilt << ',' << totalRemoved << ',' << maxContacts << ',' << below << ',';
+        if (fieldReference) {
+            const auto& reference = fieldReference->types[i].results;
+            const auto different = std::inner_product(reference.begin(), reference.end(), m.results.begin(), 0,
+                std::plus<int>{}, [](const QueryMetrics::Outcome& a, const QueryMetrics::Outcome& b) {
+                    return a.state != b.state || a.initial != b.initial || std::abs(a.pathPosition - b.pathPosition) > 1e-8;
+                });
+            summary << different;
+        }
+        summary << '\n';
         std::cout << "  " << labels[i] << " P95 " << percentile(m.durations, 0.95) << " us, hits "
                   << m.hits << ", unresolved " << m.unresolved;
         if (meshReference) std::cout << ", mismatches " << comparison.mismatch << ", paired P95 error " << comparison.p95Distance << " m";
@@ -368,11 +423,52 @@ std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, 
 void selfTest() {
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
-    const auto one = selectChunks(first, false), two = selectChunks(both, false);
+    Clipmap clipmap;
+    std::size_t visits = 0;
+    clipmap.update(first, false, visits);
+    const auto one = clipmap.layout();
+    check(visits == 27 + 125 + 343 + 729, "one invoker adds four clipmap windows");
+    check(clipmap.update(first, false, visits).empty() && visits == 0, "stationary invoker visits no slabs");
+    const Box home = bounds(keyAt(first[0]));
+    Vec nearEdge = home.center();
+    nearEdge.x = home.hi.x + 100;
+    check(clipmap.update({nearEdge}, false, visits).empty() && visits == 0, "anchor hysteresis retains coverage near edge");
+    nearEdge.x = home.hi.x + 250;
+    clipmap.update({nearEdge}, false, visits);
+    check(visits == 2 * (9 + 25 + 49 + 81), "a one-axis move touches only the entering and leaving slabs");
+    const auto withOneMoved = clipmap.layout();
+    check(clipmap.update({nearEdge, nearEdge}, false, visits).empty() && clipmap.layout() == withOneMoved,
+          "overlapping invokers share world chunks");
+    check(clipmap.update({nearEdge}, false, visits).empty() && clipmap.layout() == withOneMoved,
+          "one invoker leaving does not evict shared coverage");
+    clipmap.update(both, false, visits);
+    auto fullWindowLayout = [&] {
+        Layout expected;
+        for (const auto& w : clipmap.windows()) {
+            const Key lo = keyAt(w.box.lo), hi = keyAt(w.box.hi);
+            for (int z = lo.z; z < hi.z; ++z) for (int y = lo.y; y < hi.y; ++y) for (int x = lo.x; x < hi.x; ++x) {
+                const Key key{x, y, z};
+                if (!intersectsPlanetShell(key)) continue;
+                auto [it, inserted] = expected.try_emplace(key, w.lod);
+                if (!inserted) it->second = std::min(it->second, w.lod);
+            }
+        }
+        return expected;
+    };
+    for (int frame = 5; frame <= 165; frame += 5) {
+        clipmap.update(invokerPositions(planet, 2, frame), false, visits);
+        check(clipmap.layout() == fullWindowLayout(), "incremental clipmap equals full coverage for multiple moving invokers");
+    }
+    Clipmap fresh;
+    fresh.update(both, false, visits);
+    const auto two = fresh.layout();
     check(two.size() > one.size(), "two invokers load additional chunks");
     for (const auto& entry : one) check(two.at(entry.first) <= entry.second, "nearest invoker wins");
-    check(neighborhood(two, keyAt(first[0])) != neighborhood(selectChunks(invokerPositions(planet, 2, 25), false),
-                                                           keyAt(first[0])), "moving invokers change LOD");
+    check(two != clipmap.layout(), "moving invokers change LOD");
+    fresh.update({}, true, visits);
+    check(fresh.layout().size() > two.size() && fresh.layout().at(keyAt(first[0])) == 3, "global shell falls back to LOD 3");
+    fresh.update({}, false, visits);
+    check(fresh.layout().empty(), "unloaded clipmap releases all owners");
     check(std::abs(planet.sdf(planet.surface(both[0] / length(both[0])))) < 1e-4, "planet surface is zero");
 
     bool seamTested = false;
@@ -399,6 +495,39 @@ void selfTest() {
         if (seamTested) break;
     }
     check(seamTested, "the test layout contains mixed LOD neighbors");
+
+    const Vec oldPoint = first[0];
+    const Vec newPoint = planet.surface(unit(oldPoint) * -1);
+    for (Method method : {Method::Grid, Method::Dag, Method::Vdb}) {
+        World world(planet, method, false);
+        const auto probe = [&](Vec target) {
+            const Vec up = unit(target);
+            const Vec from = target + up * 500, to = target - up * 500;
+            return std::make_pair(world.physics.ray(from, to), world.physics.sweep(sampleShape(2, up), from, to));
+        };
+        auto before = world.update({}, false, oldPoint);
+        check(before.build.built > 0 && world.chunks.at(keyAt(oldPoint))->lod == 0, "the camera alone can load LOD 0");
+        const auto a = probe(oldPoint);
+        check(a.first.state == Hit::State::Contact && a.second.state == Hit::State::Contact, "camera footprint supports ray and capsule casts");
+        WorldStats after;
+        if (method == Method::Grid) {
+            check(world.requestUpdate({}, false, newPoint), "viewer accepts an asynchronous camera move");
+            check(!world.requestUpdate({}, false, oldPoint) && world.chunks.count(keyAt(oldPoint)) != 0 &&
+                  world.chunks.count(keyAt(newPoint)) == 0 && world.clipmapWindows()[0].box.contains(oldPoint),
+                  "queries and debug windows retain the published world while replacements are built");
+            const auto deadline = Clock::now() + std::chrono::seconds(20);
+            std::optional<WorldStats> result;
+            while (!(result = world.pollUpdate()) && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(result.has_value(), "background Clipmap batch publishes");
+            after = *result;
+        } else after = world.update({}, false, newPoint);
+        check(after.build.removed > 0 && after.build.built > 0 && world.chunks.count(keyAt(oldPoint)) == 0,
+              "camera teleport publishes new chunks and removes expired chunks");
+        const auto b = probe(newPoint), expired = probe(oldPoint);
+        check(b.first.state == Hit::State::Contact && b.second.state == Hit::State::Contact &&
+              expired.first.state == Hit::State::Miss && expired.second.state == Hit::State::Miss,
+              "casts use only the published camera coverage after a teleport");
+    }
 
     for (const auto& option : {std::make_pair(Method::Mesh, false), std::make_pair(Method::Grid, false),
                               std::make_pair(Method::Grid, true), std::make_pair(Method::Dag, false),
@@ -508,6 +637,7 @@ int main(int argc, char** argv) {
         fs::create_directories(opts.output);
         auto frames = createFile(opts.output / "frames.csv");
         auto summary = createFile(opts.output / "summary.csv");
+        auto streaming = createFile(opts.output / "streaming.csv");
         std::ofstream capsuleReport;
         if (opts.capsuleStress) {
             capsuleReport = createFile(opts.output / "capsule-cases.csv");
@@ -515,23 +645,28 @@ int main(int argc, char** argv) {
                              "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m\n";
         }
         frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,"
-                  "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts\n";
+                  "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts,"
+                  "scheduled,window_visits,changed_owners,metadata_bytes,resident_terrain_bytes,staged_terrain_bytes\n";
+        streaming << "scheme,seed,actor_invokers,camera_invokers,global,initial_ms,scheduled_updates,changed_updates,"
+                     "changed_p50_ms,changed_p95_ms,changed_max_ms,changed_select_p95_ms,unchanged_p95_ms,"
+                     "built,removed,window_visits,changed_owners,peak_resident_bytes,estimated_peak_overlap_bytes,"
+                     "peak_staged_bytes,peak_field_bytes,peak_mesh_bytes,peak_collision_bytes\n";
         summary << "scheme,query,layout,seed,frames,invokers,bodies,global,warmup,stream_every,queries,hits,initial,unresolved,"
                    "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m,p50_us,p95_us,p99_us,queries_per_second,initial_ms,update_p95_ms,step_p50_ms,"
-                   "step_p95_ms,step_p99_ms,peak_collision_bytes,stream_built,stream_removed,max_terrain_contacts,body_centers_below_analytic\n";
-        QueryResults reference;
-        bool hasMesh = false;
+                   "step_p95_ms,step_p99_ms,peak_collision_bytes,stream_built,stream_removed,max_terrain_contacts,body_centers_below_analytic,"
+                   "vs_first_field_different\n";
+        std::optional<QueryResults> reference, fieldReference;
         std::cout << std::fixed << std::setprecision(3);
         for (Method method : opts.methods) {
-            auto result = run(opts, method, frames, summary, hasMesh ? &reference : nullptr,
+            auto result = run(opts, method, frames, summary, streaming, reference ? &*reference : nullptr,
+                              fieldReference ? &*fieldReference : nullptr,
                               opts.capsuleStress ? &capsuleReport : nullptr);
-            if (method == Method::Mesh) {
-                reference = std::move(result);
-                hasMesh = true;
-            }
+            if (method == Method::Mesh) reference = std::move(result);
+            else if (!fieldReference) fieldReference = std::move(result);
         }
         frames.close();
         summary.close();
+        streaming.close();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
