@@ -15,7 +15,7 @@
 
 ## Windows 查看器
 
-双击打包目录里的 `VoxelWorldViewer.exe`。查看器使用 Windows 原生 Direct3D 12，渲染实时生成的 Marching Cubes 网格，并用当前碰撞方案模拟刚体。默认同步两条移动 Invoker 路径。
+双击打包目录里的 `VoxelWorldViewer.exe`。查看器使用 Windows 原生 Direct3D 12，渲染实时生成的 Marching Cubes 网格，并用当前碰撞方案模拟刚体。摄像机实际位置始终参与数据 LOD，默认还有两条移动 Invoker 路径。暂停时仍可移动摄像机并更新驻留范围。轨道相机远离地表时，其窗口可能与地表采样带不相交。
 
 | 操作 | 快捷键 |
 | --- | --- |
@@ -24,6 +24,8 @@
 | 绕视角中心旋转和缩放 | 左键拖动、滚轮 |
 | 跟随下一个移动 Invoker | `Tab` |
 | 开关 LOD 着色 | `L` |
+| 开关各 Invoker 的 3D LOD 窗口线框 | `K` |
+| 切换地形和刚体的三角形线框渲染 | `W` 或 `Wireframe [W]` |
 | 向当前 Invoker 附近投放一组球、胶囊和盒子 | `B` |
 | 暂停或重置模拟 | `Space`、`R` |
 
@@ -31,7 +33,7 @@
 
 ### 在 Windows 上重新构建
 
-安装 Visual Studio 2022 或 2026，选择「使用 C++ 的桌面开发」、Windows SDK 和 CMake。在项目根目录的 PowerShell 中运行构建脚本。首次构建会下载并校验 Bullet3、OpenVDB、oneTBB 和 Imath 源码，编译 Win64 Release 版本。添加 `-Test` 还会执行本机 CTest。 [Visual Studio C++ 安装说明](https://learn.microsoft.com/en-us/cpp/build/vscpp-step-0-installation)
+安装 Visual Studio 2022 或 2026，选择「使用 C++ 的桌面开发」、Windows SDK 和 CMake。在项目根目录的 PowerShell 中运行构建脚本。首次构建会下载并校验依赖源码，准备 Debug 和 Release 各自链接的库，并生成 Win64 Visual Studio 解决方案。脚本默认编译 Release。添加 `-Test` 会对所选配置执行本机 CTest。 [Visual Studio C++ 安装说明](https://learn.microsoft.com/en-us/cpp/build/vscpp-step-0-installation)
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
@@ -39,9 +41,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 .\build-windows-native\dist\voxel_world.exe --scheme all --out results-windows
 ```
 
+要构建 Debug 并生成 PDB，运行下面的命令。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Configuration Debug -Test
+```
+
+在 Visual Studio 中打开 `build-windows-native` 下的 `VoxelWorld.sln` 或 `VoxelWorld.slnx`，选择 **Debug | x64**，确认启动项目为 **VoxelWorldViewer**，按 **F5**。调试命令行基准时，把 **voxel_world** 设为启动项目，可在项目的调试属性中填入 `--self-test`。打包后的 Debug 可执行文件和 PDB 位于 `build-windows-native\dist-debug`，Release 仍输出到 `build-windows-native\dist`。
+
 ### 浏览器预览
 
-双击生成的 `VoxelWorld.html` 可离线查看同一份 Marching Cubes 网格。支持全星球、地表、Invoker 位置切换和 LOD 着色。此预览展示导出时的地形快照，实时碰撞和动态块更新由原生查看器执行。预览把坐标量化到 1 米以减小文件体积。
+双击生成的 `VoxelWorld.html` 可离线查看同一份 Marching Cubes 网格。支持全星球、地表、Invoker 位置切换、LOD 着色和窗口线框。线框使用 OBJ 导出的窗口坐标，包括当时的摄像机 Invoker。此预览展示导出时的地形快照，实时碰撞和动态块更新由原生查看器执行。预览把网格坐标量化到 1 米以减小文件体积。
 
 ```bash
 ./build/voxel_world --scheme mesh --global --frames 1 --warmup 0 --bodies 0 --obj --out results-windows-preview
@@ -71,10 +81,10 @@ cmake --build build --parallel
 
 ## Invoker、LOD 和测量
 
-- `--invokers N` 控制移动的 Invoker 数量，默认两条不同路径。每个 1,600 米块按离它最近的 Invoker 选 LOD，样本间距为 50、100、200 或 400 米。相邻块共用边界采样，细块边界从粗块尺度插值。默认仅保留 Invoker 周围的地表块。`--global` 保留整个星球的地表块，远区使用粗 LOD。
-- `--stream-every N` 指定多少帧更新一次块覆盖和 LOD，默认每六帧。已有块在局部 LOD 拓扑改变时重建，同步卸载旧碰撞体及其接触缓存。基准刻意分开记录流式更新和物理步进耗时。
+- `--invokers N` 控制回放的演员 Invoker 数量，默认两条不同路径。CLI 另加一条模拟的移动摄像机路径。每个源有四个对齐到 1,600 米世界块的立体窗口，边长为 3、5、7、9 块，采样间距为 50、100、200、400 米。窗口重叠处用最细层，世界块只驻留一份。默认保留窗口与地表采样带的交集。`--global` 给窗口外的地表块提供 LOD 3。
+- `--stream-every N` 指定多少帧更新一次块覆盖，默认每六帧。窗口中心有 200 米滞回。移动跨过阈值时只遍历进出的切片。归属变动的块及接缝受影响的邻块先构建，再在物理步之间发布。查看器后台构建，发布前继续使用旧碰撞块和旧线框。CLI 使用同步构建来测量完整更新成本。`L` 显示实际地表块的 LOD，`K` 显示窗口的几何覆盖，两者可配合查看地表筛选和 Invoker 重叠。
 - `--frames`、`--queries`、`--bodies`、`--seed` 和 `--warmup` 可调。默认每帧每类 12 次查询，48 个动态刚体，90 个测量帧。Headless 单线程运行四个独立物理世界，按同样的顺序重放输入。查询只包含地形。
-- `summary.csv` 包含四类查询的 P50/P95/P99、命中、未判定、与网格方案的分歧及共同命中的 TOI 差值，并给出刚体步进、碰撞内存和初次构建统计。TOI 差值用扫掠路径上的米数表示，三角形与三线性零等值面之间本身存在几何差异。`frames.csv` 包含采样、存储构建、Marching Cubes、Bullet 注册和卸载、各 LOD 块数及内存估算。内存列是已发布数据的估算，单位为字节；分配器开销和构建临时峰值需要另行测量。
+- `summary.csv` 包含四类查询的 P50/P95/P99、命中、未判定、与网格方案的分歧及共同命中的 TOI 差值。`vs_first_field_different` 逐条比较字段后端的状态、初始重叠和 TOI。`frames.csv` 包含各层块数、移动扫描和构建阶段。`streaming.csv` 分开统计有块变更、无块变更的调度，并列出字段、碰撞体、CPU 渲染网格、调度元数据与新旧块并存时的内存估算。实际进程峰值 RSS 可用 `/usr/bin/time -f %M` 按后端单独测量。
 
 ### 胶囊 ShapeCast 压力测试
 

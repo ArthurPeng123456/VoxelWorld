@@ -49,6 +49,15 @@ set(CMAKE_PREFIX_PATH "${OPENVDB_ROOT};${CMAKE_PREFIX_PATH}")
 find_package(OpenVDB CONFIG REQUIRED)
 # ==========================================================
 
+if(MSVC AND VOXEL_OPENVDB_DEBUG_LIBRARY)
+    # OpenVDB's Find module exposes only one library location on Windows.
+    get_target_property(openvdb_release OpenVDB::openvdb IMPORTED_LOCATION)
+    set_target_properties(OpenVDB::openvdb PROPERTIES
+        IMPORTED_CONFIGURATIONS "DEBUG;RELEASE"
+        IMPORTED_LOCATION_DEBUG "${VOXEL_OPENVDB_DEBUG_LIBRARY}"
+        IMPORTED_LOCATION_RELEASE "${openvdb_release}")
+endif()
+
 function(voxel_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4)
@@ -83,7 +92,12 @@ if(WIN32)
         target_link_options(VoxelWorldViewer PRIVATE -municode)
     endif()
     voxel_warnings(VoxelWorldViewer)
+    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT VoxelWorldViewer)
     install(TARGETS VoxelWorldViewer RUNTIME DESTINATION .)
+    if(MSVC)
+        install(FILES "$<TARGET_PDB_FILE:voxel_world>" "$<TARGET_PDB_FILE:VoxelWorldViewer>"
+            DESTINATION . CONFIGURATIONS Debug)
+    endif()
     install(FILES third_party/VTK-Copyright.txt DESTINATION licenses)
     if(NOT VOXEL_SYSTEM_BULLET)
         install(FILES "${bullet_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses RENAME Bullet-LICENSE.txt)
