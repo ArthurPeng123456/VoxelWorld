@@ -3,6 +3,7 @@ project(VoxelWorld LANGUAGES CXX)
 
 option(VOXEL_SYSTEM_BULLET "Use an installed Bullet SDK instead of the pinned Bullet3 source" OFF)
 set(VOXEL_BULLET_ARCHIVE "" CACHE FILEPATH "Optional local copy of the pinned Bullet3 archive")
+
 if(VOXEL_SYSTEM_BULLET)
     find_package(Bullet REQUIRED)
 else()
@@ -34,32 +35,19 @@ else()
     set(BULLET_INCLUDE_DIRS "${bullet_SOURCE_DIR}/src")
     set(BULLET_LIBRARIES BulletDynamics BulletCollision LinearMath)
 endif()
-find_package(TBB REQUIRED)
-find_package(OpenVDB CONFIG QUIET)
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_MODULE_DIR FindOpenVDB.cmake PATH_SUFFIXES share/openvdb lib/cmake/OpenVDB)
-    if(OPENVDB_MODULE_DIR)
-        list(APPEND CMAKE_MODULE_PATH "${OPENVDB_MODULE_DIR}")
-        find_package(OpenVDB MODULE REQUIRED)
-    endif()
+# 禁止vcpkg对OpenVDB自动查找依赖
+set(VCPKG_HOOK_OPENPACKAGE_OpenVDB OFF CACHE INTERNAL "")
+set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
+
+# ========== 自动选择 Debug / Release OpenVDB 路径 ==========
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(OPENVDB_ROOT "D:/UE/openvdb-14.0.0/out/install/x64-Debug")
+else()
+    set(OPENVDB_ROOT "D:/UE/openvdb-14.0.0/out/install/x64-Release")
 endif()
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_INCLUDE_DIR openvdb/openvdb.h REQUIRED)
-    find_library(OPENVDB_LIBRARY openvdb REQUIRED)
-    find_package(Imath CONFIG QUIET)
-    add_library(OpenVDB::openvdb UNKNOWN IMPORTED)
-    set_target_properties(OpenVDB::openvdb PROPERTIES
-        IMPORTED_LOCATION "${OPENVDB_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${OPENVDB_INCLUDE_DIR}")
-    if(TARGET Imath::Imath)
-        target_link_libraries(OpenVDB::openvdb INTERFACE Imath::Imath)
-    else()
-        find_library(ILMBASE_HALF_LIBRARY Half)
-        if(ILMBASE_HALF_LIBRARY)
-            target_link_libraries(OpenVDB::openvdb INTERFACE "${ILMBASE_HALF_LIBRARY}")
-        endif()
-    endif()
-endif()
+set(CMAKE_PREFIX_PATH "${OPENVDB_ROOT};${CMAKE_PREFIX_PATH}")
+find_package(OpenVDB CONFIG REQUIRED)
+# ==========================================================
 
 function(voxel_warnings target)
     if(MSVC)
@@ -76,12 +64,14 @@ if(MSVC)
 else()
     target_include_directories(voxel_core SYSTEM PRIVATE ${BULLET_INCLUDE_DIRS})
 endif()
-target_link_libraries(voxel_core PRIVATE ${BULLET_LIBRARIES} OpenVDB::openvdb TBB::tbb)
+# 移除 TBB::tbb
+target_link_libraries(voxel_core PRIVATE ${BULLET_LIBRARIES} OpenVDB::openvdb)
 voxel_warnings(voxel_core)
 
 add_executable(voxel_world src/main.cpp)
 target_link_libraries(voxel_world PRIVATE voxel_core)
 voxel_warnings(voxel_world)
+
 install(TARGETS voxel_world RUNTIME DESTINATION .)
 
 if(WIN32)
@@ -102,3 +92,42 @@ endif()
 
 enable_testing()
 add_test(NAME voxel_world_correctness COMMAND voxel_world --self-test)
+
+# 复制当前配置对应的 OpenVDB dll（已经删掉 TBB_DLLS）
+set(OPENVDB_BIN "${OPENVDB_ROOT}/bin")
+file(GLOB OPENVDB_DLLS "${OPENVDB_BIN}/*.dll")
+
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${OPENVDB_DLLS}
+    $<TARGET_FILE_DIR:voxel_world>
+)
+
+add_custom_command(TARGET VoxelWorldViewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${OPENVDB_DLLS}
+    $<TARGET_FILE_DIR:VoxelWorldViewer>
+)
+
+# ========== Intel oneAPI 离线安装版 oneTBB 自动拷贝DLL ==========
+set(TBB_OFFLINE_ROOT "C:/Program Files (x86)/Intel/oneAPI/tbb/latest" CACHE PATH "oneTBB离线安装根目录")
+
+# 离线版dll固定在 redist/intel64/vc14/
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(TBB_DLL "${TBB_OFFLINE_ROOT}/bin/tbb12_debug.dll")
+else()
+    set(TBB_DLL "${TBB_OFFLINE_ROOT}/bin/tbb12.dll")
+endif()
+
+# 拷贝TBB dll
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TBB_DLL}" $<TARGET_FILE_DIR:voxel_world>/
+    COMMENT "【离线oneTBB】Copy tbb dll..."
+)
+
+# 顺带拷贝OpenVDB dll（Debug名字是openvdb_d.dll）
+set(OPENVDB_DLL "${OPENVDB_ROOT}/bin/$<IF:$<CONFIG:Debug>,openvdb.dll,openvdb.dll>")
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENVDB_DLL}" $<TARGET_FILE_DIR:voxel_world>/
+    COMMENT "Copy OpenVDB dll..."
+)
