@@ -48,6 +48,7 @@ float visibility(float3 relative, float3 normal, float depth) {
     float value = shadowAt(index, relative, normal);
     float previous = index ? shadowSplits[index - 1] : projection.z;
     float blend = smoothstep(0.9, 1, (depth - previous) / max(1, shadowSplits[index] - previous));
+    [branch] if (blend <= 0) return value;
     float next = index < 3 ? shadowAt(min(index + 1, 3u), relative, normal) : 1;
     return lerp(value, next, blend);
 }

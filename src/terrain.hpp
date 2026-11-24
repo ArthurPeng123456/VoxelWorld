@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -69,8 +70,21 @@ constexpr int fieldRootLevel() {
 constexpr int rootLevel = fieldRootLevel();
 constexpr int coarsestSurfaceLevel = rootLevel > 3 ? rootLevel - 3 : 0;
 constexpr int lodCount = rootLevel + 7; // The 0.125x grid requires three additional levels.
+constexpr double fieldSideLength = chunkSize * (1u << (rootLevel + 1));
+constexpr std::uint32_t defaultLod0Radius = 512;
+constexpr bool validLod0Radius(std::uint32_t radius) {
+    return radius > 0 && (radius & (radius - 1)) == 0 && radius < fieldSideLength;
+}
+// The first doubled radius reaching the side length is the field-wide fallback.
+constexpr int lodWindowCount(std::uint32_t radius) {
+    if (!validLod0Radius(radius)) return 0;
+    int count = 0;
+    for (double extent = radius; extent < fieldSideLength; extent *= 2) ++count;
+    return count;
+}
 inline double gridChunkSize(int densityShift) { return std::ldexp(chunkSize, densityShift); }
-inline int gridRootLevel(int densityShift) { return rootLevel - densityShift; }
+constexpr int gridRootLevel(int densityShift) { return rootLevel - densityShift; }
+constexpr std::uint32_t fieldCellsPerAxis(int densityShift) { return fineCells * (1u << (gridRootLevel(densityShift) + 1)); }
 constexpr float background = 2400.0f;
 
 struct Key {
@@ -150,8 +164,17 @@ struct BuildStats {
 };
 
 using Layout = std::map<Key, int>;
+struct ClipmapWindow {
+    std::size_t invoker;
+    int lod;
+    Box box;
+};
+struct ClipmapSlab { Box box; int lod; };
 inline int layoutDensityShift(const Layout& layout) { return layout.empty() ? 0 : layout.begin()->first.densityShift; }
-Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr, int densityShift = 0);
+Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr, int densityShift = 0,
+                    std::uint32_t lod0Radius = defaultLod0Radius);
+std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vector<ClipmapWindow>& windows,
+                                 const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits);
 std::optional<Key> leafAt(const Layout& layout, Vec point);
 std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
 Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift = 0);

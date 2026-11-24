@@ -30,6 +30,8 @@ public:
     Dx12Renderer(HWND window, bool forceWarp, bool debug = false);
     ~Dx12Renderer();
     void setTerrain(const std::vector<Vertex>& terrain);
+    void clearTerrain();
+    void setTerrainPage(Key page, Box bounds, const std::vector<Vertex>& vertices);
     void setClipmapLines(const std::vector<Vertex>& lines);
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {}, bool inspectPipeline = false);
     RenderDiagnostics diagnostics() const;

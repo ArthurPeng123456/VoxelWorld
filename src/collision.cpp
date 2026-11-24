@@ -862,6 +862,7 @@ struct Physics::Impl {
     Impl(Method method, const Chunks& chunks)
         : method(method), chunks(chunks), dispatcher(&configuration), world(&dispatcher, &broadphase, &solver, &configuration) {
         world.setGravity(btVector3(0, 0, 0));
+        world.setForceUpdateAllAabbs(false);
         world.getSolverInfo().m_numIterations = 12;
         for (int type : {SPHERE_SHAPE_PROXYTYPE, CAPSULE_SHAPE_PROXYTYPE, BOX_SHAPE_PROXYTYPE}) {
             dispatcher.registerCollisionCreateFunc(type, CUSTOM_CONCAVE_SHAPE_TYPE, &forward);
@@ -871,6 +872,13 @@ struct Physics::Impl {
     ~Impl() {
         for (auto& body : bodies) world.removeRigidBody(body.body.get());
         for (auto& item : fixed) world.removeCollisionObject(item.second.object.get());
+    }
+
+    void wakeBodies(Box box) {
+        for (auto& body : bodies) {
+            const Vec pos = voxelVec(body.body->getWorldTransform().getOrigin());
+            if (box.expanded(splat(body.shape->getAngularMotionDisc())).contains(pos)) body.body->activate();
+        }
     }
 
     Method method;
@@ -914,22 +922,21 @@ void Physics::addTerrain(const Chunk& chunk) {
     }
     fixed.object = std::make_unique<btCollisionObject>();
     fixed.object->setCollisionFlags(btCollisionObject::CF_STATIC_OBJECT);
+    // The terrain proxy stays at its insertion bounds until the chunk is replaced.
+    fixed.object->setActivationState(ISLAND_SLEEPING);
     fixed.object->setCollisionShape(fixed.shape.get());
     fixed.object->setWorldTransform(transform);
     fixed.object->setFriction(btScalar(0.8));
     fixed.bytes += sizeof(btCollisionObject) + sizeof(btDbvtProxy);
     impl_->world.addCollisionObject(fixed.object.get(), terrainGroup, bodyGroup);
+    impl_->wakeBodies(chunk.box);
     impl_->fixed.emplace(chunk.key, std::move(fixed));
 }
 
 void Physics::removeTerrain(Key key) {
     auto found = impl_->fixed.find(key);
     if (found == impl_->fixed.end()) return;
-    const Box bounds = voxel::bounds(key);
-    for (auto& body : impl_->bodies) {
-        const Vec pos = voxelVec(body.body->getWorldTransform().getOrigin());
-        if (bounds.expanded(splat(body.shape->getAngularMotionDisc())).contains(pos)) body.body->activate();
-    }
+    impl_->wakeBodies(bounds(key));
     impl_->world.removeCollisionObject(found->second.object.get());
     impl_->fixed.erase(found);
 }

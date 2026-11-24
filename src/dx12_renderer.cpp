@@ -30,6 +30,30 @@ struct FrameConstants {
 };
 static_assert(sizeof(FrameConstants) == 108 * sizeof(float));
 
+struct RelativeBounds {
+    Vec center, extent;
+    RelativeBounds(Box box, Vec eye) : center(box.center() - eye), extent((box.hi - box.lo) * 0.5) {
+        // Allow for the GPU's final conversion of camera-relative coordinates to float.
+        extent = extent + splat(1.0 + 4e-7 * length(center));
+    }
+    double projectionRadius(Vec axis) const { return dot(extent, abs(axis)); }
+    double maximum(Vec axis) const { return dot(center, axis) + projectionRadius(axis); }
+    bool visible(const Camera& camera, double xScale, double yScale) const {
+        return maximum(camera.forward) >= camera.nearPlane && -maximum(camera.forward * -1) <= camera.farPlane &&
+               maximum(camera.forward + camera.right * xScale) >= 0 && maximum(camera.forward - camera.right * xScale) >= 0 &&
+               maximum(camera.forward + camera.up * yScale) >= 0 && maximum(camera.forward - camera.up * yScale) >= 0;
+    }
+    bool visible(const ShadowCascade& cascade) const {
+        for (int axis = 0; axis < 3; ++axis) {
+            const auto& row = cascade.rows[axis];
+            const Vec direction{row[0], row[1], row[2]};
+            const double p = dot(center, direction) + row[3], r = projectionRadius(direction);
+            if (p - r > 1 || p + r < (axis == 2 ? 0 : -1)) return false;
+        }
+        return true;
+    }
+};
+
 double halfValue(std::uint16_t bits) {
     const unsigned exponent = (bits >> 10) & 31, mantissa = bits & 1023;
     const double sign = bits & 0x8000 ? -1.0 : 1.0;
@@ -115,6 +139,13 @@ struct Dx12Renderer::Impl {
         UINT64 capacity{};
         D3D12_VERTEX_BUFFER_VIEW view{};
         UINT count{};
+    };
+    struct TerrainPage {
+        Box bounds;
+        Upload staging;
+        ComPtr<ID3D12Resource> vertices;
+        D3D12_VERTEX_BUFFER_VIEW view{};
+        bool dirty{};
     };
     struct Readback { ComPtr<ID3D12Resource> resource; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; };
 
@@ -392,6 +423,26 @@ struct Dx12Renderer::Impl {
         result.view = {result.resource->GetGPUVirtualAddress(), UINT(size), UINT(sizeof(GpuVertex))};
     }
 
+    void copyTerrainPages() {
+        for (auto& item : terrainPages) {
+            auto& page = item.second;
+            if (!page.dirty) continue;
+            if (!page.vertices || page.vertices->GetDesc().Width < page.staging.view.SizeInBytes) {
+                const auto properties = heap(D3D12_HEAP_TYPE_DEFAULT);
+                const auto desc = buffer(page.staging.capacity);
+                require(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, nullptr,
+                    IID_PPV_ARGS(page.vertices.ReleaseAndGetAddressOf())), "Allocate device terrain buffer");
+            }
+            const auto size = page.staging.view.SizeInBytes;
+            transition(*list.Get(), page.vertices.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(page.vertices.Get(), 0, page.staging.resource.Get(), 0, size);
+            transition(*list.Get(), page.vertices.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+            page.view = {page.vertices->GetGPUVirtualAddress(), size, UINT(sizeof(GpuVertex))};
+            page.dirty = false;
+        }
+    }
+
     Readback copyReadback(ID3D12Resource* source, UINT subresource, D3D12_RESOURCE_STATES state) {
         Readback result;
         UINT64 bytes = 0;
@@ -479,12 +530,13 @@ struct Dx12Renderer::Impl {
         const auto ex = splitDouble(camera.eye.x), ey = splitDouble(camera.eye.y), ez = splitDouble(camera.eye.z);
         const Vec planetEye = camera.eye - camera.planetCenter;
         const auto px = splitDouble(planetEye.x), py = splitDouble(planetEye.y), pz = splitDouble(planetEye.z);
+        const float xScale = float(1.92 * double(height) / width), yScale = 1.92f;
         const float constants[] = {
             ex.hi,ey.hi,ez.hi,0,ex.lo,ey.lo,ez.lo,0,
             float(camera.right.x),float(camera.right.y),float(camera.right.z),camera.atmosphereEnabled ? 1.0f : 0.0f,
             float(camera.up.x),float(camera.up.y),float(camera.up.z),0,
             float(camera.forward.x),float(camera.forward.y),float(camera.forward.z),0,
-            float(1.92 * double(height) / width),1.92f,float(camera.nearPlane),float(camera.farPlane),
+            xScale,yScale,float(camera.nearPlane),float(camera.farPlane),
             float(sun.x),float(sun.y),float(sun.z),camera.lodTint ? 1.0f : 0.0f,
             px.hi,py.hi,pz.hi,0,px.lo,py.lo,pz.lo,0,
             float(planetRadius),float(planetRadius + atmosphereHeight),8000,1200
@@ -510,17 +562,30 @@ struct Dx12Renderer::Impl {
         frameUpload->Unmap(0, nullptr);
         require(allocator->Reset(), "Reset command allocator");
         require(list->Reset(allocator.Get(), nullptr), "Reset command list");
+        copyTerrainPages();
         list->SetGraphicsRootSignature(root.Get());
         ID3D12DescriptorHeap* heaps[]{srv.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootConstantBufferView(0, frameUpload->GetGPUVirtualAddress());
         list->SetGraphicsRoot32BitConstant(1, 0, 0);
         list->SetGraphicsRootDescriptorTable(2, srv->GetGPUDescriptorHandleForHeapStart());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        auto geometry = [&] {
-            for (const auto* batch : {&terrain, &objects}) if (batch->count) {
-                list->IASetVertexBuffers(0, 1, &batch->view);
-                list->DrawInstanced(batch->count, 1, 0, 0);
-            }
+        std::vector<const TerrainPage*> visible;
+        std::array<std::vector<const TerrainPage*>, shadowCascadeCount> casters;
+        for (const auto& item : terrainPages) {
+            const RelativeBounds box(item.second.bounds, camera.eye);
+            if (box.visible(camera, xScale, yScale)) visible.push_back(&item.second);
+            if (frame.shadow[0] > 0) for (int i = 0; i < shadowCascadeCount; ++i)
+                if (box.visible(csm.cascades[i])) casters[i].push_back(&item.second);
+        }
+        auto geometry = [&](const std::vector<const TerrainPage*>& pages) {
+            const auto drawBatch = [&](const D3D12_VERTEX_BUFFER_VIEW& view, UINT count) {
+                if (!count) return;
+                list->IASetVertexBuffers(0, 1, &view);
+                list->DrawInstanced(count, 1, 0, 0);
+            };
+            drawBatch(terrain.view, terrain.count);
+            for (const auto* page : pages) drawBatch(page->view, page->staging.count);
+            drawBatch(objects.view, objects.count);
         };
         // Four conventional-depth CSM layers; scene depth remains reverse Z.
         transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -533,7 +598,7 @@ struct Dx12Renderer::Impl {
             list->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
             list->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
             list->SetGraphicsRoot32BitConstant(1, i, 0);
-            if (frame.shadow[0] > 0) geometry();
+            if (frame.shadow[0] > 0) geometry(casters[i]);
         }
         transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
@@ -550,10 +615,10 @@ struct Dx12Renderer::Impl {
         list->ClearDepthStencilView(sceneDsv, D3D12_CLEAR_FLAG_DEPTH, 0, 0, 0, nullptr);
         if (camera.wireframe) {
             list->OMSetRenderTargets(0, nullptr, FALSE, &sceneDsv);
-            list->SetPipelineState(depthPipeline.Get()); geometry();
+            list->SetPipelineState(depthPipeline.Get()); geometry(visible);
         }
         list->OMSetRenderTargets(2, targets, FALSE, &sceneDsv);
-        list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get()); geometry();
+        list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get()); geometry(visible);
         transition(*list.Get(), albedo.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), normal.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -616,11 +681,28 @@ struct Dx12Renderer::Impl {
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
     Upload terrain, objects, clipmapLines;
+    std::map<Key, TerrainPage> terrainPages;
 };
 
 Dx12Renderer::Dx12Renderer(HWND target, bool forceWarp, bool debug) : impl_(std::make_unique<Impl>(target, forceWarp, debug)) {}
 Dx12Renderer::~Dx12Renderer() = default;
-void Dx12Renderer::setTerrain(const std::vector<Vertex>& terrain) { impl_->upload(impl_->terrain, terrain); }
+void Dx12Renderer::setTerrain(const std::vector<Vertex>& terrain) {
+    clearTerrain();
+    impl_->upload(impl_->terrain, terrain);
+}
+void Dx12Renderer::clearTerrain() {
+    impl_->terrainPages.clear();
+    impl_->terrain = {};
+}
+void Dx12Renderer::setTerrainPage(Key page, Box bounds, const std::vector<Vertex>& vertices) {
+    if (vertices.empty()) impl_->terrainPages.erase(page);
+    else {
+        auto& entry = impl_->terrainPages[page];
+        impl_->upload(entry.staging, vertices);
+        entry.bounds = bounds;
+        entry.dirty = true;
+    }
+}
 void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
 void Dx12Renderer::draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture, bool inspectPipeline) {
     impl_->draw(camera, objects, capture, inspectPipeline);

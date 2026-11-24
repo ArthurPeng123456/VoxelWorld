@@ -1,6 +1,9 @@
 #include "world.hpp"
 
 #include <stdexcept>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 #include <utility>
 
 namespace voxel {
@@ -11,6 +14,33 @@ double anchorMargin(int densityShift) { return 0.125 * gridChunkSize(densityShif
 constexpr std::size_t mapNodeOverhead = 4 * sizeof(void*);
 
 struct KeyBox { Key lo, hi; }; // Half-open in chunk coordinates.
+
+double lodAnchorStep(double radius, int lod, int densityShift) {
+    const double chunkStride = std::ldexp(gridChunkSize(densityShift), lod - 3);
+    return std::min(std::max(128.0, radius / 2), chunkStride);
+}
+
+bool hasVolume(Box box) {
+    return box.lo.x < box.hi.x && box.lo.y < box.hi.y && box.lo.z < box.hi.z;
+}
+
+void appendDifference(const ClipmapWindow& window, Box other, std::vector<ClipmapSlab>& dirty) {
+    Box box = window.box;
+    const Box intersection{max(box.lo, other.lo), min(box.hi, other.hi)};
+    if (!hasVolume(intersection)) {
+        dirty.push_back({box, window.lod});
+        return;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        Box lower = box, upper = box;
+        lower.hi[axis] = intersection.lo[axis];
+        upper.lo[axis] = intersection.hi[axis];
+        if (hasVolume(lower)) dirty.push_back({lower, window.lod});
+        if (hasVolume(upper)) dirty.push_back({upper, window.lod});
+        box.lo[axis] = intersection.lo[axis];
+        box.hi[axis] = intersection.hi[axis];
+    }
+}
 
 KeyBox window(Key anchor, int lod) {
     const int r = radii[lod];
@@ -55,42 +85,97 @@ constexpr std::size_t chunkMetadata = sizeof(Chunk) + sizeof(Chunks::value_type)
 
 }  // namespace
 
-std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std::size_t& visits) {
+std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std::size_t& visits,
+                             std::uint32_t lod0Radius, bool rolling) {
     std::set<Key> changed;
     if (global) {
-        std::vector<Key> next;
-        for (std::size_t i = 0; i < invokers.size(); ++i) {
-            Key key = keyAt(invokers[i], densityShift_);
-            if (global_ && i < anchors_.size() && anchors_[i].densityShift == densityShift_) {
-                const Box retained = bounds(anchors_[i]).expanded(splat(anchorMargin(densityShift_)));
-                for (int a = 0; a < 3; ++a)
-                    if (invokers[i][a] >= retained.lo[a] && invokers[i][a] < retained.hi[a]) key[a] = anchors_[i][a];
+        const bool rebuild = !global_ || layoutDensityShift(layout_) != densityShift_;
+        std::vector<GlobalAnchor> next;
+        std::vector<ClipmapWindow> windows;
+        std::vector<ClipmapSlab> dirty;
+        constexpr int nearLevels = 3;
+        const int windowCount = lodWindowCount(lod0Radius);
+        if (!windowCount) throw std::invalid_argument("Invalid LOD0 radius");
+        const bool sameRadius = lod0Radius_ == lod0Radius;
+        const std::size_t noRoll = invokers.size() * windowCount;
+        const bool phased = rolling && !rebuild && sameRadius && noRoll == globalWindows_.size();
+        double nearOverdue = 0, outerOverdue = 0;
+        std::size_t nearWindow = noRoll, outerWindow = noRoll;
+        bool fineBuffer = true;
+        for (std::size_t i = 0; i < invokers.size(); ++i) for (int lod = 0; lod < windowCount; ++lod) {
+            const auto index = next.size();
+            const double radius = std::ldexp(double(lod0Radius), lod);
+            const double step = lodAnchorStep(radius, lod, densityShift_);
+            const double margin = step / 8;
+            double overdue = 0;
+            int mostOverdueAxis = 0;
+            Vec origin;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double position = invokers[i][axis];
+                origin[axis] = std::floor(position / step) * step;
+                if (!sameRadius || index >= globalAnchors_.size() || globalAnchors_[index].step != step) continue;
+                const double previous = globalAnchors_[index].origin[axis];
+                if (position >= previous - margin && position < previous + step + margin) origin[axis] = previous;
+                else {
+                    const double distance = std::abs(position - (previous + step / 2));
+                    if (distance > overdue) { overdue = distance; mostOverdueAxis = axis; }
+                }
             }
-            next.push_back(key);
+            // During continuous movement, publish one entering and one leaving
+            // slab. A jump beyond the nominal radius recenters its window.
+            if (phased && overdue > 0 && overdue < radius) {
+                const auto previous = globalAnchors_[index].origin;
+                const double delta = origin[mostOverdueAxis] - previous[mostOverdueAxis];
+                origin = previous;
+                origin[mostOverdueAxis] += std::clamp(delta, -step, step);
+            }
+            next.push_back({origin, step});
+            const auto box = Box{origin, origin + splat(step)}.expanded(splat(radius + margin));
+            windows.push_back({i, lod, box});
+            if (!phased) continue;
+            const double urgency = overdue / radius;
+            if (lod < nearLevels) {
+                if (urgency > nearOverdue) { nearOverdue = urgency; nearWindow = index; }
+            } else if (urgency > outerOverdue) { outerOverdue = urgency; outerWindow = index; }
+            if (lod == 0) fineBuffer &= globalWindows_[index].box.expanded(splat(-double(lod0Radius) / 2)).contains(invokers[i]);
         }
-        visits = 0;
-        if (global_ && next == anchors_ && layoutDensityShift(layout_) == densityShift_) return changed;
-        std::vector<Vec> centers;
-        for (Key key : next) centers.push_back(bounds(key).center());
-        auto desired = planetLayout(centers, &visits, densityShift_);
-        for (const auto& entry : layout_) {
-            const auto found = desired.find(entry.first);
-            if (found == desired.end() || found->second != entry.second) changed.insert(entry.first);
+
+        // Prioritize the near field. Give a waiting outer window a turn when
+        // frequent near rolls still leave every invoker well inside its LOD0.
+        const bool doNear = nearWindow != noRoll && (outerWindow == noRoll || nearRolls_ < 3 || !fineBuffer);
+        const auto activeWindow = doNear ? nearWindow : outerWindow;
+        nearRolls_ = phased && doNear && outerWindow != noRoll ? std::min(nearRolls_ + 1, 3) : 0;
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            if (phased && i != activeWindow) {
+                next[i] = globalAnchors_[i];
+                windows[i] = globalWindows_[i];
+            } else if (!sameRadius || i >= globalWindows_.size()) {
+                dirty.push_back({windows[i].box, windows[i].lod});
+            } else {
+                appendDifference(windows[i], globalWindows_[i].box, dirty);
+                appendDifference(globalWindows_[i], windows[i].box, dirty);
+            }
         }
-        for (const auto& entry : desired) {
-            const auto found = layout_.find(entry.first);
-            if (found == layout_.end() || found->second != entry.second) changed.insert(entry.first);
-        }
-        layout_ = std::move(desired);
-        anchors_ = std::move(next);
+        for (std::size_t i = sameRadius ? windows.size() : 0; i < globalWindows_.size(); ++i)
+            dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
+        changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits);
+        if (!dirty.empty() || rebuild) ++windowRevision_;
+        globalAnchors_ = std::move(next);
+        globalWindows_ = std::move(windows);
+        lod0Radius_ = lod0Radius;
+        anchors_.clear();
         coverage_.clear();
         global_ = true;
         return changed;
     }
+    const bool wasGlobal = global_;
     if (global_ || (!layout_.empty() && layoutDensityShift(layout_) != densityShift_) ||
         (!anchors_.empty() && anchors_.front().densityShift != densityShift_)) {
         for (const auto& entry : layout_) changed.insert(entry.first);
         anchors_.clear(); coverage_.clear(); layout_.clear(); global_ = false;
+        idealLayout_.clear();
+        globalAnchors_.clear();
+        globalWindows_.clear();
     }
     std::set<Key> touched;
     visits = 0;
@@ -129,6 +214,7 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         else if (has) anchors_.push_back(next);
     }
     anchors_.resize(invokers.size());
+    if (visits != 0 || wasGlobal) ++windowRevision_;
     for (const Key key : touched) {
         int lod = -1;
         const auto found = coverage_.find(key);
@@ -150,12 +236,10 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
 std::vector<ClipmapWindow> Clipmap::windows() const {
     std::vector<ClipmapWindow> result;
     if (global_) {
-        for (std::size_t i = 0; i < anchors_.size(); ++i) for (int lod = 0; lod < lodCount; ++lod) {
-            const Vec center = bounds(anchors_[i]).center();
-            const double size = gridChunkSize(densityShift_);
-            const double radius = lod < 4 ? size * radii[lod] : 2 * std::ldexp(size, lod - 3);
-            const double limit = std::ldexp(chunkSize, rootLevel);
-            result.push_back({i, lod, {max(splat(-limit), center - splat(radius)), min(splat(limit), center + splat(radius))}});
+        const double limit = fieldSideLength / 2;
+        for (const auto& w : globalWindows_) {
+            const Box box{max(splat(-limit), w.box.lo), min(splat(limit), w.box.hi)};
+            if (hasVolume(box)) result.push_back({w.invoker, w.lod, box});
         }
         return result;
     }
@@ -170,31 +254,50 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
 
 std::size_t Clipmap::bytes() const {
     return sizeof(*this) + anchors_.capacity() * sizeof(Key)
+         + globalAnchors_.capacity() * sizeof(GlobalAnchor) + globalWindows_.capacity() * sizeof(ClipmapWindow)
          + coverage_.size() * (sizeof(decltype(coverage_)::value_type) + mapNodeOverhead)
-         + layout_.size() * (sizeof(Layout::value_type) + mapNodeOverhead);
+         + (layout_.size() + idealLayout_.size()) * (sizeof(Layout::value_type) + mapNodeOverhead);
 }
 
 World::World(const Planet& planet, Method method, bool morton, double density)
     : physics(method, chunks), planet_(planet), method_(method), morton_(morton),
-      densityShift_(voxelDensityShift(density)), clipmap_(densityShift_) {}
-
-World::Prior World::snapshot() const {
-    Prior prior;
-    for (const auto& entry : chunks) prior.emplace(entry.first, std::make_pair(entry.second->lod, entry.second->neighborhood));
-    return prior;
+      densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_), clipmap_(densityShift_) {
+    publishedClipmapBytes_ = clipmap_.bytes();
 }
 
-World::Batch World::planUpdate(Clipmap planned, const Prior& prior, const std::vector<Vec>& sources,
-                              bool global, int densityShift, Clock::time_point start) {
+void World::setLod0Radius(std::uint32_t radius) {
+    if (!validLod0Radius(radius)) throw std::invalid_argument("Invalid LOD0 radius");
+    lod0Radius_ = radius;
+}
+
+World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
+                                  std::uint32_t lod0Radius, Clock::time_point start, bool rolling) {
+    try {
+        auto batch = planUpdate(sources, global, densityShift, lod0Radius, start, rolling);
+        build(batch, planet_, clipmap_.layout(), method_, morton_);
+        recoverPlan_ = false;
+        return batch;
+    } catch (...) {
+        clipmap_ = Clipmap(densityShift);
+        recoverPlan_ = true;
+        throw;
+    }
+}
+
+World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
+                              std::uint32_t lod0Radius, Clock::time_point start, bool rolling) {
     Batch batch{};
     batch.start = start;
-    batch.clipmap = std::move(planned);
-    batch.clipmap.setDensityShift(densityShift);
-    const auto changed = batch.clipmap.update(sources, global, batch.stats.windowVisits);
-    const auto& layout = batch.clipmap.layout();
+    clipmap_.setDensityShift(densityShift);
+    const auto windowRevision = clipmap_.windowRevision();
+    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits, lod0Radius, rolling);
+    batch.stats.windowsChanged = clipmap_.windowRevision() != windowRevision || recoverPlan_;
+    const auto& layout = clipmap_.layout();
+    const auto& published = chunks;
     batch.stats.changedOwners = changed.size();
     auto dirty = changed;
-    if (!prior.empty()) for (const Key key : changed) {
+    if (recoverPlan_) for (const auto& entry : published) dirty.insert(entry.first);
+    if (!published.empty()) for (const Key key : changed) {
         if (global) {
             for (Key neighbor : intersectingLeaves(layout, bounds(key).expanded(splat(1e-4)))) dirty.insert(neighbor);
         } else {
@@ -205,40 +308,58 @@ World::Batch World::planUpdate(Clipmap planned, const Prior& prior, const std::v
     }
     for (const Key key : dirty) {
         const auto desired = layout.find(key);
-        const auto previous = prior.find(key);
+        const auto previous = published.find(key);
         if (desired != layout.end()) {
-            if (previous != prior.end() && previous->second.first == desired->second &&
-                previous->second.second == neighborhood(layout, key)) continue;
+            if (previous != published.end() && previous->second->lod == desired->second &&
+                (!intersectsPlanetShell(key) || previous->second->neighborhood == neighborhood(layout, key))) continue;
             batch.build.push_back(key);
         }
-        if (previous != prior.end()) batch.remove.push_back(key);
+        if (previous != published.end()) batch.remove.push_back(key);
     }
     batch.stats.selectMs = milliseconds(batch.start);
     return batch;
 }
 
 void World::build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton) {
-    for (const Key key : batch.build) {
-        auto chunk = buildChunk(planet, layout, key, method, morton, batch.stats.build);
+    if (batch.build.empty()) return;
+    struct BuiltChunk { std::unique_ptr<Chunk> chunk; BuildStats stats; };
+    std::vector<BuiltChunk> built(batch.build.size());
+    tbb::task_arena arena(8);
+    arena.execute([&] {
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, built.size(), 4), [&](const auto& range) {
+            for (auto i = range.begin(); i != range.end(); ++i)
+                built[i].chunk = buildChunk(planet, layout, batch.build[i], method, morton, built[i].stats);
+        });
+    });
+    for (auto& item : built) {
+        auto& chunk = item.chunk;
+        batch.stats.build.sampleMs += item.stats.sampleMs;
+        batch.stats.build.storageMs += item.stats.storageMs;
+        batch.stats.build.meshMs += item.stats.meshMs;
+        batch.stats.build.built += item.stats.built;
         batch.stats.stagingBytes += chunkMetadata + fieldSize(*chunk) + chunk->mesh.capacity() * sizeof(Triangle);
-        batch.staged.emplace(key, std::move(chunk));
+        batch.staged.emplace(chunk->key, std::move(chunk));
     }
 }
 
 WorldStats World::publish(Batch batch) {
     const auto activation = Clock::now();
     for (const Key key : batch.remove) {
+        if (!chunks.at(key)->mesh.empty()) batch.stats.meshChanges.push_back(key);
         physics.removeTerrain(key);
         chunks.erase(key);
         ++batch.stats.build.removed;
     }
     while (!batch.staged.empty()) {
         auto inserted = chunks.insert(batch.staged.extract(batch.staged.begin()));
+        if (!inserted.position->second->mesh.empty()) batch.stats.meshChanges.push_back(inserted.position->first);
         physics.addTerrain(*inserted.position->second);
     }
     batch.stats.physicsLoadMs = milliseconds(activation);
-    clipmap_ = std::move(batch.clipmap);
-    if (batch.stats.windowVisits != 0) publishedWindows_ = clipmap_.windows();
+    publishedDensityShift_ = clipmap_.densityShift();
+    publishedLod0Radius_ = clipmap_.lod0Radius();
+    publishedClipmapBytes_ = clipmap_.bytes();
+    if (batch.stats.windowsChanged) publishedWindows_ = clipmap_.windows();
     batch.stats.updateMs = milliseconds(batch.start);
     return batch.stats;
 }
@@ -248,23 +369,19 @@ WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::opt
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
-    auto batch = planUpdate(clipmap_, snapshot(), sources, global, densityShift_, start);
-    build(batch, planet_, batch.clipmap.layout(), method_, morton_);
-    return publish(std::move(batch));
+    return publish(prepareUpdate(sources, global, densityShift_, lod0Radius_, start, false));
 }
 
-bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera) {
+bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling) {
     if (building_.valid()) return false;
     const auto start = Clock::now();
     auto sources = invokers;
     sources.push_back(camera);
-    // Copy only immutable scheduling metadata. The worker owns the next tree;
-    // rendering, queries, memory statistics and physics retain the published tree.
-    building_ = std::async(std::launch::async, [planet = &planet_, planned = clipmap_, prior = snapshot(),
-            method = method_, morton = morton_, densityShift = densityShift_, global, start, sources = std::move(sources)]() mutable {
-        auto batch = planUpdate(std::move(planned), prior, sources, global, densityShift, start);
-        build(batch, *planet, batch.clipmap.layout(), method, morton);
-        return batch;
+    // Published chunks are read-only until this worker finishes. Only the worker
+    // touches the planner; queries and physics continue using the published chunks.
+    building_ = std::async(std::launch::async, [this, densityShift = densityShift_, lod0Radius = lod0Radius_,
+            global, start, rolling, sources = std::move(sources)] {
+        return prepareUpdate(sources, global, densityShift, lod0Radius, start, rolling);
     });
     return true;
 }
@@ -276,6 +393,11 @@ std::optional<WorldStats> World::pollUpdate() {
     return std::nullopt;
 }
 
+bool World::hasFinestLod(Vec point) const {
+    const auto found = chunks.find(keyAt(point, publishedDensityShift_));
+    return found != chunks.end() && found->second->lod == 0;
+}
+
 std::array<int, lodCount> World::lodCounts() const {
     std::array<int, lodCount> result{};
     for (const auto& entry : chunks) ++result[entry.second->lod];
@@ -285,7 +407,7 @@ std::array<int, lodCount> World::lodCounts() const {
 TerrainMemory World::terrainMemory() const {
     TerrainMemory result;
     result.physics = physics.terrainBytes();
-    result.metadata = clipmap_.bytes() + chunks.size() * chunkMetadata + publishedWindows_.capacity() * sizeof(ClipmapWindow);
+    result.metadata = publishedClipmapBytes_ + chunks.size() * chunkMetadata + publishedWindows_.capacity() * sizeof(ClipmapWindow);
     for (const auto& entry : chunks) {
         result.fields += fieldSize(*entry.second);
         result.meshes += entry.second->mesh.capacity() * sizeof(Triangle);

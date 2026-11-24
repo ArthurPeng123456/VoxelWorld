@@ -1,4 +1,5 @@
 #include "dx12_renderer.hpp"
+#include "lod_range_dialog.hpp"
 #include "world.hpp"
 #include "free_camera.hpp"
 #include "post_process.hpp"
@@ -9,6 +10,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,13 +27,23 @@ constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows, Density = 100 };
+Key terrainPage(Key chunk) {
+    // Group adjacent chunks of the same scale to limit both uploads and draw calls.
+    const int level = chunk.level + 3;
+    const int span = 1 << level;
+    const auto align = [span](int coordinate) { return coordinate - (coordinate % span + span) % span; };
+    return {align(chunk.x), align(chunk.y), align(chunk.z), level, chunk.densityShift};
+}
+
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows,
+               RangeSettings, Density = 100 };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, Shadows> toolbarButtons{{
+constexpr std::array<ToolbarButton, RangeSettings> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
-    {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108}
+    {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108},
+    {L"LOD ranges...", 112}
 }};
 
 struct Options {
@@ -145,8 +157,8 @@ void appendRound(std::vector<Vertex>& batch, const Shape& shape, Vec p, std::uin
 void appendBeacon(std::vector<Vertex>& batch, Vec surface, double size, bool selected) {
     const Vec up = unit(surface);
     const auto axes = frameAt(up);
-    const Vec center = surface + up * (1.8 * size);
-    const Vec a = center + up * size, b = center - up * size;
+    const Vec center = surface + up * size;
+    const Vec a = center + up * size, b = surface;
     const std::array<Vec, 4> ring{center + axes[0] * (size * 0.55), center + axes[1] * (size * 0.55),
                                   center - axes[0] * (size * 0.55), center - axes[1] * (size * 0.55)};
     const auto material = color(selected ? Vec{0.32, 0.96, 1.0} : Vec{1.0, 0.61, 0.34}, 255);
@@ -262,7 +274,7 @@ public:
             // The camera keeps moving while simulation is paused.
             streamElapsed += elapsed;
             if (const auto published = world_->pollUpdate()) applyTerrain(*published, false);
-            if (streamElapsed >= 0.15 && world_->requestUpdate(invokers_, true, camera().eye)) {
+            if (streamElapsed >= dt && world_->requestUpdate(invokers_, true, camera().eye, true)) {
                 streamElapsed = 0;
             }
             fps_ = fps_ * 0.94 + 0.06 / std::max(0.001, elapsed);
@@ -279,11 +291,13 @@ public:
 
 private:
     struct VisibleBody { std::size_t index; Shape shape; std::uint32_t material; };
+    struct TerrainPage { std::set<Key> chunks; std::size_t triangles{}; };
 
     void rebuild() {
         simulationTime_ = 0;
         shapes_.clear();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity);
+        world_->setLod0Radius(lod0Radius_);
         refreshTerrain(true);
         for (int i = 0; i < opts_.invokers; ++i) spawn(i);
         updateFooter();
@@ -332,28 +346,61 @@ private:
     }
 
     void applyTerrain(const WorldStats& stats, bool force) {
-        streamMs_ = stats.updateMs;
-        if (showRanges_) refreshRanges();
-        if (!force && stats.build.built == 0 && stats.build.removed == 0) return;
-        std::vector<Vertex> geometry;
-        geometry.reserve(world_->meshBytes() / sizeof(Triangle) * 3);
-        for (const auto& entry : world_->chunks) {
-            const Chunk& chunk = *entry.second;
-            for (const auto& triangle : chunk.mesh) {
-                const auto& p = triangle.vertices;
-                const Vec middle = (p[0] + p[1] + p[2]) / 3;
-                const Vec up = unit(middle);
-                const Vec n = unit(cross(p[1] - p[0], p[2] - p[0]), up);
-                for (const Vec point : p) {
-                    const double height = std::clamp((length(point) - planetRadius + 660) / 850, 0.0, 1.0);
-                    const double rock = std::clamp(2.4 * (1 - dot(n, up)), 0.0, 1.0);
-                    const Vec tone = Vec{0.35, 0.41, 0.47} + Vec{0.31, 0.18, 0.06} * height + Vec{0.09, 0.04, 0.03} * rock;
-                    geometry.push_back(vertex(point, n, color(tone, chunk.lod)));
-                }
+        if (force || stats.windowVisits != 0 || stats.build.built != 0 || stats.build.removed != 0) {
+            streamMs_ = stats.updateMs;
+            streamBuilt_ = stats.build.built;
+        }
+        if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
+        std::set<Key> dirtyPages;
+        if (force) {
+            renderer_->clearTerrain();
+            terrainPages_.clear();
+            triangles_ = 0;
+            for (const auto& entry : world_->chunks) if (!entry.second->mesh.empty()) {
+                const auto page = terrainPage(entry.first);
+                terrainPages_[page].chunks.insert(entry.first);
+                dirtyPages.insert(page);
+            }
+        } else {
+            for (Key key : stats.meshChanges) {
+                const Key page = terrainPage(key);
+                const auto chunk = world_->chunks.find(key);
+                auto& keys = terrainPages_[page].chunks;
+                if (chunk != world_->chunks.end() && !chunk->second->mesh.empty()) keys.insert(key);
+                else keys.erase(key);
+                dirtyPages.insert(page);
             }
         }
-        triangles_ = geometry.size() / 3;
-        renderer_->setTerrain(geometry);
+        std::vector<Vertex> geometry;
+        for (const Key page : dirtyPages) {
+            auto& data = terrainPages_.at(page);
+            triangles_ -= data.triangles;
+            data.triangles = 0;
+            for (Key key : data.chunks) data.triangles += world_->chunks.at(key)->mesh.size();
+            const double infinity = std::numeric_limits<double>::infinity();
+            Box pageBounds{splat(infinity), splat(-infinity)};
+            geometry.clear();
+            geometry.reserve(data.triangles * 3);
+            for (Key key : data.chunks) {
+                const Chunk& chunk = *world_->chunks.at(key);
+                for (const auto& triangle : chunk.mesh) {
+                    const auto& p = triangle.vertices;
+                    const Vec up = unit((p[0] + p[1] + p[2]) / 3);
+                    const Vec n = unit(cross(p[1] - p[0], p[2] - p[0]), up);
+                    const double rock = std::clamp(2.4 * (1 - dot(n, up)), 0.0, 1.0);
+                    for (const Vec point : p) {
+                        pageBounds.lo = min(pageBounds.lo, point);
+                        pageBounds.hi = max(pageBounds.hi, point);
+                        const double height = std::clamp((length(point) - planetRadius + 660) / 850, 0.0, 1.0);
+                        const Vec tone = Vec{0.35, 0.41, 0.47} + Vec{0.31, 0.18, 0.06} * height + Vec{0.09, 0.04, 0.03} * rock;
+                        geometry.push_back(vertex(point, n, color(tone, chunk.lod)));
+                    }
+                }
+            }
+            triangles_ += data.triangles;
+            renderer_->setTerrainPage(page, pageBounds, geometry);
+            if (data.chunks.empty()) terrainPages_.erase(page);
+        }
     }
 
     void refreshRanges() {
@@ -591,6 +638,8 @@ private:
                 opts_.voxelDensity = voxelDensities[std::size_t(selected)];
                 world_->setVoxelDensity(opts_.voxelDensity);
             }
+        } else if (command == RangeSettings) {
+            if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) world_->setLod0Radius(lod0Radius_);
         } else if (command == View) {
             freeView_ = false;
             surface_ = !surface_;
@@ -698,9 +747,11 @@ private:
         if (world_->voxelDensity() != opts_.voxelDensity) info << L" -> " << opts_.voxelDensity << L"x building";
         if (freeView_) info << L"   |   Free " << std::fixed << std::setprecision(0) << flightSpeed_ << L" m/s";
         info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
+             << (world_->hasFinestLod(invokers_[selected_]) ? L"" : L" (LOD0 pending)")
+             << (world_->lod0Radius() == lod0Radius_ ? L"" : L"   |   Building new LOD ranges")
              << L"   |   LOD 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3] << L" / " << coarse
              << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
-             << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update";
+             << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update (" << streamBuilt_ << L" built)";
         if (fps_ > 0) info << L"   |   " << std::setprecision(0) << fps_ << L" FPS";
         if (paused_) info << L"   |   Paused";
         if (renderer_->isWarp()) info << L"   |   WARP";
@@ -895,8 +946,10 @@ private:
     std::unique_ptr<Dx12Renderer> renderer_;
     std::unique_ptr<World> world_;
     std::vector<Vec> invokers_;
+    std::uint32_t lod0Radius_{defaultLod0Radius};
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
+    std::map<Key, TerrainPage> terrainPages_;
     std::size_t selected_{}, triangles_{};
     std::wstring status_, processMemory_, terrainMemory_, lodLegend_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
@@ -906,6 +959,7 @@ private:
     double flightSpeed_{200};
     POINT mouse_{};
     double simulationTime_{}, streamMs_{}, fps_{};
+    int streamBuilt_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{2.5 * planetRadius}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
 };
 

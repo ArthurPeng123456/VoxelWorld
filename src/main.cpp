@@ -462,6 +462,110 @@ void verifyDensitySwitch(World& world, const std::vector<Vec>& invokers, bool gl
 void selfTestGlobalTerrain() {
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0);
+    {
+        Clipmap clipmap(-3);
+        check(validLod0Radius(1) && validLod0Radius(512) && !validLod0Radius(0) && !validLod0Radius(500),
+              "LOD0 radius must be a positive power of two");
+        const int count = lodWindowCount(defaultLod0Radius);
+        check(count == 15 && std::ldexp(double(defaultLod0Radius), count - 1) < fieldSideLength &&
+              std::ldexp(double(defaultLod0Radius), count) >= fieldSideLength && lodWindowCount(1024) == count - 1,
+              "LOD radii double until the field-wide fallback");
+        for (double density : voxelDensities) {
+            const auto cells = fieldCellsPerAxis(voxelDensityShift(density));
+            check((cells & (cells - 1)) == 0 && cells * (chunkSize / fineCells * density) == fieldSideLength,
+                  "every density uses a power-of-two cube covering the same spatial bounds");
+        }
+        std::size_t visits = 0;
+        const auto box = bounds(keyAt(first[0], -3));
+        Vec edge = box.center();
+        edge.x = box.hi.x;
+        const Vec before = edge - Vec{1, 0, 0};
+        const Vec after = edge + Vec{1, 0, 0};
+        clipmap.update({before}, true, visits, 1);
+        check(clipmap.update({after}, true, visits, 1).empty() && visits == 0,
+              "global anchor hysteresis retains its schedule across a nearby voxel boundary");
+        check(clipmap.layout().at(keyAt(after, -3)) == 0 && clipmap.windows().front().box.contains(after),
+              "finest LOD and its debug range cover the retained Invoker position");
+        const Vec farther = edge + Vec{310, 0, 0};
+        check(clipmap.layout().at(*leafAt(clipmap.layout(), farther)) != 0, "small LOD0 range leaves farther chunks coarse");
+        check(!clipmap.update({after}, true, visits, defaultLod0Radius).empty() && visits > 0 &&
+              clipmap.layout().at(keyAt(farther, -3)) == 0,
+              "editing a range while stationary expands the actual fine field");
+        check(clipmap.lod0Radius() == defaultLod0Radius && clipmap.windows().front().box.contains(farther),
+              "debug ranges use the configured physical distance");
+
+        // Cross an interior LOD0 anchor while staying inside the LOD1 anchor.
+        Clipmap rolling(-3);
+        const Vec start = edge + Vec{72, 0, 0};
+        const Vec next = edge + Vec{80, 0, 0};
+        const Vec other = planet.surface(unit(first[0] * -1));
+        rolling.update({start, other}, true, visits);
+        const auto initialWindows = rolling.windows();
+        const auto compareFull = [&](bool checkCoarseTraversal = false) {
+            Layout ideal, oracle;
+            std::size_t fullVisits = 0;
+            const auto windows = rolling.windows();
+            updatePlanetLayout(ideal, oracle, windows, {}, -3, true, fullVisits);
+            check(rolling.layout() == oracle, "incremental global LOD equals full rebuild including 2:1 balance");
+            if (checkCoarseTraversal) {
+                const auto half = splat(fieldSideLength / 2);
+                std::size_t coarseVisits = 0;
+                const auto changes = updatePlanetLayout(ideal, oracle, windows, {{{half * -1, half}, count - 1}},
+                                                        -3, false, coarseVisits);
+                check(changes.empty() && coarseVisits < fullVisits / 16,
+                      "a coarse slab skips the finer subtrees even when it spans the field");
+            }
+            return fullVisits;
+        };
+        const auto changed = rolling.update({next, other}, true, visits);
+        const auto movedWindows = rolling.windows();
+        check(!changed.empty() && movedWindows.front().box.lo.x != initialWindows.front().box.lo.x,
+              "crossing the fine anchor rolls LOD0");
+        for (std::size_t i = 1; i < movedWindows.size(); ++i) {
+            const auto a = movedWindows[i].box, b = initialWindows[i].box;
+            check(length(a.lo - b.lo) == 0 && length(a.hi - b.hi) == 0,
+                  "rolling LOD0 leaves coarser levels and the second Invoker stationary");
+        }
+        check(visits < compareFull(true) / 2, "a fine window move visits only a small part of the tree");
+        {
+            const Vec jump = edge + Vec{730, 167, 43};
+            Clipmap phased = rolling, settled = rolling;
+            settled.update({jump, other}, true, visits);
+            phased.update({jump, other}, true, visits, defaultLod0Radius, true);
+            const auto firstBatch = phased.windows();
+            check(firstBatch[0].box.contains(jump) && phased.layout().at(keyAt(jump, -3)) == 0,
+                  "rolling update publishes the moved invoker's LOD0 first");
+            for (std::size_t i = 0; i < firstBatch.size(); ++i) if (firstBatch[i].lod >= 3) {
+                check(length(firstBatch[i].box.lo - movedWindows[i].box.lo) == 0 &&
+                      length(firstBatch[i].box.hi - movedWindows[i].box.hi) == 0,
+                      "the near batch does not roll outer windows");
+            }
+            for (int i = 0; i < 4 * count; ++i) {
+                const auto previous = phased.windows();
+                phased.update({jump, other}, true, visits, defaultLod0Radius, true);
+                const auto current = phased.windows();
+                int moved = 0;
+                for (std::size_t w = 0; w < current.size(); ++w) {
+                    const Vec delta = abs(current[w].box.center() - previous[w].box.center());
+                    const double distance = std::max({delta.x, delta.y, delta.z});
+                    if (!distance) continue;
+                    ++moved;
+                    const double stride = std::ldexp(gridChunkSize(-3), current[w].lod - 3);
+                    check(distance <= stride && (delta.x > 0) + (delta.y > 0) + (delta.z > 0) == 1,
+                          "a regular roll moves at most one chunk along one axis");
+                }
+                check(moved <= 1, "only one invoker window rolls in a batch");
+                if (!moved) break;
+            }
+            check(phased.layout() == settled.layout(), "outer batches converge to the complete balanced layout");
+        }
+        for (Vec p : {edge + Vec{730, 150, 30}, edge + Vec{-300, 30, 50}, start}) {
+            rolling.update({p, other}, true, visits);
+            compareFull();
+        }
+        rolling.update({start}, true, visits, 256);
+        compareFull();
+    }
     for (double density : voxelDensities) {
         const int shift = voxelDensityShift(density);
         const Key key = keyAt(first[0], shift);
@@ -531,12 +635,15 @@ void selfTestGlobalTerrain() {
             }
             check(interfaces > 50, "global test exercises many multiscale boundaries");
             const Vec opposite = first[0] * -1;
+            globe.setLod0Radius(256);
             check(globe.requestUpdate({}, true, opposite), "global camera teleport starts a background build");
+            check(globe.lod0Radius() == defaultLod0Radius, "pending LOD range keeps the previous terrain active");
             const Vec oldUp = unit(first[0]);
             check(globe.physics.ray(first[0] + oldUp * 100000, first[0] - oldUp * 100000).state == Hit::State::Contact,
                   "old global coverage remains queryable while new LOD leaves are built");
             waitForPublication(globe);
             check(globe.chunks.at(keyAt(opposite))->lod == 0, "camera refines the opposite hemisphere");
+            check(globe.lod0Radius() == 256 && globe.hasFinestLod(opposite), "LOD range publishes with its refined chunks");
             const auto prior = leafAt(layout, first[0]);
             check(prior.has_value(), "previous invoker was covered");
             const Vec up = unit(first[0]);

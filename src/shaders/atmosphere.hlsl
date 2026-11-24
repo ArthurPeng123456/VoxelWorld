@@ -14,25 +14,34 @@ cbuffer Camera : register(b0) {
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }
 float3 betaR() { return float3(5.802e-6, 13.558e-6, 33.100e-6); }
 float betaM() { return 3.996e-6; }
-float2 density(DF3 p) {
-    // The cancellation must happen before demotion to float.
-    float h = max(0, dfAltitude(p, float2(atmosphere.x, 0)));
+float2 density(float radiusDelta) {
+    // (r² - R²) / (r + R) avoids subtracting two nearly equal radii.
+    float r = sqrt(max(0, atmosphere.x * atmosphere.x + radiusDelta));
+    float h = max(0, radiusDelta / (r + atmosphere.x));
     return exp(-h / atmosphere.zw);
 }
 float3 extinction(float2 optical) { return betaR() * optical.x + (betaM() / 0.9) * optical.y; }
-float2 sunlightDepth(DF3 p) {
-    float2 ground, top;
-    if (dfRaySphere(p, sunlight.xyz, float2(atmosphere.x, 0), ground) && ground.x > 0.01)
-        return float2(1e20, 1e20);
-    if (!dfRaySphere(p, sunlight.xyz, float2(atmosphere.y, 0), top)) return 0;
-    float step = max(0, top.y) / 6;
+float2 sunlightDepth(float radiusDelta, float sunProjection, float sunLengthSquared, float topDelta) {
+    float groundDisc = sunProjection * sunProjection - sunLengthSquared * radiusDelta;
+    if (radiusDelta > 0 && sunProjection < 0 && groundDisc >= 0 &&
+        radiusDelta > 0.01 * (sqrt(max(0, groundDisc)) - sunProjection)) return float2(1e20, 1e20);
+    float toTop = radiusDelta - topDelta;
+    float topDisc = sunProjection * sunProjection - sunLengthSquared * toTop;
+    if (topDisc < 0) return 0;
+    float root = sqrt(topDisc);
+    float distance = sunProjection < 0 ? (root - sunProjection) / sunLengthSquared
+                                       : -toTop / max(root + sunProjection, 1e-6);
+    float step = max(0, distance) / 6;
     float2 optical = 0;
-    [loop] for (int i = 0; i < 6; ++i)
-        optical += density(df3Add(p, df3Scale(sunlight.xyz, (i + 0.5) * step))) * step;
-    return optical;
+    [unroll] for (int i = 0; i < 6; ++i) {
+        float t = (i + 0.5) * step;
+        optical += density(radiusDelta + t * (2 * sunProjection + sunLengthSquared * t));
+    }
+    return optical * step;
 }
 // Single scattering with Rayleigh + Cornette-Shanks Mie phase functions.
-// Geometry is df64; bounded optical depths, exponentials and radiance use float.
+// Intersect and anchor the ray in DF64, then integrate radial deltas from
+// that anchor. The inner integrals never reconstruct absolute positions.
 float3 scatter(DF3 eye, float3 ray, float limit, out float3 transmittance) {
     float2 interval;
     transmittance = 1;
@@ -40,21 +49,40 @@ float3 scatter(DF3 eye, float3 ray, float limit, out float3 transmittance) {
     if (!dfRaySphere(eye, ray, float2(atmosphere.y, 0), interval)) return 0;
     float start = max(0, interval.x), end = min(limit, interval.y);
     if (end <= start) return 0;
+    DF3 anchor = eye;
+    float altitude;
+    [branch] if (start > 0) {
+        anchor = df3Add(eye, df3Scale(ray, start));
+        altitude = atmosphere.y - atmosphere.x;
+    } else {
+        altitude = dfAltitude(eye, float2(atmosphere.x, 0));
+    }
+    float delta = altitude * (2 * atmosphere.x + altitude);
+    float topDelta = (atmosphere.y - atmosphere.x) * (atmosphere.y + atmosphere.x);
+    float viewProjection = dot(anchor.hi, ray) + dot(anchor.lo, ray);
+    float sunProjection = dot(anchor.hi, sunlight.xyz) + dot(anchor.lo, sunlight.xyz);
+    float rayLengthSquared = dot(ray, ray), sunLengthSquared = dot(sunlight.xyz, sunlight.xyz);
     float mu = dot(ray, sunlight.xyz), g = 0.76;
     float phaseR = 3.0 / (16.0 * 3.14159265) * (1 + mu * mu);
     float phaseM = 3.0 / (8.0 * 3.14159265) * (1 - g * g) * (1 + mu * mu)
                  / ((2 + g * g) * pow(max(1e-3, 1 + g * g - 2 * g * mu), 1.5));
     float2 optical = 0;
     float3 sumR = 0, sumM = 0;
+    // Cosine-spaced quadrature resolves near-ground density from either end.
+    static const float sampleEdges[17] = {
+        0.000000000f, 0.009607360f, 0.038060234f, 0.084265194f, 0.146446609f,
+        0.222214883f, 0.308658284f, 0.402454839f, 0.500000000f, 0.597545161f,
+        0.691341716f, 0.777785117f, 0.853553391f, 0.915734806f, 0.961939766f,
+        0.990392640f, 1.000000000f
+    };
+    float span = end - start;
     [loop] for (int i = 0; i < 16; ++i) {
-        // Concentrate at both ends: near-ground density must also be resolved from orbit.
-        float u0 = float(i) / 16, u1 = float(i + 1) / 16;
-        float s0 = 0.5 - 0.5 * cos(3.14159265 * u0), s1 = 0.5 - 0.5 * cos(3.14159265 * u1);
-        float dt = (end - start) * (s1 - s0);
-        float t = start + (end - start) * 0.5 * (s0 + s1);
-        DF3 p = df3Add(eye, df3Scale(ray, t));
-        float2 local = density(p) * dt;
-        float3 attenuation = exp(-extinction(optical + local * 0.5 + sunlightDepth(p)));
+        float s0 = sampleEdges[i], s1 = sampleEdges[i + 1];
+        float dt = span * (s1 - s0), t = span * 0.5 * (s0 + s1);
+        float radial = delta + t * (2 * viewProjection + rayLengthSquared * t);
+        float2 local = density(radial) * dt;
+        float3 attenuation = exp(-extinction(optical + local * 0.5 +
+                                  sunlightDepth(radial, sunProjection + mu * t, sunLengthSquared, topDelta)));
         sumR += attenuation * local.x;
         sumM += attenuation * local.y;
         optical += local;
