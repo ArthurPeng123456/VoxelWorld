@@ -18,7 +18,8 @@ struct WorldStats {
 class Clipmap {
 public:
     Clipmap() = default;
-    explicit Clipmap(int densityShift) : densityShift_(densityShift) {}
+    explicit Clipmap(int densityShift, TerrainElevationRange range = elevationRange(TerrainPreset::Classic))
+        : densityShift_(densityShift), elevationRange_(range) {}
     void setDensityShift(int shift) { densityShift_ = shift; }
     int densityShift() const { return densityShift_; }
     std::set<Key> update(const std::vector<Vec>& invokers, bool global, std::size_t& visits,
@@ -31,6 +32,7 @@ public:
 private:
     struct GlobalAnchor { Vec origin; double step; };
     int densityShift_{};
+    TerrainElevationRange elevationRange_{elevationRange(TerrainPreset::Classic)};
     std::uint32_t lod0Radius_{defaultLod0Radius};
     std::vector<Key> anchors_;
     std::map<Key, std::array<unsigned, 4>> coverage_;

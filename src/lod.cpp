@@ -63,7 +63,8 @@ std::vector<Key> intersectingLeaves(const Layout& layout, Box box) {
 }
 
 std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vector<ClipmapWindow>& windows,
-                                 const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits) {
+                                 const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits,
+                                 TerrainElevationRange range) {
     visits = 0;
     if (!rebuild && dirty.empty()) return {};
     std::array<std::vector<Box>, lodCount - 1> levels;
@@ -91,7 +92,7 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
                 return slab.lod < key.level + 3 && overlaps(box, slab.box);
             })) return;
         ++visits;
-        const bool surface = intersectsPlanetShell(key);
+        const bool surface = intersectsPlanetShell(key, range);
         const int requested = requestedLod(box, surface);
         const auto previous = ideal.find(key);
         if (key.level && (key.level + 3 > requested ||
@@ -170,7 +171,7 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
             children(key, [&](Key child) {
                 remember(child);
                 balanced.emplace(child, child.level ? child.level + 3 :
-                    std::min(requestedLod(bounds(child), intersectsPlanetShell(child)), 3));
+                    std::min(requestedLod(bounds(child), intersectsPlanetShell(child, range)), 3));
                 ++visits;
             });
             children(key, enqueueNeighbors);

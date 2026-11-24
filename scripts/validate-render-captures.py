@@ -40,15 +40,23 @@ def orbit_shading_edges(path):
 
 
 def validate(directory):
+    report = (directory / "validation.txt").read_text().splitlines()
+    terrain = next((line.split("=", 1)[1] for line in report if line.startswith("terrain=")), "classic")
     for backend in ("mesh", "grid", "dag", "vdb"):
         for view in ("orbit", "orbit-wireframe", "surface", "horizon", "wireframe", "ranges", "free", "global-lod-wireframe"):
             bitmap(directory / f"{backend}-{view}.bmp")
-    orbit_edges = orbit_shading_edges(directory / "grid-orbit-no-effects.bmp")
-    if orbit_edges > 0.005:
+    orbit_file = directory / "grid-orbit-no-effects.bmp"
+    orbit_edges = orbit_shading_edges(orbit_file)
+    if terrain == "classic" and orbit_edges > 0.005:
         raise ValueError(f"Mesh shading bands visible in the orbit capture: {orbit_edges:.2%}")
     bitmap(directory / "invoker-control.bmp")
-    if "invoker_controls=passed" not in (directory / "validation.txt").read_text().splitlines():
+    if "invoker_controls=passed" not in report:
         raise ValueError("Invoker movement and camera controls did not finish validation")
+    if "terrain=classic" in report and "terrain_controls=passed" not in report:
+        raise ValueError("Terrain dropdown did not finish validation")
+    if terrain == "mars":
+        for region in (1, 2):
+            bitmap(directory / f"grid-mars-remote-{region}.bmp")
     size_a, a = bitmap(directory / "precision-base.bmp")
     size_b, b = bitmap(directory / "precision-translated.bmp")
     if size_a != size_b:
@@ -91,7 +99,8 @@ def validate(directory):
         size, configured = bitmap(directory / f"pipeline-{name}.bmp")
         if size != on_size or sum(abs(p - q) > 2 for p, q in zip(on, configured)) < 1000:
             raise ValueError(f"Rendering settings did not reach the GPU in {name}")
-    print(f"46 required captures verified; orbit shading edges={orbit_edges:.2%}; CSM 1024/2048/4096; "
+    count = 48 if terrain == "mars" else 46
+    print(f"{count} required captures verified for {terrain}; orbit shading edges={orbit_edges:.2%}; CSM 1024/2048/4096; "
           f"translation max difference={maximum}/255, mean={mean:.9f}/255; "
           f"shadowed={shadowed}, exposure-brightened={brightened}; HDR max={diagnostics['hdr_max_component']}")
 

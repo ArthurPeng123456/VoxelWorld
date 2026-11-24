@@ -61,7 +61,7 @@ float visibility(float3 relative, float3 normal, float depth) {
 
 float3 skyRadiance(float3 ray) {
     float2 ground;
-    bool hit = dfRaySphere(planetEye(), ray, float2(atmosphere.x - 1000, 0), ground) && ground.x > 0;
+    bool hit = dfRaySphere(planetEye(), ray, float2(atmosphere.x + terrainParams.z, 0), ground) && ground.x > 0;
     float3 transmittance;
     float3 inscatter = scatter(planetEye(), ray, hit ? ground.x : projection.w, transmittance);
     float3 background = hit ? 0 : float3(0.0008, 0.0012, 0.002);
@@ -84,13 +84,14 @@ float4 deferredPS(Sky input) : SV_Target {
     float3 viewDirection = relative / max(distance, 1e-6);
     float airDistance = distance;
     float3 normal = normalize(normalData.xyz);
+    float3 shadowNormal = normal;
+    float roughness = normalData.w;
     float3 albedo = material.rgb;
     [branch] if (code < 253) {
         float metersPerPixel = distance / max(1, 0.5 * renderParams.y * projection.y);
         float detail = 1 - smoothstep(32, 256, metersPerPixel);
-        albedo = terrainAlbedo(code, material.rg, detail);
+        float3 radial = normalize(planetEyeHi.xyz + (planetEyeLo.xyz + relative));
         [branch] if (detail < 1) {
-            float3 radial = normalize(planetEyeHi.xyz + (planetEyeLo.xyz + relative));
             normal = normalize(lerp(radial, normal, detail));
             // Planetary mesh chords dip below the reference sphere. Use its continuous
             // air path at a distance, fading back to mesh depth near the silhouette.
@@ -102,12 +103,17 @@ float4 deferredPS(Sky input) : SV_Target {
                 }
             }
         }
+        shadowNormal = normal;
+        [branch] if (terrainParams.x > 0.5 && sunlight.w < 0.5) {
+            float footprint = metersPerPixel / max(0.24, dot(normal, -viewDirection));
+            albedo = geologyMaterial(radial, relative, material.rgb, footprint, detail, normal, roughness);
+        } else albedo = terrainAlbedo(code, material.rg, detail);
     }
     float diffuse = max(0, dot(normal, sunlight.xyz));
-    float shadow = visibility(relative, normal, viewDepth);
+    float shadow = visibility(relative, shadowNormal, viewDepth);
     float3 eyeDirection = -viewDirection;
     float3 halfVector = normalize(sunlight.xyz + eyeDirection);
-    float specular = pow(saturate(dot(normal, halfVector)), lerp(96, 8, normalData.w)) * 0.08;
+    float specular = pow(saturate(dot(normal, halfVector)), lerp(96, 8, roughness)) * 0.08;
     float3 radiance = albedo * (0.12 + 1.8 * diffuse * shadow) + specular * shadow;
     if (code == 253) {
         float facing = saturate(dot(normal, eyeDirection));

@@ -158,7 +158,7 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         }
         for (std::size_t i = sameRadius ? windows.size() : 0; i < globalWindows_.size(); ++i)
             dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
-        changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits);
+        changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits, elevationRange_);
         if (!dirty.empty() || rebuild) ++windowRevision_;
         globalAnchors_ = std::move(next);
         globalWindows_ = std::move(windows);
@@ -193,7 +193,7 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         for (int lod = 0; lod < 4; ++lod) {
             auto add = [&](Key key) {
                 ++visits;
-                if (!intersectsPlanetShell(key)) return;
+                if (!intersectsPlanetShell(key, elevationRange_)) return;
                 ++coverage_[key][lod];
                 touched.insert(key);
             };
@@ -261,7 +261,7 @@ std::size_t Clipmap::bytes() const {
 
 World::World(const Planet& planet, Method method, bool morton, double density)
     : physics(method, chunks), planet_(planet), method_(method), morton_(morton),
-      densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_), clipmap_(densityShift_) {
+      densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_), clipmap_(densityShift_, planet.elevationRange()) {
     publishedClipmapBytes_ = clipmap_.bytes();
 }
 
@@ -278,7 +278,7 @@ World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, 
         recoverPlan_ = false;
         return batch;
     } catch (...) {
-        clipmap_ = Clipmap(densityShift);
+        clipmap_ = Clipmap(densityShift, planet_.elevationRange());
         recoverPlan_ = true;
         throw;
     }
@@ -311,7 +311,8 @@ World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int
         const auto previous = published.find(key);
         if (desired != layout.end()) {
             if (previous != published.end() && previous->second->lod == desired->second &&
-                (!intersectsPlanetShell(key) || previous->second->neighborhood == neighborhood(layout, key))) continue;
+                (!intersectsPlanetShell(key, planet_.elevationRange()) ||
+                 previous->second->neighborhood == neighborhood(layout, key))) continue;
             batch.build.push_back(key);
         }
         if (previous != published.end()) batch.remove.push_back(key);

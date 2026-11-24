@@ -3,6 +3,7 @@ namespace voxel {
 inline constexpr char shaderSource[] = R"voxelshader(
 @VOXEL_PRECISION_SHADER@
 @VOXEL_ATMOSPHERE_SHADER@
+@VOXEL_TERRAIN_MATERIAL_SHADER@
 @VOXEL_DEFERRED_SHADER@
 )voxelshader";
 }

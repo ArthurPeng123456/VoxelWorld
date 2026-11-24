@@ -2,6 +2,7 @@
 #include "../third_party/marching_cases.hpp"
 
 #include <limits>
+#include <stdexcept>
 
 namespace voxel {
 
@@ -32,7 +33,24 @@ Box bounds(Key key) {
     return {lo, lo + splat(std::ldexp(size, key.level))};
 }
 
-Planet::Planet(std::uint64_t seed) {
+const char* name(TerrainPreset preset) {
+    switch (preset) {
+        case TerrainPreset::Mars: return "mars";
+        case TerrainPreset::Volcanic: return "volcanic";
+        default: return "classic";
+    }
+}
+
+TerrainPreset parseTerrainPreset(std::string_view value) {
+    for (const auto preset : terrainPresets) if (value == name(preset)) return preset;
+    throw std::invalid_argument("Choose classic, mars or volcanic for --terrain");
+}
+
+Planet::Planet(std::uint64_t seed, TerrainPreset preset) : preset_(preset) {
+    if (preset_ != TerrainPreset::Classic) {
+        buildGeology(seed);
+        return;
+    }
     auto random = [&seed] {
         seed += 0x9e3779b97f4a7c15ULL;
         auto value = seed;
@@ -109,14 +127,19 @@ double Planet::sampleElevation(Vec d, Vec& gradient) const {
 
 double Planet::elevation(Vec direction) const {
     Vec unused;
+    if (preset_ != TerrainPreset::Classic) return sampleGeology<false>(direction, unused, nullptr, 0);
     return sampleElevation<false>(direction, unused);
 }
 
-PlanetSurfaceSample Planet::sampleSurface(Vec direction) const {
+PlanetSurfaceSample Planet::sampleSurface(Vec direction, double spacing, bool sampleNormal) const {
     Vec gradient;
-    const double height = sampleElevation<true>(direction, gradient);
+    double craterMaterial = 0;
+    double height;
+    if (preset_ == TerrainPreset::Classic) height = sampleElevation<true>(direction, gradient);
+    else if (sampleNormal) height = sampleGeology<true>(direction, gradient, &craterMaterial, spacing);
+    else height = sampleGeology<false>(direction, gradient, &craterMaterial, spacing);
     const Vec tangent = gradient - direction * dot(gradient, direction);
-    return {height, unit(direction - tangent / (planetRadius + height), direction)};
+    return {height, unit(direction - tangent / (planetRadius + height), direction), craterMaterial};
 }
 
 float Planet::sdf(Vec p) const {
@@ -127,7 +150,8 @@ float Planet::sdf(Vec p) const {
 }
 
 Vec Planet::invokerDirection(int index, double frame) const {
-    const Vec axis = craters_[std::size_t(index) % craters_.size()].axis;
+    const Vec axis = preset_ == TerrainPreset::Classic ? craters_[std::size_t(index) % craters_.size()].axis
+                                                       : impacts_[std::size_t(index) % impacts_.size()].axis;
     const Vec reference = std::abs(axis.z) < 0.9 ? Vec{0, 0, 1} : Vec{0, 1, 0};
     const Vec tangent = unit(cross(reference, axis));
     const double angle = (0.07 * 25600.0 / planetRadius)
@@ -184,11 +208,11 @@ Key Chunk::cellIndex(Vec p) const {
 
 Cell Chunk::cellAt(Vec p) const { return cell(cellIndex(p)); }
 
-bool intersectsPlanetShell(Key key) {
+bool intersectsPlanetShell(Key key, TerrainElevationRange range) {
     const auto box = bounds(key);
     const double rMin = length(box.clamp({}));
     const double rMax = length(max(abs(box.lo), abs(box.hi)));
-    return rMin <= planetRadius + 1000 && rMax >= planetRadius - 1000;
+    return rMin <= planetRadius + range.upper && rMax >= planetRadius + range.lower;
 }
 
 Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift) {
@@ -486,19 +510,21 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     const int cells = fineCells >> std::min(lod, 3);
     const int count = cells + 1;
     const auto box = bounds(key);
-    const bool shell = intersectsPlanetShell(key);
+    const bool shell = intersectsPlanetShell(key, planet.elevationRange());
     auto chunk = std::make_unique<Chunk>(Chunk{key, lod, cells, box, (box.hi.x - box.lo.x) / cells,
                                                shell ? neighborhood(layout, key) : std::array<int, 27>{}, {}, {}, {}, {}});
     auto start = Clock::now();
-    if (!shell) {
+    const auto storeUniform = [&](float value) {
         if (method != Method::Mesh) {
-            const bool solid = length(box.center()) < planetRadius;
-            chunk->field = makeStorage(method, count, {solid ? -background : background}, morton, chunk->spacing, box.lo);
-            const auto solidMask = solid ? std::uint32_t((std::uint64_t(1) << cells) - 1) : 0;
+            chunk->field = makeStorage(method, count, {value}, morton, chunk->spacing, box.lo);
+            const auto solidMask = value < 0 ? std::uint32_t((std::uint64_t(1) << cells) - 1) : 0;
             chunk->rows.assign(std::size_t(cells) * cells, CellRow{0, solidMask});
         }
         stats.storageMs += milliseconds(start);
         ++stats.built;
+    };
+    if (!shell) {
+        storeUniform(length(box.center()) < planetRadius ? -background : background);
         return chunk;
     }
     std::vector<float> samples;
@@ -516,6 +542,17 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     }
     stats.sampleMs += milliseconds(start);
     start = Clock::now();
+    if (planet.preset() != TerrainPreset::Classic) {
+        // Test the final samples, including the coarser boundary interpolation.
+        // Trilinear cells cannot cross zero when all corners are on one side.
+        // Keep signed distances in the band used by contact and seam queries.
+        const auto [lowest, highest] = std::minmax_element(samples.begin(), samples.end());
+        const double margin = std::max(16.0, 2 * chunk->spacing);
+        if (*lowest > margin || *highest < -margin) {
+            storeUniform(*lowest > margin ? *lowest : *highest);
+            return chunk;
+        }
+    }
     chunk->field = makeStorage(method, count, samples, morton, chunk->spacing, box.lo);
     stats.storageMs += milliseconds(start);
     start = Clock::now();

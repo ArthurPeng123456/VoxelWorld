@@ -15,6 +15,8 @@ struct Camera {
     bool lodTint, wireframe;
     Vec planetCenter{};
     RenderSettings settings{};
+    TerrainPreset terrain{TerrainPreset::Classic};
+    std::uint32_t terrainSeed{};
 };
 
 struct RenderDiagnostics {

@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -58,6 +59,18 @@ bool clip(Box box, Vec start, Vec delta, double& first, double& last);
 
 // World distances are meters. CPU positions, directions and transforms use Vec/double.
 constexpr double planetRadius = 6371000.0;
+enum class TerrainPreset { Classic, Mars, Volcanic };
+constexpr std::array terrainPresets{TerrainPreset::Classic, TerrainPreset::Mars, TerrainPreset::Volcanic};
+struct TerrainElevationRange { double lower, upper; };
+constexpr TerrainElevationRange elevationRange(TerrainPreset preset) {
+    switch (preset) {
+        case TerrainPreset::Mars: return {-4700, 3400};
+        case TerrainPreset::Volcanic: return {-4000, 5200};
+        default: return {-1000, 1000};
+    }
+}
+const char* name(TerrainPreset preset);
+TerrainPreset parseTerrainPreset(std::string_view value);
 constexpr double chunkSize = 1600.0;
 constexpr int fineCells = 32;
 constexpr int fieldRootLevel() {
@@ -70,6 +83,7 @@ constexpr int rootLevel = fieldRootLevel();
 constexpr int coarsestSurfaceLevel = rootLevel > 3 ? rootLevel - 3 : 0;
 constexpr int lodCount = rootLevel + 7; // The 0.125x grid requires three additional levels.
 constexpr double fieldSideLength = chunkSize * (1u << (rootLevel + 1));
+static_assert(planetRadius + elevationRange(TerrainPreset::Volcanic).upper < fieldSideLength / 2);
 constexpr std::uint32_t defaultLod0Radius = 512;
 constexpr bool validLod0Radius(std::uint32_t radius) {
     return radius > 0 && (radius & (radius - 1)) == 0 && radius < fieldSideLength;
@@ -99,24 +113,35 @@ struct Key {
 inline Vec asVec(Key key) { return {double(key.x), double(key.y), double(key.z)}; }
 Key keyAt(Vec p, int densityShift = 0);
 Box bounds(Key key);
-bool intersectsPlanetShell(Key key);
+bool intersectsPlanetShell(Key key, TerrainElevationRange range = elevationRange(TerrainPreset::Classic));
 
-struct PlanetSurfaceSample { double elevation; Vec normal; };
+struct PlanetSurfaceSample { double elevation; Vec normal; double craterMaterial; };
 
 class Planet {
 public:
-    explicit Planet(std::uint64_t seed);
+    explicit Planet(std::uint64_t seed, TerrainPreset preset = TerrainPreset::Classic);
+    TerrainPreset preset() const { return preset_; }
+    TerrainElevationRange elevationRange() const { return voxel::elevationRange(preset_); }
     double elevation(Vec direction) const;
-    PlanetSurfaceSample sampleSurface(Vec direction) const;
+    PlanetSurfaceSample sampleSurface(Vec direction, double spacing = 0, bool sampleNormal = true) const;
     float sdf(Vec p) const;
     Vec surface(Vec direction) const { return direction * (planetRadius + elevation(direction)); }
     Vec invokerDirection(int index, double frame) const;
 private:
     struct Crater { Vec axis; double width, depth, rim; };
+    struct Impact { Vec axis, along; double width, depth, rim, peak; };
     template<bool withGradient> double sampleElevation(Vec direction, Vec& gradient) const;
+    template<bool withGradient> double sampleGeology(Vec direction, Vec& gradient, double* craterMaterial, double spacing) const;
+    template<bool withGradient> double geologyNoise(Vec p, Vec& gradient) const;
+    void buildGeology(std::uint64_t seed);
+    TerrainPreset preset_;
     std::vector<Crater> craters_;
     std::array<std::vector<std::size_t>, 8> craterOctants_;
     std::array<double, 3> phase_{};
+    std::vector<Impact> impacts_;
+    std::vector<unsigned> impactOffsets_, impactIndices_;
+    std::vector<float> noise_;
+    std::uint32_t craterSeed_{};
 };
 
 
@@ -178,7 +203,8 @@ inline int layoutDensityShift(const Layout& layout) { return layout.empty() ? 0 
 Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr, int densityShift = 0,
                     std::uint32_t lod0Radius = defaultLod0Radius);
 std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vector<ClipmapWindow>& windows,
-                                 const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits);
+                                 const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits,
+                                 TerrainElevationRange range = elevationRange(TerrainPreset::Classic));
 std::optional<Key> leafAt(const Layout& layout, Vec point);
 std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
 Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift = 0);

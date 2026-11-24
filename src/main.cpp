@@ -30,6 +30,7 @@ struct Options {
     int bodies{48};
     int streamEvery{6};
     double voxelDensity{1};
+    TerrainPreset terrain{TerrainPreset::Classic};
     bool morton{}, global{}, obj{}, selfTest{}, selfTestGlobal{}, help{}, capsuleStress{};
     fs::path output{"results"};
 };
@@ -40,6 +41,7 @@ void help() {
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress]\n"
               << "  [--self-test] [--self-test-global] (full-planet integration tests)\n"
               << "  [--voxel-density 0.125|0.25|0.5|1|2] (sampling-spacing multiplier; default 1 = 50m)\n"
+              << "  [--terrain classic|mars|volcanic]\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -78,6 +80,7 @@ Options options(int argc, char** argv) {
             else if (method == "vdb" || method == "4") opts.methods = {Method::Vdb};
             else throw std::invalid_argument("Invalid scheme: " + method);
         } else if (arg == "--seed") opts.seed = number();
+        else if (arg == "--terrain") opts.terrain = parseTerrainPreset(next());
         else if (arg == "--frames") opts.frames = bounded(1, 100000);
         else if (arg == "--warmup") opts.warmup = bounded(0, 10000);
         else if (arg == "--invokers") opts.invokers = bounded(1, 80);
@@ -261,7 +264,7 @@ struct QueryResults {
 
 QueryResults run(const Options& opts, Method method, std::ostream& frames, std::ostream& summary, std::ostream& streaming,
                  const QueryResults* meshReference, const QueryResults* fieldReference, std::ostream* capsuleReport) {
-    Planet planet(opts.seed);
+    Planet planet(opts.seed, opts.terrain);
     World world(planet, method, opts.morton, opts.voxelDensity);
     auto invokers = invokerPositions(planet, opts.invokers, 0);
     Vec camera = replayCamera(invokers.front(), 0);
@@ -735,24 +738,93 @@ void selfTest() {
     static_assert(sizeof(Vec) == 3 * sizeof(double), "World vectors must remain double precision");
     check(planetRadius == 6371000.0 && chunkSize / fineCells == 50.0, "Earth radius retains 50 meter local sampling");
     const Planet planet(42);
-    const auto checkSurfaceNormal = [&planet](Vec direction) {
+    const auto checkSurfaceNormal = [](const Planet& field, Vec direction) {
         const auto axes = frameAt(direction);
         constexpr double delta = 0.2 / planetRadius;
-        const Vec dx = planet.surface(unit(direction + axes[0] * delta)) -
-                       planet.surface(unit(direction - axes[0] * delta));
-        const Vec dy = planet.surface(unit(direction + axes[1] * delta)) -
-                       planet.surface(unit(direction - axes[1] * delta));
-        const auto sample = planet.sampleSurface(direction);
-        check(std::abs(sample.elevation - planet.elevation(direction)) < 1e-9 &&
+        const Vec dx = field.surface(unit(direction + axes[0] * delta)) -
+                       field.surface(unit(direction - axes[0] * delta));
+        const Vec dy = field.surface(unit(direction + axes[1] * delta)) -
+                       field.surface(unit(direction - axes[1] * delta));
+        const auto sample = field.sampleSurface(direction);
+        check(std::abs(sample.elevation - field.elevation(direction)) < 1e-9 &&
               dot(sample.normal, unit(cross(dx, dy))) > 0.99999,
               "procedural terrain normal agrees with finite differences of elevation");
     };
-    checkSurfaceNormal(unit({-0.4, 1, 0.3}));
+    checkSurfaceNormal(planet, unit({-0.4, 1, 0.3}));
     for (int i = 0; i < 3; ++i) {
         const Vec center = planet.invokerDirection(i, 0);
         const Vec tangent = frameAt(center)[0];
         for (double offset : {100.0, 400.0, 900.0})
-            checkSurfaceNormal(unit(center + tangent * (offset / planetRadius)));
+            checkSurfaceNormal(planet, unit(center + tangent * (offset / planetRadius)));
+    }
+    for (const auto preset : {TerrainPreset::Mars, TerrainPreset::Volcanic}) {
+        const Planet field(42, preset), repeat(42, preset), otherSeed(43, preset);
+        const auto range = field.elevationRange();
+        const Vec center = field.invokerDirection(0, 0);
+        const auto tangent = frameAt(center)[0];
+        check(parseTerrainPreset(name(preset)) == preset && field.elevation(center) == repeat.elevation(center) &&
+              std::abs(field.elevation(center) - otherSeed.elevation(center)) > 1,
+              "terrain presets and seeds reproduce the intended field");
+        for (double meters : {85.0, 350.0, 540.0, 1230.0})
+            checkSurfaceNormal(field, unit(center + tangent * (meters / planetRadius)));
+        double maximumRelief = 0;
+        for (int i = 0; i < 960; ++i) {
+            const double z = (i + 0.5) / 480 - 1;
+            const double r = std::sqrt(1 - z * z), azimuth = i * 2.399963229728653;
+            const Vec direction{r * std::cos(azimuth), r * std::sin(azimuth), z};
+            const double height = field.elevation(direction);
+            check(height >= range.lower && height <= range.upper &&
+                  intersectsPlanetShell(keyAt(field.surface(direction), -3), range),
+                  "new terrain relief fits the shell used for field and clipmap selection");
+            maximumRelief = std::max(maximumRelief, std::abs(height));
+        }
+        check(maximumRelief > 1000, "regional geology extends beyond the original shell");
+        if (preset == TerrainPreset::Mars) {
+            for (const auto* globe : {&field, &otherSeed}) {
+                for (double z : {-0.88, -0.53, -0.17, 0.17, 0.53, 0.88}) {
+                    for (int sector = 0; sector < 4; ++sector) {
+                        const double angle = sector * 1.5707963267948966 + 0.47;
+                        const double radius = std::sqrt(1 - z * z);
+                        const Vec direction{radius * std::cos(angle), radius * std::sin(angle), z};
+                        const auto local = frameAt(direction);
+                        int craterSamples = 0, smallCraterSamples = 0;
+                        for (int row = -7; row <= 7; ++row) for (int col = -7; col <= 7; ++col) {
+                            const Vec step = local[0] * (181 * row + 29 * col) + local[1] * (47 * row + 171 * col);
+                            const Vec d = unit(direction + step / planetRadius);
+                            const double fine = globe->sampleSurface(d, 6.25, false).craterMaterial;
+                            const double coarse = globe->sampleSurface(d, 130, false).craterMaterial;
+                            craterSamples += fine > 0.13;
+                            smallCraterSamples += fine - coarse > 0.08;
+                        }
+                        check(craterSamples >= 12 && smallCraterSamples >= 2,
+                              "remote Mars sector has local and small impacts at z=" + std::to_string(z) +
+                              ", sector=" + std::to_string(sector) + ": " + std::to_string(craterSamples) +
+                              " crater samples and " + std::to_string(smallCraterSamples) + " small-crater samples");
+                        checkSurfaceNormal(*globe, direction);
+                    }
+                }
+            }
+        }
+        const Vec point = field.surface(center);
+        for (double sign : {-1.0, 1.0}) {
+            const Key key = keyAt(point + center * (800 * sign), -3);
+            BuildStats stats;
+            const auto chunk = buildChunk(field, {{key, 2}}, key, Method::Grid, false, stats);
+            const float value = chunk->field->get(0, 0, 0);
+            check(intersectsPlanetShell(key, range) && !chunk->surfaceBounds && chunk->mesh.empty() &&
+                  value * sign > 2 * chunk->spacing && chunk->field->get(8, 8, 8) == value,
+                  "blocks safely inside or outside the terrain use constant signed storage");
+        }
+        for (const auto method : {Method::Mesh, Method::Grid, Method::Dag, Method::Vdb}) {
+            World world(field, method, false);
+            world.update({point}, false);
+            const Vec start = point + center * 400, end = point - center * 400;
+            const auto ray = world.physics.ray(start, end);
+            const auto capsule = world.physics.sweep(sampleShape(2, center), start, end);
+            check(ray.state == Hit::State::Contact && capsule.state == Hit::State::Contact &&
+                  std::abs(ray.fraction - 0.5) < 0.075 && capsule.fraction < ray.fraction,
+                  "all backends cast against the selected terrain geometry");
+        }
     }
     const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
     for (const auto& text : {"", "0", "0.3", "nan", "inf", "0.5x", "2.0001"}) {
@@ -1011,7 +1083,8 @@ int main(int argc, char** argv) {
         auto settings = createFile(opts.output / "settings.txt");
         settings << "voxel_density=" << opts.voxelDensity << '\n'
                  << "finest_spacing_m=" << chunkSize / fineCells * opts.voxelDensity << '\n'
-                 << "planet_radius_m=" << planetRadius << '\n';
+                 << "planet_radius_m=" << planetRadius << '\n'
+                 << "terrain=" << name(opts.terrain) << '\n';
         std::cout << "Voxel sampling spacing " << opts.voxelDensity << "x (LOD 0: "
                   << chunkSize / fineCells * opts.voxelDensity << " meters)\n";
         auto frames = createFile(opts.output / "frames.csv");

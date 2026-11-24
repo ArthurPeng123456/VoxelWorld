@@ -26,9 +26,9 @@ constexpr DXGI_FORMAT hdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 struct FrameConstants {
     float camera[40]{};
     float shadowRows[4][3][4]{};
-    float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{}, scattering[4]{};
+    float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{}, scattering[4]{}, terrain[4]{};
 };
-static_assert(sizeof(FrameConstants) == 112 * sizeof(float));
+static_assert(sizeof(FrameConstants) == 116 * sizeof(float));
 
 struct RelativeBounds {
     Vec center, extent;
@@ -579,6 +579,9 @@ struct Dx12Renderer::Impl {
         frame.scattering[0] = float(settings.rayleighStrength);
         frame.scattering[1] = float(settings.mieStrength);
         frame.scattering[2] = float(settings.mieAnisotropy);
+        frame.terrain[0] = float(camera.terrain);
+        frame.terrain[1] = float(camera.terrainSeed);
+        frame.terrain[2] = float(elevationRange(camera.terrain).lower);
         void* mapped = nullptr; const D3D12_RANGE noReads{0,0};
         require(frameUpload->Map(0, &noReads, &mapped), "Map frame constants");
         std::memcpy(mapped, &frame, sizeof(frame));

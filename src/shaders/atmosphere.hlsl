@@ -10,11 +10,22 @@ cbuffer Camera : register(b0) {
     float4 shadowSettings; // enabled, inverse resolution, normal bias multiplier
     float4 renderParams; // width, height, exposure multiplier, tone mapper
     float4 scatteringParams; // Rayleigh strength, Mie strength, Mie anisotropy
+    float4 terrainParams; // preset, texture seed, minimum terrain elevation
 };
 
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }
-float3 betaR() { return scatteringParams.x * float3(5.802e-6, 13.558e-6, 33.100e-6); }
-float betaM() { return scatteringParams.y * 3.996e-6; }
+float3 betaR() {
+    float3 spectrum = float3(5.802, 13.558, 33.100);
+    if (terrainParams.x == 1) spectrum = float3(2.6, 1.8, 1.15);
+    if (terrainParams.x == 2) spectrum = float3(3.9, 3.7, 3.6);
+    return (scatteringParams.x * 1e-6) * spectrum;
+}
+float3 betaM() {
+    float3 spectrum = 3.996;
+    if (terrainParams.x == 1) spectrum = float3(2.95, 2.15, 1.45);
+    if (terrainParams.x == 2) spectrum = float3(4.4, 4.0, 3.55);
+    return (scatteringParams.y * 1e-6) * spectrum;
+}
 float2 density(float radiusDelta) {
     // (r² - R²) / (r + R) avoids subtracting two nearly equal radii.
     float r = sqrt(max(0, atmosphere.x * atmosphere.x + radiusDelta));

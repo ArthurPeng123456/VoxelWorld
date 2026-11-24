@@ -29,6 +29,8 @@ constexpr double invokerSpeed = 240.0;
 constexpr double invokerReturnSpeed = 720.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
+constexpr std::array terrainLabels{L"Classic", L"Mars Craters", L"Volcanic Highlands"};
+static_assert(terrainLabels.size() == terrainPresets.size());
 
 Key terrainPage(Key chunk) {
     // Group adjacent chunks of the same scale to limit both uploads and draw calls.
@@ -39,7 +41,7 @@ Key terrainPage(Key chunk) {
 }
 
 enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows,
-               RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget };
+               RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget, TerrainStyle };
 
 struct ToolbarButton { const wchar_t* label; int width; };
 constexpr std::array<ToolbarButton, GraphicsSettings> toolbarButtons{{
@@ -55,6 +57,7 @@ struct Options {
     int invokers{2};
     bool warp{}, morton{};
     double voxelDensity{1};
+    TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
     std::filesystem::path captures;
 };
@@ -108,6 +111,14 @@ Options readOptions() {
         else if (option == L"--capture-dir") result.captures = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
+        else if (option == L"--terrain") {
+            const auto value = next();
+            std::string ascii(value.size(), ' ');
+            std::transform(value.begin(), value.end(), ascii.begin(), [](wchar_t c) {
+                return c >= L'a' && c <= L'z' ? static_cast<char>(c) : ' ';
+            });
+            result.terrain = parseTerrainPreset(ascii);
+        }
         else if (option == L"--invokers") {
             const auto n = integer();
             if (n < 1 || n > maxInvokers) throw std::invalid_argument("Invoker count must be from 1 to 16");
@@ -211,7 +222,7 @@ Vec moveOnPlanet(const Planet& planet, Vec position, Vec tangent, double meters)
 
 class App {
 public:
-    explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed), method_(opts_.method) {}
+    explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed, opts_.terrain), method_(opts_.method) {}
     ~App() {
         renderer_.reset();
         if (IsWindow(window_)) DestroyWindow(window_);
@@ -259,6 +270,9 @@ public:
         createCombo(instance, Density, L"Voxel step", 80, 156);
         createCombo(instance, InvokerCount, L"Invokers", 67, 67);
         createCombo(instance, CameraTarget, L"Camera", 66, 125);
+        createCombo(instance, TerrainStyle, L"Terrain", 65, 177);
+        for (const auto* label : terrainLabels) addComboItem(TerrainStyle, label);
+        SendMessageW(combo(TerrainStyle), CB_SETCURSEL, WPARAM(opts_.terrain), 0);
         for (int i = 0; i < int(voxelDensities.size()); ++i) {
             std::wostringstream label;
             label << voxelDensities[i] << L"x (" << chunkSize / fineCells * voxelDensities[i] << L" m)";
@@ -514,6 +528,8 @@ private:
             }
         }
         std::vector<Vertex> geometry;
+        const bool classic = planet_.preset() == TerrainPreset::Classic;
+        const double geologyHalfRange = planet_.preset() == TerrainPreset::Mars ? 4700 : 4500;
         for (const Key page : dirtyPages) {
             auto& data = terrainPages_.at(page);
             triangles_ -= data.triangles;
@@ -535,14 +551,17 @@ private:
                         const Vec up = unit(point);
                         Vec normal = up;
                         double elevation = 0;
-                        if (reliefDetail > 0) {
-                            const auto sample = planet_.sampleSurface(up);
-                            normal = unit(up + (sample.normal - up) * reliefDetail, up);
-                            elevation = sample.elevation * reliefDetail;
+                        double craterMaterial = 0;
+                        if (reliefDetail > 0 || !classic) {
+                            const auto sample = planet_.sampleSurface(up, chunk.spacing, reliefDetail > 0);
+                            if (reliefDetail > 0) normal = unit(up + (sample.normal - up) * reliefDetail, up);
+                            elevation = classic ? sample.elevation * reliefDetail : sample.elevation;
+                            craterMaterial = sample.craterMaterial;
                         }
-                        const double height = std::clamp((elevation + 660) / 850, 0.0, 1.0);
+                        const double height = std::clamp(classic ? (elevation + 660) / 850 :
+                            (elevation + geologyHalfRange) / (2 * geologyHalfRange), 0.0, 1.0);
                         const double rock = std::clamp(2.4 * (1 - dot(normal, up)), 0.0, 1.0);
-                        geometry.push_back(vertex(point, normal, color({height, rock, 0}, chunk.lod)));
+                        geometry.push_back(vertex(point, normal, color({height, rock, craterMaterial}, chunk.lod)));
                     }
                 }
             }
@@ -590,9 +609,10 @@ private:
     }
 
     Camera camera() const {
+        const auto textureSeed = std::uint32_t((opts_.seed ^ (opts_.seed >> 32)) % 1021);
         if (freeView_) {
             return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
-                    lodTint_, wireframe_, {}, opts_.render};
+                    lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed};
         }
         const Vec target = invokers_[selected_];
         const Vec radial = unit(target);
@@ -619,7 +639,7 @@ private:
         }
         const Vec forward = unit(center - eye), right = unit(cross(forward, nominalUp), basis[0]);
         return {eye, right, unit(cross(right, forward)), forward, nearPlane, 20 * planetRadius,
-                lodTint_, wireframe_, {}, opts_.render};
+                lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed};
     }
 
     int captureAll() {
@@ -627,6 +647,7 @@ private:
         std::ofstream report(opts_.captures / "validation.txt");
         report.exceptions(std::ios::badbit | std::ios::failbit);
         report << "Direct3D 12 " << (renderer_->isWarp() ? "WARP" : "hardware") << '\n';
+        report << "terrain=" << name(opts_.terrain) << '\n';
         for (int i = 0; i < int(methods.size()); ++i) {
             method_ = i;
             selected_ = 0;
@@ -730,6 +751,7 @@ private:
                 report.put('\n');
             }
             if (maxContacts == 0) throw std::runtime_error("Capture scenario did not observe terrain contact");
+            if (methods[i] == Method::Grid && opts_.terrain == TerrainPreset::Mars) captureRemoteMars();
         }
         // End-to-end check of the actual DX12 vertex/camera/planet upload paths
         // with a common trillion-meter world translation.
@@ -803,26 +825,58 @@ private:
         renderer_->draw(validation, caster, opts_.captures / "pipeline-atmosphere-tuned.bmp");
         captureInvokerControls();
         report << "invoker_controls=passed\n";
+        if (opts_.terrain == TerrainPreset::Classic) {
+            for (const auto preset : {TerrainPreset::Mars, TerrainPreset::Volcanic, TerrainPreset::Classic}) {
+                selectCaptureItem(TerrainStyle, int(preset));
+                const Vec target = invokers_[selected_], direction = unit(target);
+                const auto hit = world_->physics.ray(target + direction * 250, target - direction * 250);
+                if (planet_.preset() != preset || camera().terrain != preset || triangles_ == 0 ||
+                    std::abs(planet_.sdf(target)) > 1e-6 || hit.state != Hit::State::Contact)
+                    throw std::runtime_error("Terrain dropdown did not replace both the rendered and collision fields");
+            }
+            report << "terrain_controls=passed\n";
+        }
         return 0;
     }
 
+    void captureRemoteMars() {
+        constexpr std::array directions{Vec{0.34, -0.82, 0.46}, Vec{0.83, 0.52, -0.20}};
+        for (std::size_t i = 0; i < directions.size(); ++i) {
+            const Vec direction = unit(directions[i]);
+            const Vec target = planet_.surface(direction);
+            const auto local = frameAt(direction);
+            Camera remote = camera();
+            remote.eye = target + direction * 1760 + local[0] * 950;
+            remote.forward = unit(target - remote.eye);
+            remote.right = unit(cross(remote.forward, direction));
+            remote.up = cross(remote.right, remote.forward);
+            remote.nearPlane = 8;
+            applyTerrain(world_->update({target}, true, remote.eye), false);
+            if (!world_->hasFinestLod(target) ||
+                world_->physics.ray(target + direction * 300, target - direction * 300).state != Hit::State::Contact)
+                throw std::runtime_error("Remote Mars terrain did not publish fine collision coverage");
+            renderer_->draw(remote, {}, opts_.captures / ("grid-mars-remote-" + std::to_string(i + 1) + ".bmp"));
+        }
+    }
+
+    void selectCaptureItem(int command, int item) {
+        const HWND field = combo(command);
+        if (SendMessageW(field, CB_SETCURSEL, WPARAM(item), 0) == CB_ERR)
+            throw std::runtime_error("Unable to select a viewer dropdown item");
+        SendMessageW(window_, WM_COMMAND, MAKEWPARAM(command, CBN_SELENDOK), reinterpret_cast<LPARAM>(field));
+        if (std::exchange(pending_, 0) != command) throw std::runtime_error("Viewer dropdown did not dispatch its selection");
+        action(command);
+    }
+
     void captureInvokerControls() {
-        const auto selectItem = [&](int command, int item) {
-            const HWND field = combo(command);
-            if (SendMessageW(field, CB_SETCURSEL, WPARAM(item), 0) == CB_ERR)
-                throw std::runtime_error("Unable to select an Invoker control item");
-            SendMessageW(window_, WM_COMMAND, MAKEWPARAM(command, CBN_SELENDOK), reinterpret_cast<LPARAM>(field));
-            if (std::exchange(pending_, 0) != command) throw std::runtime_error("Invoker dropdown did not dispatch its selection");
-            action(command);
-        };
         const auto bodyCount = shapes_.size();
         const Vec first = invokers_.front();
-        selectItem(InvokerCount, 2);
+        selectCaptureItem(InvokerCount, 2);
         if (invokers_.size() != 3 || length(invokers_.front() - first) != 0 || shapes_.size() != bodyCount ||
             SendMessageW(combo(CameraTarget), CB_GETCOUNT, 0, 0) != 4)
             throw std::runtime_error("Changing Invoker count did not preserve the scene and update the camera list");
 
-        selectItem(CameraTarget, 2);
+        selectCaptureItem(CameraTarget, 2);
         if (!controlling_ || !surface_ || freeView_ || selected_ != 1 ||
             (GetActiveWindow() == window_ && GetFocus() != viewport_))
             throw std::runtime_error("Camera selection did not hand control to the selected Invoker");
@@ -849,8 +903,8 @@ private:
         const Vec route = planet_.surface(planet_.invokerDirection(1, simulationTime_ * 2.0));
         if (returning_[1] || length(invokers_[1] - route) != 0)
             throw std::runtime_error("Detached Invoker did not rejoin its route");
-        selectItem(CameraTarget, 3);
-        selectItem(InvokerCount, 0);
+        selectCaptureItem(CameraTarget, 3);
+        selectCaptureItem(InvokerCount, 0);
         if (controlling_ || selected_ != 0 || invokers_.size() != 1 || shapes_.size() != bodyCount ||
             SendMessageW(combo(CameraTarget), CB_GETCURSEL, 0, 0) != 0)
             throw std::runtime_error("Removing the controlled Invoker did not safely detach the camera");
@@ -874,6 +928,21 @@ private:
         } else if (command == CameraTarget) {
             const auto selected = SendMessageW(combo(CameraTarget), CB_GETCURSEL, 0, 0);
             if (selected >= 0) selectCameraTarget(std::size_t(selected));
+        } else if (command == TerrainStyle) {
+            const auto selected = SendMessageW(combo(TerrainStyle), CB_GETCURSEL, 0, 0);
+            if (selected >= 0 && selected < LRESULT(terrainPresets.size())) {
+                const auto preset = terrainPresets[std::size_t(selected)];
+                if (preset != opts_.terrain) {
+                    Planet next(opts_.seed, preset);
+                    // The old streamer holds a reference to this planet. Join
+                    // its work before installing the new procedural field.
+                    world_.reset();
+                    planet_ = std::move(next);
+                    opts_.terrain = preset;
+                    freeView_ = false;
+                    rebuild();
+                }
+            }
         } else if (command == RangeSettings) {
             if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) world_->setLod0Radius(lod0Radius_);
         } else if (command == GraphicsSettings) {
@@ -1001,7 +1070,7 @@ private:
         int coarse = 0;
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
         std::wostringstream info;
-        info << methodLabels[method_];
+        info << methodLabels[method_] << L"   |   " << terrainLabels[std::size_t(opts_.terrain)];
         info << L"   |   Step " << world_->voxelDensity() << L"x ("
              << chunkSize / fineCells * world_->voxelDensity() << L" m)";
         if (world_->voxelDensity() != opts_.voxelDensity) info << L" -> " << opts_.voxelDensity << L"x building";
@@ -1138,7 +1207,7 @@ private:
             }
             case WM_COMMAND: {
                 const int command = LOWORD(w), notification = HIWORD(w);
-                if (command >= Density && command <= CameraTarget) {
+                if (command >= Density && command <= TerrainStyle) {
                     if (notification == CBN_SELENDOK || (notification == CBN_SELCHANGE &&
                         !SendMessageW(app->combo(command), CB_GETDROPPEDSTATE, 0, 0))) app->pending_ = command;
                 } else if (command >= Mesh && command <= GraphicsSettings && notification == BN_CLICKED) app->pending_ = command;
@@ -1211,7 +1280,7 @@ private:
     int method_, pending_{};
     HWND window_{}, viewport_{};
     std::array<HWND, toolbarButtons.size()> buttons_{};
-    std::array<ToolbarCombo, CameraTarget - Density + 1> combos_{};
+    std::array<ToolbarCombo, TerrainStyle - Density + 1> combos_{};
     HFONT font_{};
     HBRUSH background_{};
     std::unique_ptr<Dx12Renderer> renderer_;
