@@ -45,6 +45,8 @@ constexpr int sweepBudget = 12000;
 template<class Operation>
 void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation operation) {
     const Vec pad = extents + splat(epsilon);
+    const int densityShift = chunks.empty() ? 0 : chunks.begin()->first.densityShift;
+    const double size = gridChunkSize(densityShift);
     if (!chunks.empty() && chunks.rbegin()->first.level > 0) {
         const Vec delta = to - from;
         auto visit = [&](auto&& self, Key key) -> void {
@@ -56,16 +58,16 @@ void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation op
             const int step = 1 << (key.level - 1);
             for (int i = 0; i < 8; ++i)
                 self(self, Key{key.x + (i & 1) * step, key.y + ((i >> 1) & 1) * step,
-                               key.z + (i >> 2) * step, key.level - 1});
+                               key.z + (i >> 2) * step, key.level - 1, densityShift});
         };
-        const int step = 1 << rootLevel;
+        const int level = gridRootLevel(densityShift), step = 1 << level;
         for (int i = 0; i < 8; ++i)
-            visit(visit, Key{(i & 1) ? 0 : -step, (i & 2) ? 0 : -step, (i & 4) ? 0 : -step, rootLevel});
+            visit(visit, Key{(i & 1) ? 0 : -step, (i & 2) ? 0 : -step, (i & 4) ? 0 : -step, level, densityShift});
         return;
     }
-    const Key lo = keyAt(min(from, to) - pad), hi = keyAt(max(from, to) + pad);
+    const Key lo = keyAt(min(from, to) - pad, densityShift), hi = keyAt(max(from, to) + pad, densityShift);
     auto emit = [&](int x, int y, int z) {
-        const auto found = chunks.find({x, y, z});
+        const auto found = chunks.find({x, y, z, 0, densityShift});
         if (found != chunks.end()) operation(*found->second);
     };
     if (hi.x - lo.x <= 1 && hi.y - lo.y <= 1 && hi.z - lo.z <= 1) {
@@ -78,8 +80,8 @@ void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation op
     // This keeps a long diagonal cast proportional to its swept tube.
     const Vec delta = to - from;
     auto slice = [&](int axis, int index, double& first, double& last) {
-        const double lower = index * chunkSize - pad[axis];
-        const double upper = (index + 1) * chunkSize + pad[axis];
+        const double lower = index * size - pad[axis];
+        const double upper = (index + 1) * size + pad[axis];
         if (std::abs(delta[axis]) < 1e-13) return from[axis] >= lower && from[axis] <= upper;
         const double a = (lower - from[axis]) / delta[axis], b = (upper - from[axis]) / delta[axis];
         first = std::max(first, std::min(a, b));
@@ -88,8 +90,8 @@ void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation op
     };
     auto range = [&](int axis, double first, double last) {
         const double a = from[axis] + delta[axis] * first, b = from[axis] + delta[axis] * last;
-        return std::make_pair(int(std::floor((std::min(a, b) - pad[axis]) / chunkSize)),
-                              int(std::floor((std::max(a, b) + pad[axis]) / chunkSize)));
+        return std::make_pair(int(std::floor((std::min(a, b) - pad[axis]) / size)),
+                              int(std::floor((std::max(a, b) + pad[axis]) / size)));
     };
     for (int z = lo.z; z <= hi.z; ++z) {
         double beforeZ = 0, afterZ = 1;

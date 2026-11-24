@@ -7,20 +7,21 @@ namespace voxel {
 namespace {
 
 constexpr int radii[] = {1, 2, 3, 4};
-constexpr double anchorMargin = 0.125 * chunkSize;
+double anchorMargin(int densityShift) { return 0.125 * gridChunkSize(densityShift); }
 constexpr std::size_t mapNodeOverhead = 4 * sizeof(void*);
 
 struct KeyBox { Key lo, hi; }; // Half-open in chunk coordinates.
 
 KeyBox window(Key anchor, int lod) {
     const int r = radii[lod];
-    return {{anchor.x - r, anchor.y - r, anchor.z - r}, {anchor.x + r + 1, anchor.y + r + 1, anchor.z + r + 1}};
+    return {{anchor.x - r, anchor.y - r, anchor.z - r, 0, anchor.densityShift},
+            {anchor.x + r + 1, anchor.y + r + 1, anchor.z + r + 1, 0, anchor.densityShift}};
 }
 
 template<class Visit>
 void visitBox(KeyBox box, Visit visit) {
     for (int z = box.lo.z; z < box.hi.z; ++z) for (int y = box.lo.y; y < box.hi.y; ++y) {
-        for (int x = box.lo.x; x < box.hi.x; ++x) visit(Key{x, y, z});
+        for (int x = box.lo.x; x < box.hi.x; ++x) visit(Key{x, y, z, 0, box.lo.densityShift});
     }
 }
 
@@ -59,19 +60,19 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
     if (global) {
         std::vector<Key> next;
         for (std::size_t i = 0; i < invokers.size(); ++i) {
-            Key key = keyAt(invokers[i]);
-            if (global_ && i < anchors_.size()) {
-                const Box retained = bounds(anchors_[i]).expanded(splat(anchorMargin));
+            Key key = keyAt(invokers[i], densityShift_);
+            if (global_ && i < anchors_.size() && anchors_[i].densityShift == densityShift_) {
+                const Box retained = bounds(anchors_[i]).expanded(splat(anchorMargin(densityShift_)));
                 for (int a = 0; a < 3; ++a)
                     if (invokers[i][a] >= retained.lo[a] && invokers[i][a] < retained.hi[a]) key[a] = anchors_[i][a];
             }
             next.push_back(key);
         }
         visits = 0;
-        if (global_ && next == anchors_) return changed;
+        if (global_ && next == anchors_ && layoutDensityShift(layout_) == densityShift_) return changed;
         std::vector<Vec> centers;
         for (Key key : next) centers.push_back(bounds(key).center());
-        auto desired = planetLayout(centers, &visits);
+        auto desired = planetLayout(centers, &visits, densityShift_);
         for (const auto& entry : layout_) {
             const auto found = desired.find(entry.first);
             if (found == desired.end() || found->second != entry.second) changed.insert(entry.first);
@@ -86,7 +87,8 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         global_ = true;
         return changed;
     }
-    if (global_) {
+    if (global_ || (!layout_.empty() && layoutDensityShift(layout_) != densityShift_) ||
+        (!anchors_.empty() && anchors_.front().densityShift != densityShift_)) {
         for (const auto& entry : layout_) changed.insert(entry.first);
         anchors_.clear(); coverage_.clear(); layout_.clear(); global_ = false;
     }
@@ -95,9 +97,9 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
     for (std::size_t i = 0; i < std::max(anchors_.size(), invokers.size()); ++i) {
         const bool had = i < anchors_.size(), has = i < invokers.size();
         const Key previous = had ? anchors_[i] : Key{};
-        Key next = has ? keyAt(invokers[i]) : Key{};
+        Key next = has ? keyAt(invokers[i], densityShift_) : Key{};
         if (had && has) {
-            const Box retained = bounds(previous).expanded(splat(anchorMargin));
+            const Box retained = bounds(previous).expanded(splat(anchorMargin(densityShift_)));
             for (int axis = 0; axis < 3; ++axis) {
                 if (invokers[i][axis] >= retained.lo[axis] && invokers[i][axis] < retained.hi[axis]) next[axis] = previous[axis];
             }
@@ -150,7 +152,8 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
     if (global_) {
         for (std::size_t i = 0; i < anchors_.size(); ++i) for (int lod = 0; lod < lodCount; ++lod) {
             const Vec center = bounds(anchors_[i]).center();
-            const double radius = lod < 4 ? chunkSize * radii[lod] : 2 * std::ldexp(chunkSize, lod - 3);
+            const double size = gridChunkSize(densityShift_);
+            const double radius = lod < 4 ? size * radii[lod] : 2 * std::ldexp(size, lod - 3);
             const double limit = std::ldexp(chunkSize, rootLevel);
             result.push_back({i, lod, {max(splat(-limit), center - splat(radius)), min(splat(limit), center + splat(radius))}});
         }
@@ -159,7 +162,8 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
     result.reserve(anchors_.size() * 4);
     for (std::size_t i = 0; i < anchors_.size(); ++i) for (int lod = 0; lod < 4; ++lod) {
         const auto box = window(anchors_[i], lod);
-        result.push_back({i, lod, {asVec(box.lo) * chunkSize, asVec(box.hi) * chunkSize}});
+        const double size = gridChunkSize(densityShift_);
+        result.push_back({i, lod, {asVec(box.lo) * size, asVec(box.hi) * size}});
     }
     return result;
 }
@@ -170,8 +174,9 @@ std::size_t Clipmap::bytes() const {
          + layout_.size() * (sizeof(Layout::value_type) + mapNodeOverhead);
 }
 
-World::World(const Planet& planet, Method method, bool morton)
-    : physics(method, chunks), planet_(planet), method_(method), morton_(morton) {}
+World::World(const Planet& planet, Method method, bool morton, double density)
+    : physics(method, chunks), planet_(planet), method_(method), morton_(morton),
+      densityShift_(voxelDensityShift(density)), clipmap_(densityShift_) {}
 
 World::Prior World::snapshot() const {
     Prior prior;
@@ -180,10 +185,11 @@ World::Prior World::snapshot() const {
 }
 
 World::Batch World::planUpdate(Clipmap planned, const Prior& prior, const std::vector<Vec>& sources,
-                              bool global, Clock::time_point start) {
+                              bool global, int densityShift, Clock::time_point start) {
     Batch batch{};
     batch.start = start;
     batch.clipmap = std::move(planned);
+    batch.clipmap.setDensityShift(densityShift);
     const auto changed = batch.clipmap.update(sources, global, batch.stats.windowVisits);
     const auto& layout = batch.clipmap.layout();
     batch.stats.changedOwners = changed.size();
@@ -242,7 +248,7 @@ WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::opt
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
-    auto batch = planUpdate(clipmap_, snapshot(), sources, global, start);
+    auto batch = planUpdate(clipmap_, snapshot(), sources, global, densityShift_, start);
     build(batch, planet_, batch.clipmap.layout(), method_, morton_);
     return publish(std::move(batch));
 }
@@ -255,8 +261,8 @@ bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec cam
     // Copy only immutable scheduling metadata. The worker owns the next tree;
     // rendering, queries, memory statistics and physics retain the published tree.
     building_ = std::async(std::launch::async, [planet = &planet_, planned = clipmap_, prior = snapshot(),
-            method = method_, morton = morton_, global, start, sources = std::move(sources)]() mutable {
-        auto batch = planUpdate(std::move(planned), prior, sources, global, start);
+            method = method_, morton = morton_, densityShift = densityShift_, global, start, sources = std::move(sources)]() mutable {
+        auto batch = planUpdate(std::move(planned), prior, sources, global, densityShift, start);
         build(batch, *planet, batch.clipmap.layout(), method, morton);
         return batch;
     });

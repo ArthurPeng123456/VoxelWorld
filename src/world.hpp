@@ -21,11 +21,16 @@ struct ClipmapWindow {
 
 class Clipmap {
 public:
+    Clipmap() = default;
+    explicit Clipmap(int densityShift) : densityShift_(densityShift) {}
+    void setDensityShift(int shift) { densityShift_ = shift; }
+    int densityShift() const { return densityShift_; }
     std::set<Key> update(const std::vector<Vec>& invokers, bool global, std::size_t& visits);
     std::vector<ClipmapWindow> windows() const;
     const Layout& layout() const { return layout_; }
     std::size_t bytes() const;
 private:
+    int densityShift_{};
     std::vector<Key> anchors_;
     std::map<Key, std::array<unsigned, 4>> coverage_;
     Layout layout_;
@@ -39,7 +44,9 @@ struct TerrainMemory {
 
 class World {
 public:
-    World(const Planet& planet, Method method, bool morton);
+    World(const Planet& planet, Method method, bool morton, double density = 1);
+    void setVoxelDensity(double density) { densityShift_ = voxelDensityShift(density); }
+    double voxelDensity() const { return std::ldexp(1.0, clipmap_.densityShift()); }
     WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {});
     bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera);
     std::optional<WorldStats> pollUpdate();
@@ -61,12 +68,13 @@ private:
     };
     Prior snapshot() const;
     static Batch planUpdate(Clipmap planned, const Prior& prior, const std::vector<Vec>& sources,
-                            bool global, Clock::time_point start);
+                            bool global, int densityShift, Clock::time_point start);
     static void build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton);
     WorldStats publish(Batch batch);
     const Planet& planet_;
     Method method_;
     bool morton_;
+    int densityShift_{};
     Clipmap clipmap_;
     std::vector<ClipmapWindow> publishedWindows_;
     std::future<Batch> building_;

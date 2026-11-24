@@ -27,6 +27,7 @@ struct Options {
     int queries{12};
     int bodies{48};
     int streamEvery{6};
+    double voxelDensity{1};
     bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{};
     fs::path output{"results"};
 };
@@ -35,6 +36,7 @@ void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
+              << "  [--voxel-density 0.125|0.25|0.5|1|2] (sampling-spacing multiplier; default 1 = 50m)\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -82,6 +84,7 @@ Options options(int argc, char** argv) {
         else if (arg == "--out") opts.output = next();
         else if (arg == "--morton") opts.morton = true;
         else if (arg == "--global") opts.global = true;
+        else if (arg == "--voxel-density" || arg == "--density") opts.voxelDensity = parseVoxelDensity(next());
         else if (arg == "--obj") opts.obj = true;
         else if (arg == "--self-test") opts.selfTest = true;
         else if (arg == "--capsule-stress") opts.capsuleStress = true;
@@ -210,6 +213,7 @@ std::ofstream createFile(const fs::path& path) {
 void exportMesh(const fs::path& path, const World& world, const std::vector<Vec>& invokers, Vec camera) {
     auto out = createFile(path);
     out << "# VoxelWorld Marching Cubes, world coordinates in meters\n";
+    out << "# voxel_density " << world.voxelDensity() << '\n';
     for (const Vec p : invokers) out << "# invoker " << p.x << ' ' << p.y << ' ' << p.z << '\n';
     out << "# camera_invoker " << camera.x << ' ' << camera.y << ' ' << camera.z << '\n';
     for (const auto& window : world.clipmapWindows()) {
@@ -254,7 +258,7 @@ struct QueryResults {
 QueryResults run(const Options& opts, Method method, std::ostream& frames, std::ostream& summary, std::ostream& streaming,
                  const QueryResults* meshReference, const QueryResults* fieldReference, std::ostream* capsuleReport) {
     Planet planet(opts.seed);
-    World world(planet, method, opts.morton);
+    World world(planet, method, opts.morton, opts.voxelDensity);
     auto invokers = invokerPositions(planet, opts.invokers, 0);
     Vec camera = replayCamera(invokers.front(), 0);
     const WorldStats initial = world.update(invokers, opts.global, camera);
@@ -452,6 +456,53 @@ void selfTest() {
     check(planetRadius == 6371000.0 && chunkSize / fineCells == 50.0, "Earth radius retains 50 meter local sampling");
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
+    for (const auto& text : {"", "0", "0.3", "nan", "inf", "0.5x", "2.0001"}) {
+        bool rejected = false;
+        try { parseVoxelDensity(std::string(text)); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "unsupported voxel density is rejected");
+    }
+    check(parseVoxelDensity(std::wstring(L"0.125")) == 0.125, "viewer accepts wide-character density arguments");
+    for (double density : voxelDensities) {
+        const int shift = voxelDensityShift(density);
+        const Key key = keyAt(first[0], shift);
+        const Box box = bounds(key);
+        check(box.contains(first[0]) && box.hi.x - box.lo.x == chunkSize * density,
+              "density scales chunk coordinates without scaling the planet");
+        World scaled(planet, Method::Grid, false, density);
+        scaled.update(first, true);
+        check(scaled.voxelDensity() == density && scaled.chunks.at(key)->lod == 0 &&
+              scaled.chunks.at(key)->spacing == 50 * density, "all five density levels produce the requested voxel spacing");
+        double volume = 0;
+        for (const auto& item : scaled.chunks) {
+            check(item.first.densityShift == shift, "published field uses one coherent density");
+            volume += std::ldexp(density * density * density, 3 * item.first.level);
+        }
+        check(volume == std::ldexp(8.0, 3 * rootLevel), "density settings preserve full planetary coverage");
+        const Vec up = unit(first[0]);
+        const auto ray = scaled.physics.ray(first[0] + up * 500, first[0] - up * 500);
+        check(ray.state == Hit::State::Contact && std::abs(ray.fraction - 0.5) < 0.02,
+              "density-aware field rays hit the local surface");
+        const Vec opposite = first[0] * -1, away = unit(opposite);
+        check(scaled.physics.ray(opposite + away * 100000, opposite - away * 100000).state == Hit::State::Contact,
+              "density settings preserve distant hemisphere queries");
+        if (density == 1) {
+            const auto body = scaled.physics.addBody(sampleShape(1, up), first[0] + up * 100, up * -10);
+            const Vec before = scaled.physics.bodyPosition(body);
+            scaled.setVoxelDensity(0.125);
+            check(scaled.voxelDensity() == 1 && scaled.requestUpdate(first, true, first[0]),
+                  "runtime density switch stages a replacement while preserving published density");
+            const auto deadline = Clock::now() + std::chrono::seconds(20);
+            std::optional<WorldStats> published;
+            while (!(published = scaled.pollUpdate()) && Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(published.has_value() && scaled.voxelDensity() == 0.125 &&
+                  scaled.chunks.at(keyAt(first[0], -3))->spacing == 6.25,
+                  "runtime density switch publishes the new field and meshes");
+            check(length(scaled.physics.bodyPosition(body) - before) == 0, "density replacement retains body transforms");
+            scaled.physics.step(1.0 / 60, true);
+            check(scaled.physics.bodySpeed(body) > 9, "density replacement retains body velocity");
+        }
+    }
     Clipmap clipmap;
     std::size_t visits = 0;
     clipmap.update(first, false, visits);
@@ -759,6 +810,12 @@ int main(int argc, char** argv) {
         if (opts.help) { help(); return 0; }
         if (opts.selfTest) { selfTest(); return 0; }
         fs::create_directories(opts.output);
+        auto settings = createFile(opts.output / "settings.txt");
+        settings << "voxel_density=" << opts.voxelDensity << '\n'
+                 << "finest_spacing_m=" << chunkSize / fineCells * opts.voxelDensity << '\n'
+                 << "planet_radius_m=" << planetRadius << '\n';
+        std::cout << "Voxel sampling spacing " << opts.voxelDensity << "x (LOD 0: "
+                  << chunkSize / fineCells * opts.voxelDensity << " meters)\n";
         auto frames = createFile(opts.output / "frames.csv");
         auto summary = createFile(opts.output / "summary.csv");
         auto streaming = createFile(opts.output / "streaming.csv");

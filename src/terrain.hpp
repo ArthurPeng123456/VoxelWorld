@@ -1,5 +1,7 @@
 #pragma once
 
+#include "grid_density.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -66,20 +68,23 @@ constexpr int fieldRootLevel() {
 }
 constexpr int rootLevel = fieldRootLevel();
 constexpr int coarsestSurfaceLevel = rootLevel > 3 ? rootLevel - 3 : 0;
-constexpr int lodCount = rootLevel + 4;
+constexpr int lodCount = rootLevel + 7; // The 0.125x grid requires three additional levels.
+inline double gridChunkSize(int densityShift) { return std::ldexp(chunkSize, densityShift); }
+inline int gridRootLevel(int densityShift) { return rootLevel - densityShift; }
 constexpr float background = 2400.0f;
 
 struct Key {
     int x{}, y{}, z{};
     // Lower corner in base-chunk units; side length is chunkSize * 2^level.
     int level{};
+    int densityShift{};
     int operator[](int axis) const { return axis == 0 ? x : axis == 1 ? y : z; }
     int& operator[](int axis) { return axis == 0 ? x : axis == 1 ? y : z; }
-    bool operator==(Key b) const { return x == b.x && y == b.y && z == b.z && level == b.level; }
-    bool operator<(Key b) const { return std::tie(level, x, y, z) < std::tie(b.level, b.x, b.y, b.z); }
+    bool operator==(Key b) const { return x == b.x && y == b.y && z == b.z && level == b.level && densityShift == b.densityShift; }
+    bool operator<(Key b) const { return std::tie(densityShift, level, x, y, z) < std::tie(b.densityShift, b.level, b.x, b.y, b.z); }
 };
 inline Vec asVec(Key key) { return {double(key.x), double(key.y), double(key.z)}; }
-Key keyAt(Vec p);
+Key keyAt(Vec p, int densityShift = 0);
 Box bounds(Key key);
 bool intersectsPlanetShell(Key key);
 
@@ -145,10 +150,11 @@ struct BuildStats {
 };
 
 using Layout = std::map<Key, int>;
-Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr);
+inline int layoutDensityShift(const Layout& layout) { return layout.empty() ? 0 : layout.begin()->first.densityShift; }
+Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr, int densityShift = 0);
 std::optional<Key> leafAt(const Layout& layout, Vec point);
 std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
-Layout selectChunks(const std::vector<Vec>& invokers, bool global);
+Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift = 0);
 std::array<int, 27> neighborhood(const Layout& layout, Key key);
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
                                   Method method, bool morton, BuildStats& stats);

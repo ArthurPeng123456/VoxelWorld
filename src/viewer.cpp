@@ -24,7 +24,7 @@ constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Density = 100 };
 
 struct ToolbarButton { const wchar_t* label; int width; };
 constexpr std::array<ToolbarButton, FreeView> toolbarButtons{{
@@ -38,6 +38,7 @@ struct Options {
     std::uint64_t seed{42};
     int invokers{2};
     bool warp{}, morton{};
+    double voxelDensity{1};
     std::filesystem::path captures;
 };
 
@@ -62,6 +63,7 @@ Options readOptions() {
         if (option == L"--warp") result.warp = true;
         else if (option == L"--morton") result.morton = true;
         else if (option == L"--capture-dir") result.captures = next();
+        else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
         else if (option == L"--invokers") {
             const auto n = integer();
@@ -197,6 +199,20 @@ public:
             if (!buttons_[i]) throw std::runtime_error("Create viewer toolbar failed");
             SendMessageW(buttons_[i], WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
         }
+        densityLabel_ = CreateWindowExW(0, L"STATIC", L"Voxel step:", WS_VISIBLE | WS_CHILD,
+                                        0, 0, 1, 1, window_, nullptr, instance, nullptr);
+        densityCombo_ = CreateWindowExW(0, L"COMBOBOX", nullptr,
+            WS_VISIBLE | WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 1, 220, window_, reinterpret_cast<HMENU>(INT_PTR(Density)), instance, nullptr);
+        if (!densityLabel_ || !densityCombo_) throw std::runtime_error("Create voxel density control failed");
+        SendMessageW(densityLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+        SendMessageW(densityCombo_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+        for (int i = 0; i < int(voxelDensities.size()); ++i) {
+            std::wostringstream label;
+            label << voxelDensities[i] << L"x (" << chunkSize / fineCells * voxelDensities[i] << L" m)";
+            SendMessageW(densityCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.str().c_str()));
+            if (voxelDensities[i] == opts_.voxelDensity) SendMessageW(densityCombo_, CB_SETCURSEL, WPARAM(i), 0);
+        }
         arrange();
         ShowWindow(window_, show);
         UpdateWindow(window_);
@@ -212,7 +228,8 @@ public:
         while (!closed_) {
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                 if (message.message == WM_QUIT) return int(message.wParam);
-                if (message.message == WM_KEYDOWN && key(message.wParam, (message.lParam & (1L << 30)) == 0)) continue;
+                if (message.hwnd != densityCombo_ && message.message == WM_KEYDOWN &&
+                    key(message.wParam, (message.lParam & (1L << 30)) == 0)) continue;
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -261,7 +278,7 @@ private:
     void rebuild() {
         simulationTime_ = 0;
         shapes_.clear();
-        world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton);
+        world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity);
         refreshTerrain(true);
         for (int i = 0; i < opts_.invokers; ++i) spawn(i);
         updateFooter();
@@ -532,6 +549,12 @@ private:
                 method_ = command - Mesh;
                 rebuild();
             }
+        } else if (command == Density) {
+            const auto selected = SendMessageW(densityCombo_, CB_GETCURSEL, 0, 0);
+            if (selected >= 0 && selected < LRESULT(voxelDensities.size())) {
+                opts_.voxelDensity = voxelDensities[std::size_t(selected)];
+                world_->setVoxelDensity(opts_.voxelDensity);
+            }
         } else if (command == View) {
             freeView_ = false;
             surface_ = !surface_;
@@ -607,6 +630,9 @@ private:
             MoveWindow(buttons_[i], x, y, width, 34, TRUE);
             x += width + (i == 3 ? 21 : 6);
         }
+        if (x > 12 && x + 240 > client.right - 12) { x = 12; y += 40; }
+        if (densityLabel_) MoveWindow(densityLabel_, x, y + 8, 80, 24, TRUE);
+        if (densityCombo_) MoveWindow(densityCombo_, x + 80, y + 4, 160, 220, TRUE);
         const int toolbarHeight = y + 43;
         const int height = std::max(0L, client.bottom - toolbarHeight - footerHeight);
         MoveWindow(viewport_, 0, toolbarHeight, client.right, height, TRUE);
@@ -625,6 +651,9 @@ private:
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
         std::wostringstream info;
         info << methodLabels[method_];
+        info << L"   |   Step " << world_->voxelDensity() << L"x ("
+             << chunkSize / fineCells * world_->voxelDensity() << L" m)";
+        if (world_->voxelDensity() != opts_.voxelDensity) info << L" -> " << opts_.voxelDensity << L"x building";
         if (freeView_) info << L"   |   Free " << std::fixed << std::setprecision(0) << flightSpeed_ << L" m/s";
         info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
              << L"   |   LOD 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3] << L" / " << coarse
@@ -634,6 +663,12 @@ private:
         if (paused_) info << L"   |   Paused";
         if (renderer_->isWarp()) info << L"   |   WARP";
         status_ = info.str();
+        const double spacing = chunkSize / fineCells * world_->voxelDensity();
+        std::wostringstream legend;
+        legend << L"LOD 0 Cyan " << spacing << L" m / 1 Green " << spacing * 2
+               << L" m / 2 Gold " << spacing * 4 << L" m / 3 Violet " << spacing * 8
+               << L" m / 4+ Red to Blue, x2 per LOD";
+        lodLegend_ = legend.str();
 
         constexpr double mib = 1024.0 * 1024.0;
         PROCESS_MEMORY_COUNTERS_EX process{};
@@ -691,7 +726,7 @@ private:
         const wchar_t* controls = freeView_
             ? L"Free [C]: WASD move / Q-E down-up / Drag to look / Shift x5 / Wheel speed / F2 wireframe / H atmosphere"
             : lodTint_ || showRanges_
-            ? L"LOD 0 Cyan 50 m / 1 Green 100 m / 2 Gold 200 m / 3 Violet 400 m / 4-15 Red to Blue, x2 per LOD"
+            ? lodLegend_.c_str()
             : L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
         DrawTextW(dc, controls, -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         EndPaint(window_, &paintInfo);
@@ -741,7 +776,14 @@ private:
                 limits->ptMinTrackSize = {1080, 560};
                 return 0;
             }
-            case WM_COMMAND: if (HIWORD(w) == BN_CLICKED) app->pending_ = LOWORD(w); return 0;
+            case WM_COMMAND:
+                if ((LOWORD(w) == Density && HIWORD(w) == CBN_SELCHANGE) ||
+                    (LOWORD(w) != Density && HIWORD(w) == BN_CLICKED)) app->pending_ = LOWORD(w);
+                return 0;
+            case WM_CTLCOLORSTATIC:
+                SetTextColor(reinterpret_cast<HDC>(w), RGB(220, 231, 243));
+                SetBkMode(reinterpret_cast<HDC>(w), TRANSPARENT);
+                return reinterpret_cast<LRESULT>(app->background_);
             case WM_DRAWITEM: app->paintButton(*reinterpret_cast<DRAWITEMSTRUCT*>(l)); return TRUE;
             case WM_PAINT:
                 if (!app->window_) return DefWindowProcW(window, message, w, l);
@@ -802,7 +844,7 @@ private:
     Options opts_;
     Planet planet_;
     int method_, pending_{};
-    HWND window_{}, viewport_{};
+    HWND window_{}, viewport_{}, densityLabel_{}, densityCombo_{};
     std::array<HWND, toolbarButtons.size()> buttons_{};
     HFONT font_{};
     HBRUSH background_{};
@@ -812,7 +854,7 @@ private:
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
     std::size_t selected_{}, triangles_{};
-    std::wstring status_, processMemory_, terrainMemory_;
+    std::wstring status_, processMemory_, terrainMemory_, lodLegend_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
     bool atmosphereEnabled_{true};
     bool freeView_{};
