@@ -5,6 +5,10 @@ cbuffer Camera : register(b0) {
     float4 sunlight;
     float4 planetEyeHi, planetEyeLo; // camera minus planet center, split on CPU in double
     float4 atmosphere; // ground radius, top radius, Rayleigh/Mie scale heights (meters)
+    float4 shadowRows[12];
+    float4 shadowSplits, shadowTexels, shadowBiases;
+    float4 shadowSettings; // enabled, inverse resolution
+    float4 renderParams; // width, height, exposure multiplier, wireframe
 };
 
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }
@@ -58,7 +62,6 @@ float3 scatter(DF3 eye, float3 ray, float limit, out float3 transmittance) {
     transmittance = exp(-extinction(optical));
     return 20 * (sumR * betaR() * phaseR + sumM * betaM() * phaseM);
 }
-float3 displayColor(float3 radiance) { return pow(1 - exp(-max(radiance, 0)), 1.0 / 2.2); }
 
 struct Surface {
     float4 clip : SV_Position;
@@ -81,51 +84,10 @@ Surface surfaceVS(float3 hi : POSITION0, float3 lo : POSITION1, float3 normal : 
     result.material = material;
     return result;
 }
-float4 surfacePS(Surface input) : SV_Target {
-    float3 normal = normalize(input.normal);
-    float diffuse = max(0, dot(normal, sunlight.xyz));
-    int code = int(round(input.material.a * 255));
-    float3 color = input.material.rgb;
-    if (code < 254 && sunlight.w > 0.5) {
-        if (code == 0) color = float3(0.19, 0.72, 0.83);
-        if (code == 1) color = float3(0.28, 0.63, 0.38);
-        if (code == 2) color = float3(0.81, 0.63, 0.29);
-        if (code == 3) color = float3(0.53, 0.43, 0.64);
-        if (code >= 4) color = lerp(float3(0.95, 0.35, 0.22), float3(0.12, 0.22, 0.46), saturate((code - 4) / 8.0));
-    }
-    if (code == 255) return float4(color, 1);
-    color *= 0.18 + 0.82 * diffuse;
-    float distance = length(input.relative);
-    float3 transmittance;
-    float3 inscatter = scatter(planetEye(), input.relative / max(distance, 1e-6), distance, transmittance);
-    return float4(displayColor(color * transmittance + inscatter), 1);
-}
 struct Sky { float4 clip : SV_Position; float2 position : TEXCOORD; };
 Sky skyVS(uint id : SV_VertexID) {
     Sky result;
     result.position = float2(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0);
     result.clip = float4(result.position, 0, 1);
-    return result;
-}
-struct SkyOutput { float4 color : SV_Target; float depth : SV_Depth; };
-SkyOutput skyPS(Sky input) {
-    float3 ray = normalize(cameraForward.xyz + cameraRight.xyz * (input.position.x / projection.x)
-                          + cameraUp.xyz * (input.position.y / projection.y));
-    float2 ground;
-    // The sphere only bounds the atmospheric integral. The entire ground is
-    // rendered from voxel LOD meshes, including the coarsest planetary leaves.
-    bool hit = dfRaySphere(planetEye(), ray, float2(atmosphere.x - 1000, 0), ground) && ground.x > 0;
-    float limit = hit ? ground.x : projection.w;
-    float3 transmittance;
-    float3 inscatter = scatter(planetEye(), ray, limit, transmittance);
-    float3 background = float3(0.0008, 0.0012, 0.002);
-    if (hit) background = 0;
-    else {
-        float sunDisk = smoothstep(cos(0.0048), cos(0.0044), dot(ray, sunlight.xyz));
-        background += 20 * sunDisk;
-    }
-    SkyOutput result;
-    result.color = float4(displayColor(background * transmittance + inscatter), 1);
-    result.depth = 0;
     return result;
 }

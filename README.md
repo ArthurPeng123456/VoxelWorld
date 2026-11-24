@@ -40,6 +40,21 @@ GPU 测试包含 94 组数据，检查 df64 运算、毫米高度、地平线求
 
 ## Windows 查看器
 
+### 延迟着色、HDR 与 CSM
+
+原生查看器使用两个 G-buffer：RGBA8 保存线性材质颜色和材质标记，RGBA16F 保存世界法线与粗糙度，另有可读取的 D32 反向深度。全屏光照阶段从深度重建相机相对位置，计算方向光、环境光、镜面高光、级联阴影和大气空气透视。天空和调试线框也在线性 HDR 空间合成，最终统一处理曝光、ACES filmic 近似曲线和 sRGB 输出转换。场景颜色使用 `R16G16B16A16_FLOAT`，可以保留大于 1 的亮度；当前显示输出为色调映射后的 sRGB/SDR。[HDR 渲染参考](https://github.com/microsoft/DirectXTK12/wiki/Using-HDR-rendering) · [色调映射曲线来源](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
+
+CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分视锥。CPU 使用 double 拟合包围球并在星球坐标系内对齐阴影纹素，GPU 继续在相机相对坐标系计算阴影。接收面使用法线偏移，3×3 PCF 过滤阴影边界，级联末尾 10% 混合到下一层。阴影距离随相机高度在 10–200 公里之间调整，末级向无阴影光照渐变，轨道视角超出局部阴影距离时关闭局部 CSM。[CSM 参考](https://learn.microsoft.com/en-us/windows/win32/dxtecharts/cascaded-shadow-maps)
+
+`Shadows [J]` 或 J 切换阴影，`[` / `]` 每次降低／提高 0.5 EV。命令行 `--exposure EV` 接受 -10 到 10，默认 0；`--no-shadows` 关闭 CSM。例：
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --exposure -0.5
+.\build-windows-native\dist\VoxelWorldViewer.exe --no-shadows
+```
+
+`--capture-dir` 在可用时启用 D3D12 调试层，并增加阴影开关、曝光 +1 EV、窗口缩放／恢复的固定场景。`.pipeline.txt` 记录 G-buffer 有效像素数、HDR 浮点最大值、非有限值检查和四个级联的深度像素数。`python scripts/validate-render-captures.py DIRECTORY` 检查画面对照和缓冲报告。硬件与 WARP 验证均观测到四层阴影数据和超过 1 的 HDR 值；GPU 数值测试还对照 CPU 检查曝光与色调映射结果。
+
 双击打包目录里的 `VoxelWorldViewer.exe`。查看器使用 Windows 原生 Direct3D 12，渲染实时生成的 Marching Cubes 网格，并用当前碰撞方案模拟刚体。摄像机实际位置始终参与数据 LOD，默认还有两条移动 Invoker 路径。暂停时仍可移动摄像机并更新驻留范围。轨道相机远离地表时仍保留整个星球的粗层数据，靠近新的地表位置后会逐层细分。
 
 | 操作 | 快捷键 |
@@ -56,6 +71,8 @@ GPU 测试包含 94 组数据，检查 df64 运算、毫米高度、地平线求
 | 开关各 Invoker 的 3D LOD 窗口线框 | `K` |
 | 切换地形和刚体的三角形线框渲染 | `F2` 或 `Wireframe [F2]` |
 | 开关大气散射和地形空气透视（默认开启） | `H` 或 `Atmosphere [H]` |
+| 开关 CSM 阴影（默认开启） | `J` 或 `Shadows [J]` |
+| 降低／提高曝光 0.5 EV | `[` / `]` |
 | 向当前 Invoker 附近投放一组球、胶囊和盒子 | `B` |
 | 暂停或重置模拟 | `Space`、`R` |
 

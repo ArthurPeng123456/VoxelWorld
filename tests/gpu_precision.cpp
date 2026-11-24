@@ -1,6 +1,7 @@
 #include "render_coordinates.hpp"
 #include "shaders.hpp"
 #include "precision_test_shader.hpp"
+#include "post_process.hpp"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -25,7 +26,7 @@ ComPtr<ID3DBlob> compile(const std::string& source, const char* entry, const cha
     return code;
 }
 struct Input { float pHi[4]{}, pLo[4]{}, bHi[4]{}, bLo[4]{}, ray[4]{}, params[4]{}; };
-struct Output { float relative[4], geometry[4], arithmetic0[4], arithmetic1[4], scattering[4], transmittance[4]; };
+struct Output { float relative[4], geometry[4], arithmetic0[4], arithmetic1[4], scattering[4], transmittance[4], tone[4]; };
 void pack(Vec value, float* hi, float* lo) {
     for (int i = 0; i < 3; ++i) { const auto p = splitDouble(value[i]); hi[i] = p.hi; lo[i] = p.lo; }
 }
@@ -40,7 +41,8 @@ int main(int argc, char** argv) {
     try {
         // Compile the production entry points, including precise transforms, with release flags.
         for (const auto& entry : {std::pair{"surfaceVS", "vs_5_0"}, {"surfacePS", "ps_5_0"},
-                                  {"skyVS", "vs_5_0"}, {"skyPS", "ps_5_0"}})
+                                  {"skyVS", "vs_5_0"}, {"deferredPS", "ps_5_0"},
+                                  {"shadowVS", "vs_5_0"}, {"toneMapPS", "ps_5_0"}, {"linePS", "ps_5_0"}})
             compile(shaderSource, entry.first, entry.second);
         const bool hardware = argc > 1 && std::string(argv[1]) == "--hardware";
         ComPtr<ID3D11Device> device;
@@ -100,11 +102,12 @@ int main(int argc, char** argv) {
         require(device->CreateUnorderedAccessView(outputBuffer.Get(), nullptr, &uav), "Create output UAV");
         context->CSSetShader(cs.Get(), nullptr, 0);
         const Vec sun = unit(Vec{0.45, 0.25, 0.86});
-        float camera[40]{};
+        float camera[108]{};
         camera[11] = 1; // Atmosphere enabled, matching the viewer default.
         camera[24] = float(sun.x); camera[25] = float(sun.y); camera[26] = float(sun.z);
         camera[36] = float(planetRadius); camera[37] = float(planetRadius + atmosphereHeight);
         camera[38] = 8000; camera[39] = 1200;
+        camera[106] = 1;
         D3D11_BUFFER_DESC cbDesc{};
         cbDesc.ByteWidth = sizeof(camera); cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
         cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -115,7 +118,7 @@ int main(int argc, char** argv) {
         context->CSSetConstantBuffers(0, 1, cbs);
         ID3D11ShaderResourceView* srvs[]{srv.Get()};
         ID3D11UnorderedAccessView* uavs[]{uav.Get()};
-        context->CSSetShaderResources(0, 1, srvs);
+        context->CSSetShaderResources(5, 1, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->Dispatch(UINT((inputs.size() + 63) / 64), 1, 1);
         context->CopyResource(staging.Get(), outputBuffer.Get());
@@ -129,6 +132,10 @@ int main(int argc, char** argv) {
             const auto& in = inputs[i]; const auto& out = outputs[i];
             const Vec p = unpack(in.pHi, in.pLo), b = unpack(in.bHi, in.bLo);
             const std::string label = "case " + std::to_string(i);
+            const double ev = int(i % 5) - 2;
+            const double hdrValues[4] = {0.18, 1, 4, 20};
+            for (int channel = 0; channel < 4; ++channel)
+                close(out.tone[channel], toneMap(hdrValues[channel], ev), 2e-5, label + " HDR tone mapping");
             for (int a = 0; a < 3; ++a) {
                 const double error = std::abs(out.relative[a] - (p - b)[a]);
                 worstRelative = std::max(worstRelative, error);

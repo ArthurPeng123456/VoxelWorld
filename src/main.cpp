@@ -1,5 +1,7 @@
 #include "world.hpp"
 #include "free_camera.hpp"
+#include "shadow_cascades.hpp"
+#include "post_process.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -426,6 +428,38 @@ std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, 
 }
 
 void selfTest() {
+    {
+        const Vec eye{123.125,-45.5,planetRadius + 200}, right{1,0,0}, up{0,0,1}, forward{0,1,0};
+        const auto csm = buildShadowCascades(eye, right, up, forward, 0.3, 10000000, 1.6, {0.45,0.25,0.86});
+        check(csm.enabled, "near-surface views enable cascaded shadows");
+        double previous = 0.3;
+        for (const auto& cascade : csm.cascades) {
+            check(cascade.farDistance > previous && cascade.texelSize > 0 && cascade.depthBias > 0,
+                  "shadow cascade splits and biases are well ordered");
+            for (int i = 0; i < 8; ++i) {
+                const double d = i & 4 ? cascade.farDistance : previous;
+                const Vec p = forward * d + right * ((i & 1 ? 1 : -1) * d * 1.6 / 1.92)
+                            + up * ((i & 2 ? 1 : -1) * d / 1.92);
+                const Vec projected = cascade.project(p);
+                check(std::abs(projected.x) <= 1.000001 && std::abs(projected.y) <= 1.000001 &&
+                      projected.z >= 0 && projected.z <= 1, "CSM projections contain each camera frustum interval");
+            }
+            previous = cascade.farDistance;
+        }
+        const Vec translation{1e12,-1e12,1e12};
+        const auto translated = buildShadowCascades((eye + translation) - translation, right, up, forward,
+            0.3, 10000000, 1.6, {0.45,0.25,0.86});
+        for (int i = 0; i < shadowCascadeCount; ++i)
+            check(length(csm.cascades[i].project({100,200,30}) - translated.cascades[i].project({100,200,30})) < 1e-10,
+                  "CSM fitting is invariant under common trillion-meter translations");
+        check(!buildShadowCascades(eye, right, up, forward, 300000, 10000000, 1.6, {0.45,0.25,0.86}).enabled,
+              "orbital views outside the shadow range disable local cascades");
+        check(toneMap(0, 0) == 0 && toneMap(4, 0) > toneMap(1, 0) && toneMap(1, 1) > toneMap(1, 0) &&
+              toneMap(1000, 0) <= 1, "HDR exposure and highlight compression are monotonic and bounded");
+        bool rejected = false;
+        try { parseExposure(std::string("nan")); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected && parseExposure(std::wstring(L"-1.5")) == -1.5, "exposure arguments validate finite EV values");
+    }
     {
         FreeCamera camera;
         const Vec eye{planetRadius + 0.125, -planetRadius, 200};

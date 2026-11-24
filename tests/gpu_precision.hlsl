@@ -1,6 +1,6 @@
 struct TestInput { float4 pHi, pLo, bHi, bLo, ray, params; };
-struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance; };
-StructuredBuffer<TestInput> cases : register(t0);
+struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance, tone; };
+StructuredBuffer<TestInput> cases : register(t5);
 RWStructuredBuffer<TestOutput> results : register(u0);
 [numthreads(64, 1, 1)]
 void precisionCS(uint id : SV_DispatchThreadID) {
@@ -22,5 +22,7 @@ void precisionCS(uint id : SV_DispatchThreadID) {
     float limit = hit && roots.x > 0 ? roots.x : 5e7;
     result.scattering = float4(scatter(p, input.ray.xyz, limit, transmittance), 0);
     result.transmittance = float4(transmittance, 0);
+    float exposure = exp2(int(id % 5) - 2);
+    result.tone = float4(acesToneMap(float3(0.18, 1, 4), exposure), acesToneMap(float3(20, 20, 20), exposure).x);
     results[id] = result;
 }
