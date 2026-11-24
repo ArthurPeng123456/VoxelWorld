@@ -139,6 +139,12 @@ endif()
 
 enable_testing()
 add_test(NAME voxel_world_correctness COMMAND voxel_world --self-test)
+if(CMAKE_CONFIGURATION_TYPES)
+    add_test(NAME voxel_world_global_terrain COMMAND voxel_world --self-test-global
+        CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
+elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    add_test(NAME voxel_world_global_terrain COMMAND voxel_world --self-test-global)
+endif()
 if(WIN32)
     add_test(NAME voxel_gpu_precision COMMAND voxel_gpu_precision)
 endif()

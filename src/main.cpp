@@ -30,14 +30,15 @@ struct Options {
     int bodies{48};
     int streamEvery{6};
     double voxelDensity{1};
-    bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{};
+    bool morton{}, global{}, obj{}, selfTest{}, selfTestGlobal{}, help{}, capsuleStress{};
     fs::path output{"results"};
 };
 
 void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
-              << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
+              << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress]\n"
+              << "  [--self-test] [--self-test-global] (full-planet integration tests)\n"
               << "  [--voxel-density 0.125|0.25|0.5|1|2] (sampling-spacing multiplier; default 1 = 50m)\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
@@ -89,6 +90,7 @@ Options options(int argc, char** argv) {
         else if (arg == "--voxel-density" || arg == "--density") opts.voxelDensity = parseVoxelDensity(next());
         else if (arg == "--obj") opts.obj = true;
         else if (arg == "--self-test") opts.selfTest = true;
+        else if (arg == "--self-test-global") opts.selfTestGlobal = true;
         else if (arg == "--capsule-stress") opts.capsuleStress = true;
         else if (arg == "--help" || arg == "-h") opts.help = true;
         else throw std::invalid_argument("Unknown argument: " + arg);
@@ -427,6 +429,125 @@ std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, 
     return chunk;
 }
 
+WorldStats waitForPublication(World& world) {
+    // Correctness tests wait for completion. CTest supplies the process timeout.
+    for (;;) {
+        if (auto published = world.pollUpdate()) return *published;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void verifyDensitySwitch(World& world, const std::vector<Vec>& invokers, bool global, Vec point) {
+    const Vec up = unit(point);
+    const Key oldKey = keyAt(point), newKey = keyAt(point, voxelDensityShift(0.125));
+    const auto body = world.physics.addBody(sampleShape(1, up), point + up * 100, up * -10);
+    const Vec before = world.physics.bodyPosition(body);
+    world.setVoxelDensity(0.125);
+    check(world.requestUpdate(invokers, global, point), "runtime density switch starts a background build");
+    check(world.voxelDensity() == 1 && world.chunks.count(oldKey) != 0 && world.chunks.count(newKey) == 0,
+          "runtime density switch preserves the published field until activation");
+    const auto published = waitForPublication(world);
+    const auto fine = world.chunks.find(newKey);
+    check(published.build.built > 0 && published.build.removed > 0 && world.voxelDensity() == 0.125 &&
+          world.chunks.count(oldKey) == 0 && fine != world.chunks.end() &&
+          fine->second->spacing == 6.25 && fine->second->field && !fine->second->mesh.empty(),
+          "runtime density switch publishes the new field and meshes");
+    check(world.physics.ray(point + up * 500, point - up * 500).state == Hit::State::Contact,
+          "density replacement publishes queryable terrain");
+    check(length(world.physics.bodyPosition(body) - before) == 0, "density replacement retains body transforms");
+    world.physics.step(1.0 / 60, true);
+    check(world.physics.bodySpeed(body) > 9, "density replacement retains body velocity");
+}
+
+void selfTestGlobalTerrain() {
+    const Planet planet(42);
+    const auto first = invokerPositions(planet, 1, 0);
+    for (double density : voxelDensities) {
+        const int shift = voxelDensityShift(density);
+        const Key key = keyAt(first[0], shift);
+        const Box box = bounds(key);
+        check(box.contains(first[0]) && box.hi.x - box.lo.x == chunkSize * density,
+              "density scales chunk coordinates without scaling the planet");
+        World scaled(planet, Method::Grid, false, density);
+        scaled.update(first, true);
+        check(scaled.voxelDensity() == density && scaled.chunks.at(key)->lod == 0 &&
+              scaled.chunks.at(key)->spacing == 50 * density, "all five density levels produce the requested voxel spacing");
+        double volume = 0;
+        for (const auto& item : scaled.chunks) {
+            check(item.first.densityShift == shift, "published field uses one coherent density");
+            volume += std::ldexp(density * density * density, 3 * item.first.level);
+        }
+        check(volume == std::ldexp(8.0, 3 * rootLevel), "density settings preserve full planetary coverage");
+        const Vec up = unit(first[0]);
+        const auto ray = scaled.physics.ray(first[0] + up * 500, first[0] - up * 500);
+        check(ray.state == Hit::State::Contact && std::abs(ray.fraction - 0.5) < 0.02,
+              "density-aware field rays hit the local surface");
+        const Vec opposite = first[0] * -1, away = unit(opposite);
+        check(scaled.physics.ray(opposite + away * 100000, opposite - away * 100000).state == Hit::State::Contact,
+              "density settings preserve distant hemisphere queries");
+        if (density == 1) verifyDensitySwitch(scaled, first, true, first[0]);
+    }
+
+    // Global LOD must retain real field values and meshes away from every invoker.
+    for (Method method : {Method::Grid, Method::Dag, Method::Vdb, Method::Mesh}) {
+        World globe(planet, method, false);
+        globe.update(first, true);
+        for (int i = 0; i < 32; ++i) {
+            const double z = -0.97 + 1.94 * i / 31;
+            const double angle = i * 2.399963229728653;
+            const Vec up{std::sqrt(1 - z * z) * std::cos(angle), std::sqrt(1 - z * z) * std::sin(angle), z};
+            const Vec center = planet.surface(up);
+            const auto ray = globe.physics.ray(center + up * 100000, center - up * 100000);
+            check(ray.state == Hit::State::Contact && ray.fraction > 0.4 && ray.fraction < 0.6,
+                  "global voxel/mesh ray hits distant terrain across all hemispheres");
+        }
+        if (method != Method::Mesh)
+            check(globe.physics.ray({}, {planetRadius + 100000,0,0}).initial, "constant interior leaves preserve solid queries");
+        if (method == Method::Grid) {
+            int interfaces = 0;
+            Layout layout;
+            for (const auto& c : globe.chunks) layout.emplace(c.first, c.second->lod);
+            for (const auto& item : globe.chunks) {
+                const Chunk& fine = *item.second;
+                if (fine.mesh.empty()) continue;
+                for (Key key : intersectingLeaves(layout, fine.box.expanded(splat(1e-4)))) {
+                    const Chunk& coarse = *globe.chunks.at(key);
+                    if (coarse.lod <= fine.lod || coarse.mesh.empty()) continue;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        if (std::abs(fine.box.hi[axis] - coarse.box.lo[axis]) > 1e-5 &&
+                            std::abs(fine.box.lo[axis] - coarse.box.hi[axis]) > 1e-5) continue;
+                        const Vec lo = max(fine.box.lo, coarse.box.lo), hi = min(fine.box.hi, coarse.box.hi);
+                        const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+                        if (hi[u] - lo[u] < 1e-4 || hi[v] - lo[v] < 1e-4) continue;
+                        for (double a : {0.25,0.75}) for (double b : {0.25,0.75}) {
+                            Vec p = lo; p[u] += (hi[u] - lo[u]) * a; p[v] += (hi[v] - lo[v]) * b;
+                            const double x = fine.cellAt(p).value(p), y = coarse.cellAt(p).value(p);
+                            check(std::abs(x - y) < coarse.spacing * 2e-6 + 0.001,
+                                  "different-sized LOD leaves share a continuous boundary field");
+                        }
+                        ++interfaces;
+                    }
+                }
+            }
+            check(interfaces > 50, "global test exercises many multiscale boundaries");
+            const Vec opposite = first[0] * -1;
+            check(globe.requestUpdate({}, true, opposite), "global camera teleport starts a background build");
+            const Vec oldUp = unit(first[0]);
+            check(globe.physics.ray(first[0] + oldUp * 100000, first[0] - oldUp * 100000).state == Hit::State::Contact,
+                  "old global coverage remains queryable while new LOD leaves are built");
+            waitForPublication(globe);
+            check(globe.chunks.at(keyAt(opposite))->lod == 0, "camera refines the opposite hemisphere");
+            const auto prior = leafAt(layout, first[0]);
+            check(prior.has_value(), "previous invoker was covered");
+            const Vec up = unit(first[0]);
+            check(globe.physics.ray(first[0] + up * 100000, first[0] - up * 100000).state == Hit::State::Contact,
+                  "moving away coarsens terrain without removing global coverage");
+        }
+    }
+
+    std::cout << "Global terrain self-tests passed.\n";
+}
+
 void selfTest() {
     {
         const Vec eye{123.125,-45.5,planetRadius + 200}, right{1,0,0}, up{0,0,1}, forward{0,1,0};
@@ -496,47 +617,6 @@ void selfTest() {
         check(rejected, "unsupported voxel density is rejected");
     }
     check(parseVoxelDensity(std::wstring(L"0.125")) == 0.125, "viewer accepts wide-character density arguments");
-    for (double density : voxelDensities) {
-        const int shift = voxelDensityShift(density);
-        const Key key = keyAt(first[0], shift);
-        const Box box = bounds(key);
-        check(box.contains(first[0]) && box.hi.x - box.lo.x == chunkSize * density,
-              "density scales chunk coordinates without scaling the planet");
-        World scaled(planet, Method::Grid, false, density);
-        scaled.update(first, true);
-        check(scaled.voxelDensity() == density && scaled.chunks.at(key)->lod == 0 &&
-              scaled.chunks.at(key)->spacing == 50 * density, "all five density levels produce the requested voxel spacing");
-        double volume = 0;
-        for (const auto& item : scaled.chunks) {
-            check(item.first.densityShift == shift, "published field uses one coherent density");
-            volume += std::ldexp(density * density * density, 3 * item.first.level);
-        }
-        check(volume == std::ldexp(8.0, 3 * rootLevel), "density settings preserve full planetary coverage");
-        const Vec up = unit(first[0]);
-        const auto ray = scaled.physics.ray(first[0] + up * 500, first[0] - up * 500);
-        check(ray.state == Hit::State::Contact && std::abs(ray.fraction - 0.5) < 0.02,
-              "density-aware field rays hit the local surface");
-        const Vec opposite = first[0] * -1, away = unit(opposite);
-        check(scaled.physics.ray(opposite + away * 100000, opposite - away * 100000).state == Hit::State::Contact,
-              "density settings preserve distant hemisphere queries");
-        if (density == 1) {
-            const auto body = scaled.physics.addBody(sampleShape(1, up), first[0] + up * 100, up * -10);
-            const Vec before = scaled.physics.bodyPosition(body);
-            scaled.setVoxelDensity(0.125);
-            check(scaled.voxelDensity() == 1 && scaled.requestUpdate(first, true, first[0]),
-                  "runtime density switch stages a replacement while preserving published density");
-            const auto deadline = Clock::now() + std::chrono::seconds(20);
-            std::optional<WorldStats> published;
-            while (!(published = scaled.pollUpdate()) && Clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            check(published.has_value() && scaled.voxelDensity() == 0.125 &&
-                  scaled.chunks.at(keyAt(first[0], -3))->spacing == 6.25,
-                  "runtime density switch publishes the new field and meshes");
-            check(length(scaled.physics.bodyPosition(body) - before) == 0, "density replacement retains body transforms");
-            scaled.physics.step(1.0 / 60, true);
-            check(scaled.physics.bodySpeed(body) > 9, "density replacement retains body velocity");
-        }
-    }
     Clipmap clipmap;
     std::size_t visits = 0;
     clipmap.update(first, false, visits);
@@ -624,67 +704,6 @@ void selfTest() {
     }
     check(seamTested, "the test layout contains mixed LOD neighbors");
 
-    // Global LOD must retain real field values and meshes away from every invoker.
-    for (Method method : {Method::Grid, Method::Dag, Method::Vdb, Method::Mesh}) {
-        World globe(planet, method, false);
-        globe.update(first, true);
-        for (int i = 0; i < 32; ++i) {
-            const double z = -0.97 + 1.94 * i / 31;
-            const double angle = i * 2.399963229728653;
-            const Vec up{std::sqrt(1 - z * z) * std::cos(angle), std::sqrt(1 - z * z) * std::sin(angle), z};
-            const Vec center = planet.surface(up);
-            const auto ray = globe.physics.ray(center + up * 100000, center - up * 100000);
-            check(ray.state == Hit::State::Contact && ray.fraction > 0.4 && ray.fraction < 0.6,
-                  "global voxel/mesh ray hits distant terrain across all hemispheres");
-        }
-        if (method != Method::Mesh)
-            check(globe.physics.ray({}, {planetRadius + 100000,0,0}).initial, "constant interior leaves preserve solid queries");
-        if (method == Method::Grid) {
-            int interfaces = 0;
-            Layout layout;
-            for (const auto& c : globe.chunks) layout.emplace(c.first, c.second->lod);
-            for (const auto& item : globe.chunks) {
-                const Chunk& fine = *item.second;
-                if (fine.mesh.empty()) continue;
-                for (Key key : intersectingLeaves(layout, fine.box.expanded(splat(1e-4)))) {
-                    const Chunk& coarse = *globe.chunks.at(key);
-                    if (coarse.lod <= fine.lod || coarse.mesh.empty()) continue;
-                    for (int axis = 0; axis < 3; ++axis) {
-                        if (std::abs(fine.box.hi[axis] - coarse.box.lo[axis]) > 1e-5 &&
-                            std::abs(fine.box.lo[axis] - coarse.box.hi[axis]) > 1e-5) continue;
-                        const Vec lo = max(fine.box.lo, coarse.box.lo), hi = min(fine.box.hi, coarse.box.hi);
-                        const int u = (axis + 1) % 3, v = (axis + 2) % 3;
-                        if (hi[u] - lo[u] < 1e-4 || hi[v] - lo[v] < 1e-4) continue;
-                        for (double a : {0.25,0.75}) for (double b : {0.25,0.75}) {
-                            Vec p = lo; p[u] += (hi[u] - lo[u]) * a; p[v] += (hi[v] - lo[v]) * b;
-                            const double x = fine.cellAt(p).value(p), y = coarse.cellAt(p).value(p);
-                            check(std::abs(x - y) < coarse.spacing * 2e-6 + 0.001,
-                                  "different-sized LOD leaves share a continuous boundary field");
-                        }
-                        ++interfaces;
-                    }
-                }
-            }
-            check(interfaces > 50, "global test exercises many multiscale boundaries");
-            const Vec opposite = first[0] * -1;
-            check(globe.requestUpdate({}, true, opposite), "global camera teleport starts a background build");
-            const Vec oldUp = unit(first[0]);
-            check(globe.physics.ray(first[0] + oldUp * 100000, first[0] - oldUp * 100000).state == Hit::State::Contact,
-                  "old global coverage remains queryable while new LOD leaves are built");
-            const auto deadline = Clock::now() + std::chrono::seconds(20);
-            std::optional<WorldStats> published;
-            while (!(published = globe.pollUpdate()) && Clock::now() < deadline)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            check(published.has_value(), "global multiscale replacement publishes atomically");
-            check(globe.chunks.at(keyAt(opposite))->lod == 0, "camera refines the opposite hemisphere");
-            const auto prior = leafAt(layout, first[0]);
-            check(prior.has_value(), "previous invoker was covered");
-            const Vec up = unit(first[0]);
-            check(globe.physics.ray(first[0] + up * 100000, first[0] - up * 100000).state == Hit::State::Contact,
-                  "moving away coarsens terrain without removing global coverage");
-        }
-    }
-
     const Vec oldPoint = first[0];
     const Vec newPoint = planet.surface(unit(oldPoint) * -1);
     for (Method method : {Method::Grid, Method::Dag, Method::Vdb}) {
@@ -704,11 +723,7 @@ void selfTest() {
             check(!world.requestUpdate({}, false, oldPoint) && world.chunks.count(keyAt(oldPoint)) != 0 &&
                   world.chunks.count(keyAt(newPoint)) == 0 && world.clipmapWindows()[0].box.contains(oldPoint),
                   "queries and debug windows retain the published world while replacements are built");
-            const auto deadline = Clock::now() + std::chrono::seconds(20);
-            std::optional<WorldStats> result;
-            while (!(result = world.pollUpdate()) && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            check(result.has_value(), "background Clipmap batch publishes");
-            after = *result;
+            after = waitForPublication(world);
         } else after = world.update({}, false, newPoint);
         check(after.build.removed > 0 && after.build.built > 0 && world.chunks.count(keyAt(oldPoint)) == 0,
               "camera teleport publishes new chunks and removes expired chunks");
@@ -716,6 +731,7 @@ void selfTest() {
         check(b.first.state == Hit::State::Contact && b.second.state == Hit::State::Contact &&
               expired.first.state == Hit::State::Miss && expired.second.state == Hit::State::Miss,
               "casts use only the published camera coverage after a teleport");
+        if (method == Method::Grid) verifyDensitySwitch(world, {}, false, newPoint);
     }
 
     for (const auto& option : {std::make_pair(Method::Mesh, false), std::make_pair(Method::Grid, false),
@@ -842,7 +858,11 @@ int main(int argc, char** argv) {
     try {
         const auto opts = options(argc, argv);
         if (opts.help) { help(); return 0; }
-        if (opts.selfTest) { selfTest(); return 0; }
+        if (opts.selfTest || opts.selfTestGlobal) {
+            if (opts.selfTest) selfTest();
+            if (opts.selfTestGlobal) selfTestGlobalTerrain();
+            return 0;
+        }
         fs::create_directories(opts.output);
         auto settings = createFile(opts.output / "settings.txt");
         settings << "voxel_density=" << opts.voxelDensity << '\n'

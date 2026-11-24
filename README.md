@@ -121,6 +121,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 
 
 在 Visual Studio 中打开 `build-windows-native` 下的 `VoxelWorld.sln` 或 `VoxelWorld.slnx`，选择 **Debug | x64**，确认启动项目为 **VoxelWorldViewer**，按 **F5**。调试命令行基准时，把 **voxel_world** 设为启动项目，可在项目的调试属性中填入 `--self-test`。打包后的 Debug 可执行文件和 PDB 位于 `build-windows-native\dist-debug`，Release 仍输出到 `build-windows-native\dist`。
 
+`--self-test` 用局部地形验证异步密度切换、RayCast 和刚体状态。Release 的 CTest 还会运行 `--self-test-global`，验证五档密度的全星球覆盖、远端碰撞、LOD 接缝和全局切换。如需在 Debug 中复查这些耗时场景，可以直接向 `voxel_world.exe` 传入 `--self-test-global`。
+
 ### 浏览器预览
 
 双击生成的 `VoxelWorld.html` 可离线查看同一份覆盖全星球的多层 Marching Cubes 网格。支持全星球、地表、Invoker 位置切换、LOD 着色和窗口线框。线框使用 OBJ 导出的窗口坐标，包括当时的摄像机 Invoker。此预览展示导出时的地形快照，实时碰撞、动态块更新和 df64 大气由原生查看器执行。预览保留 double 坐标，通过高低位顶点和相机相对消减显示，避免旧的 Int16 格式在地球尺度下溢出。
