@@ -26,7 +26,8 @@ struct Options {
     int queries{12};
     int bodies{48};
     int streamEvery{6};
-    bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{};
+    bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{}, rayCompare{};
+    int raysPerInvoker{20};
     fs::path output{"results"};
 };
 
@@ -34,6 +35,7 @@ void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
+              << "  [--ray-compare] [--rays-per-invoker N]\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -84,9 +86,16 @@ Options options(int argc, char** argv) {
         else if (arg == "--obj") opts.obj = true;
         else if (arg == "--self-test") opts.selfTest = true;
         else if (arg == "--capsule-stress") opts.capsuleStress = true;
+        else if (arg == "--ray-compare") opts.rayCompare = true;
+        else if (arg == "--rays-per-invoker") opts.raysPerInvoker = bounded(1, 10000);
         else if (arg == "--help" || arg == "-h") opts.help = true;
         else throw std::invalid_argument("Unknown argument: " + arg);
     }
+    //opts.rayCompare = true;
+    //opts.invokers = 100;
+    //opts.frames = 1;
+    //opts.raysPerInvoker = 20;
+    //opts.seed = 42;
     if (std::int64_t(opts.frames) * opts.queries > 1'000'000) throw std::invalid_argument("frames * queries must be at most 1000000");
     return opts;
 }
@@ -628,46 +637,134 @@ void selfTest() {
 }  // namespace
 }  // namespace voxel
 
+namespace voxel {
+
+// Side-by-side ray benchmark (--ray-compare): the same ray is issued on the mesh
+// backend and the grid backend back-to-back, in the same frame. No clock timing;
+// VTune attributes the cost. Bodies are not spawned because only ray detection
+// is compared and rigid bodies never block a terrain ray.
+void rayCompare(const Options& opts) {
+    Planet planet(opts.seed);
+    World meshWorld(planet, Method::Mesh, false);
+    World gridWorld(planet, Method::Grid, false);
+
+    // Frame-0 coverage for both backends. Later frames move the invokers along
+    // Planet::invokerDirection (the viewer's trajectory) and re-stream the
+    // terrain every --stream-every frames so the casts stay inside coverage.
+    auto invokers = invokerPositions(planet, opts.invokers, 0.0);
+    const WorldStats initialMesh = meshWorld.update(invokers, opts.global, std::nullopt);
+    const WorldStats initialGrid = gridWorld.update(invokers, opts.global, std::nullopt);
+
+    std::mt19937_64 rng(opts.seed ^ 0x9e3779b97f4a7c15ULL);
+    auto random = [&] { return (rng() >> 11) * 0x1p-53; };
+
+    // One external query around an invoker: a random surface target within
+    // ~1100 m of it, crossed from 130 m above to 85 m below the surface.
+    auto shot = [&](Vec anchor) {
+        const Vec up = unit(anchor);
+        const auto axes = frameAt(up);
+        const Vec dir = unit(up * planetRadius + axes[0] * (1100 * (random() - 0.5))
+                                                + axes[1] * (1100 * (random() - 0.5)));
+        const Vec surface = planet.surface(dir);
+        return std::make_pair(surface + dir * 130.0, surface - dir * 85.0);
+    };
+
+    // Warmup primes caches; no measurement here (VTune samples regardless).
+    for (int w = 0; w < opts.warmup; ++w) {
+        for (std::size_t i = 0; i < invokers.size(); ++i) {
+            const auto [from, to] = shot(invokers[i]);
+            meshWorld.physics.ray(from, to);
+            gridWorld.physics.ray(from, to);
+        }
+    }
+
+    double travel = 0, updateTotal = 0;
+    int updates = 0, rays = 0, meshContacts = 0, gridContacts = 0, mismatches = 0;
+    std::vector<double> updateTimes;
+    auto previous = invokers;
+    for (int frame = 0; frame < opts.frames; ++frame) {
+        const auto moving = invokerPositions(planet, opts.invokers, frame);
+        // Terrain streaming for both backends, outside the ray loop so the
+        // build cost never hides inside a single cast.
+        if (frame > 0 && frame % opts.streamEvery == 0) {
+            const auto timer = Clock::now();
+            meshWorld.update(moving, opts.global, std::nullopt);
+            gridWorld.update(moving, opts.global, std::nullopt);
+            const double elapsed = milliseconds(timer);
+            updateTimes.push_back(elapsed);
+            updateTotal += elapsed;
+            ++updates;
+        }
+        for (std::size_t i = 0; i < moving.size(); ++i) {
+            for (int r = 0; r < opts.raysPerInvoker; ++r) {
+                const auto [from, to] = shot(moving[i]);
+                const Hit meshHit = meshWorld.physics.ray(from, to);
+                const Hit gridHit = gridWorld.physics.ray(from, to);
+                ++rays;
+                meshContacts += meshHit.state == Hit::State::Contact;
+                gridContacts += gridHit.state == Hit::State::Contact;
+                mismatches += meshHit.state != gridHit.state;
+            }
+        }
+    }
+    std::sort(updateTimes.begin(), updateTimes.end());
+    const int perFrame = opts.frames * opts.invokers;
+    std::cout << "ray-compare done: " << opts.frames << " frames, " << opts.invokers
+              << " moving invokers x " << opts.raysPerInvoker << " rays per frame = " << rays
+              << " mesh/grid ray pairs\n";
+    std::cout << "  invoker travel " << travel << " m total, " << travel / std::max(1, perFrame)
+              << " m per frame per invoker\n";
+    std::cout << "  terrain streamed " << updates << " times (every " << opts.streamEvery
+              << " frames), initial " << initialMesh.updateMs << '/' << initialGrid.updateMs
+              << " ms, later total " << updateTotal << " ms, p95 " << percentile(updateTimes, 0.95) << " ms\n";
+    std::cout << "  contacts mesh " << meshContacts << ", grid " << gridContacts << ", state mismatches "
+              << mismatches << '\n';
+}
+
+}  // namespace voxel
+
 int main(int argc, char** argv) {
     using namespace voxel;
     try {
         const auto opts = options(argc, argv);
-        if (opts.help) { help(); return 0; }
-        if (opts.selfTest) { selfTest(); return 0; }
-        fs::create_directories(opts.output);
-        auto frames = createFile(opts.output / "frames.csv");
-        auto summary = createFile(opts.output / "summary.csv");
-        auto streaming = createFile(opts.output / "streaming.csv");
-        std::ofstream capsuleReport;
-        if (opts.capsuleStress) {
-            capsuleReport = createFile(opts.output / "capsule-cases.csv");
-            capsuleReport << "scheme,scenario,queries,hits,initial,unresolved,p50_us,p95_us,p99_us,"
-                             "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m\n";
-        }
-        frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,"
-                  "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts,"
-                  "scheduled,window_visits,changed_owners,metadata_bytes,resident_terrain_bytes,staged_terrain_bytes\n";
-        streaming << "scheme,seed,actor_invokers,camera_invokers,global,initial_ms,scheduled_updates,changed_updates,"
-                     "changed_p50_ms,changed_p95_ms,changed_max_ms,changed_select_p95_ms,unchanged_p95_ms,"
-                     "built,removed,window_visits,changed_owners,peak_resident_bytes,estimated_peak_overlap_bytes,"
-                     "peak_staged_bytes,peak_field_bytes,peak_mesh_bytes,peak_collision_bytes\n";
-        summary << "scheme,query,layout,seed,frames,invokers,bodies,global,warmup,stream_every,queries,hits,initial,unresolved,"
-                   "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m,p50_us,p95_us,p99_us,queries_per_second,initial_ms,update_p95_ms,step_p50_ms,"
-                   "step_p95_ms,step_p99_ms,peak_collision_bytes,stream_built,stream_removed,max_terrain_contacts,body_centers_below_analytic,"
-                   "vs_first_field_different\n";
-        std::optional<QueryResults> reference, fieldReference;
-        std::cout << std::fixed << std::setprecision(3);
-        for (Method method : opts.methods) {
-            auto result = run(opts, method, frames, summary, streaming, reference ? &*reference : nullptr,
-                              fieldReference ? &*fieldReference : nullptr,
-                              opts.capsuleStress ? &capsuleReport : nullptr);
-            if (method == Method::Mesh) reference = std::move(result);
-            else if (!fieldReference) fieldReference = std::move(result);
-        }
-        frames.close();
-        summary.close();
-        streaming.close();
-        return 0;
+        rayCompare(opts); return 0;
+        //if (opts.help) { help(); return 0; }
+        //if (opts.selfTest) { selfTest(); return 0; }
+        //if (opts.rayCompare) { rayCompare(opts); return 0; }
+        //fs::create_directories(opts.output);
+        //auto frames = createFile(opts.output / "frames.csv");
+        //auto summary = createFile(opts.output / "summary.csv");
+        //auto streaming = createFile(opts.output / "streaming.csv");
+        //std::ofstream capsuleReport;
+        //if (opts.capsuleStress) {
+        //    capsuleReport = createFile(opts.output / "capsule-cases.csv");
+        //    capsuleReport << "scheme,scenario,queries,hits,initial,unresolved,p50_us,p95_us,p99_us,"
+        //                     "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m\n";
+        //}
+        //frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,"
+        //          "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts,"
+        //          "scheduled,window_visits,changed_owners,metadata_bytes,resident_terrain_bytes,staged_terrain_bytes\n";
+        //streaming << "scheme,seed,actor_invokers,camera_invokers,global,initial_ms,scheduled_updates,changed_updates,"
+        //             "changed_p50_ms,changed_p95_ms,changed_max_ms,changed_select_p95_ms,unchanged_p95_ms,"
+        //             "built,removed,window_visits,changed_owners,peak_resident_bytes,estimated_peak_overlap_bytes,"
+        //             "peak_staged_bytes,peak_field_bytes,peak_mesh_bytes,peak_collision_bytes\n";
+        //summary << "scheme,query,layout,seed,frames,invokers,bodies,global,warmup,stream_every,queries,hits,initial,unresolved,"
+        //           "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m,p50_us,p95_us,p99_us,queries_per_second,initial_ms,update_p95_ms,step_p50_ms,"
+        //           "step_p95_ms,step_p99_ms,peak_collision_bytes,stream_built,stream_removed,max_terrain_contacts,body_centers_below_analytic,"
+        //           "vs_first_field_different\n";
+        //std::optional<QueryResults> reference, fieldReference;
+        //std::cout << std::fixed << std::setprecision(3);
+        //for (Method method : opts.methods) {
+        //    auto result = run(opts, method, frames, summary, streaming, reference ? &*reference : nullptr,
+        //                      fieldReference ? &*fieldReference : nullptr,
+        //                      opts.capsuleStress ? &capsuleReport : nullptr);
+        //    if (method == Method::Mesh) reference = std::move(result);
+        //    else if (!fieldReference) fieldReference = std::move(result);
+        //}
+        //frames.close();
+        //summary.close();
+        //streaming.close();
+        //return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
