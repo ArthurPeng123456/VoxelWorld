@@ -70,7 +70,10 @@ CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分�
 | 自由摄像机下降／上升 | `Q` / `E` |
 | 自由摄像机转向、加速、调速 | 左键或右键拖动、按住 `Shift`（5 倍）、滚轮 |
 | 绕视角中心旋转和缩放 | 左键拖动、滚轮 |
-| 跟随下一个移动 Invoker | `Tab` |
+| 设置移动 Invoker 数量（1–16） | 工具栏 `Invokers` |
+| 跟随并接管指定 Invoker | 工具栏 `Camera` 选择 `Invoker N`，或按 `Tab` 切到下一个 |
+| 接管时沿地表移动、加速 | `W` / `A` / `S` / `D`，`Shift`（3 倍） |
+| 脱离当前 Invoker | `Esc` 或 `Camera` 选择 `Detached`，也可用 `C` 接入自由相机 |
 | 开关 LOD 着色 | `L` |
 | 开关各 Invoker 的 3D LOD 窗口线框 | `K` |
 | 设置 LOD0 半径并预览各级距离 | 工具栏 `LOD ranges...` |
@@ -82,6 +85,8 @@ CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分�
 | 暂停或重置模拟 | `Space`、`R` |
 
 自由摄像机以 double 保存位置，W/S 沿视线前后移动，A/D 左右平移，Q/E 沿相机上方向升降。初始速度随进入时的高度调整，状态栏显示基础速度；滚轮向上加速、向下减速，Shift 临时加速 5 倍。松开移动键或切换到其他应用时停止移动，暂停模拟仍可飞行并更新地形 LOD。该模式不做地形碰撞约束。再次按 C 返回先前的轨道／地表模式，F 切换至锚定视角，Reset 退出自由模式。工具栏会随窗口宽度自动换行。
+
+`Invokers` 的数量仅指移动 Invoker，摄像机另外参与数据 LOD。调整数量保留现有刚体和剩余 Invoker 的位置。接管时使用第三人称相机，WASD 按镜头方向沿程序化地表移动，默认速度为 240 米/秒。拖动旋转镜头，滚轮调整跟随距离。换目标或脱离后，原 Invoker 从当前位置平滑回到当前巡航轨迹。暂停时仍可手动移动，巡航和回归在恢复模拟后继续。Invoker 标记使用分面法线、高光和边缘补光，当前相机目标为青色，其他标记为橙色。
 
 切换后端会从同一种子重建场景和刚体。状态栏显示 LOD 块数、三角形数量、刚体数量和 LOD 更新耗时，并每 0.25 秒刷新内存统计（MiB）：`RAM` 为当前进程工作集，`Private commit` 为进程私有提交量，`Peak RAM` 为进程启动以来的峰值工作集。另列出当前驻留地形的估算总量及体素字段、CPU 网格、碰撞、调度元数据分项；该估算属于进程内存的一部分，不包含后台构建、动态刚体、渲染资源和分配器额外开销，不应与进程统计相加。命令行可用 `--seed`、`--invokers`、`--scheme` 和 `--morton`。设备创建失败时会尝试 Direct3D 12 的 WARP 软件渲染，也可用 `--warp` 强制启用。受组织应用控制管理的电脑可能需要管理员批准本地生成的可执行文件。
 
@@ -143,7 +148,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 
 
 在 Visual Studio 中打开 `build-windows-native` 下的 `VoxelWorld.sln` 或 `VoxelWorld.slnx`，选择 **Debug | x64**，确认启动项目为 **VoxelWorldViewer**，按 **F5**。调试命令行基准时，把 **voxel_world** 设为启动项目，可在项目的调试属性中填入 `--self-test`。打包后的 Debug 可执行文件和 PDB 位于 `build-windows-native\dist-debug`，Release 仍输出到 `build-windows-native\dist`。
 
-`--self-test` 用局部地形验证异步密度切换、RayCast、ShapeCast 和刚体状态。Release 的 CTest 还会运行 `--self-test-global`，验证五档密度的全星球覆盖、远端碰撞、各级范围翻倍、单窗口单轴滚动与全量重建的布局一致性、LOD 接缝和全局切换。如需在 Debug 中复查这些耗时场景，可以直接向 `voxel_world.exe` 传入 `--self-test-global`。
+`--self-test` 用局部地形验证异步密度切换、RayCast、ShapeCast 和刚体状态。Release 的 CTest 还会运行 `--self-test-global`，验证五档密度的全星球覆盖、远端碰撞、各级范围翻倍、单窗口单轴滚动与全量重建的布局一致性、LOD 接缝和全局切换。如需在 Debug 中复查这些耗时场景，可以直接向 `voxel_world.exe` 传入 `--self-test-global`。Viewer 的 `--capture-dir` 还会验证 Invoker 数量变更、相机接管、移动与脱离后回归，并保存 `invoker-control.bmp`。
 
 ### 浏览器预览
 

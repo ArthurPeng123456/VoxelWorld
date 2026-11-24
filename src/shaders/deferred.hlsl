@@ -11,14 +11,14 @@ GBuffer surfacePS(Surface input) {
     GBuffer result;
     result.albedo = input.material;
     int code = int(round(input.material.a * 255));
-    if (code < 254 && sunlight.w > 0.5) {
+    if (code < 253 && sunlight.w > 0.5) {
         if (code == 0) result.albedo.rgb = float3(0.19, 0.72, 0.83);
         if (code == 1) result.albedo.rgb = float3(0.28, 0.63, 0.38);
         if (code == 2) result.albedo.rgb = float3(0.81, 0.63, 0.29);
         if (code == 3) result.albedo.rgb = float3(0.53, 0.43, 0.64);
         if (code >= 4) result.albedo.rgb = lerp(float3(0.95, 0.35, 0.22), float3(0.12, 0.22, 0.46), saturate((code - 4) / 8.0));
     }
-    result.normal = float4(normalize(input.normal), code == 254 ? 0.5 : 0.85);
+    result.normal = float4(normalize(input.normal), code == 253 ? 0.35 : code == 254 ? 0.5 : 0.85);
     return result;
 }
 
@@ -77,9 +77,15 @@ float4 deferredPS(Sky input) : SV_Target {
     float3 normal = normalize(normalData.xyz);
     float diffuse = max(0, dot(normal, sunlight.xyz));
     float shadow = visibility(relative, normal, viewDepth);
-    float3 halfVector = normalize(sunlight.xyz - normalize(relative));
+    float3 eyeDirection = -normalize(relative);
+    float3 halfVector = normalize(sunlight.xyz + eyeDirection);
     float specular = pow(saturate(dot(normal, halfVector)), lerp(96, 8, normalData.w)) * 0.08;
     float3 radiance = material.rgb * (0.12 + 1.8 * diffuse * shadow) + specular * shadow;
+    if (code == 253) {
+        float facing = saturate(dot(normal, eyeDirection));
+        float rim = 1 - facing;
+        radiance += material.rgb * (0.22 * facing + 0.09 * rim * rim);
+    }
     float distance = length(relative);
     float3 transmittance;
     float3 inscatter = scatter(planetEye(), relative / max(distance, 1e-6), distance, transmittance);

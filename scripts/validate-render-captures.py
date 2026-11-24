@@ -23,6 +23,9 @@ def validate(directory):
     for backend in ("mesh", "grid", "dag", "vdb"):
         for view in ("orbit", "orbit-wireframe", "surface", "horizon", "wireframe", "ranges", "free", "global-lod-wireframe"):
             bitmap(directory / f"{backend}-{view}.bmp")
+    bitmap(directory / "invoker-control.bmp")
+    if "invoker_controls=passed" not in (directory / "validation.txt").read_text().splitlines():
+        raise ValueError("Invoker movement and camera controls did not finish validation")
     size_a, a = bitmap(directory / "precision-base.bmp")
     size_b, b = bitmap(directory / "precision-translated.bmp")
     if size_a != size_b:
@@ -50,7 +53,7 @@ def validate(directory):
         int(diagnostics[f"cascade_{i}_depth_pixels"]) == 0 for i in range(4)
     ):
         raise ValueError("G-buffer or one of the four CSM layers is empty")
-    print(f"39 required captures verified; translation max difference={maximum}/255, mean={mean:.9f}/255; "
+    print(f"40 required captures verified; translation max difference={maximum}/255, mean={mean:.9f}/255; "
           f"shadowed={shadowed}, exposure-brightened={brightened}; HDR max={diagnostics['hdr_max_component']}")
 
 
