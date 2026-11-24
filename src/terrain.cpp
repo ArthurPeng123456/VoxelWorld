@@ -52,25 +52,71 @@ Planet::Planet(std::uint64_t seed) {
         craters_.push_back({axis, diameterRatio * diameterRatio * 0.5,
                             180 + random() * 560, 40 + random() * 95});
     }
+    for (std::size_t i = 0; i < craters_.size(); ++i) {
+        const auto& crater = craters_[i];
+        // The angular cutoff is equivalent to this chord length on the unit sphere.
+        const double reach = std::sqrt(3.92 * crater.width) + 1e-12;
+        for (int octant = 0; octant < 8; ++octant) {
+            bool overlaps = true;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double sign = octant & (1 << axis) ? 1 : -1;
+                overlaps &= crater.axis[axis] * sign >= -reach;
+            }
+            if (overlaps) craterOctants_[octant].push_back(i);
+        }
+    }
 }
 
-double Planet::elevation(Vec d) const {
+template<bool withGradient>
+double Planet::sampleElevation(Vec d, Vec& gradient) const {
     double bowl = 0;
     double rim = 0;
-    for (const auto& crater : craters_) {
+    Vec bowlSlope{}, rimSlope{};
+    const int octant = (d.x >= 0 ? 1 : 0) | (d.y >= 0 ? 2 : 0) | (d.z >= 0 ? 4 : 0);
+    for (const auto index : craterOctants_[octant]) {
+        const auto& crater = craters_[index];
         const double chord = 1 - dot(d, crater.axis);
         if (chord > 1.96 * crater.width) continue;
         const double radius = std::sqrt(std::max(0.0, chord / crater.width));
         const double depth = std::max(0.0, 1 - radius * radius);
         const double ridge = std::max(0.0, 1 - std::abs(radius - 0.99) / 0.4);
-        bowl = std::max(bowl, crater.depth * depth * depth);
-        rim = std::max(rim, crater.rim * ridge * ridge);
+        const double nextBowl = crater.depth * depth * depth;
+        const double nextRim = crater.rim * ridge * ridge;
+        if (nextBowl > bowl) {
+            bowl = nextBowl;
+            if constexpr (withGradient) bowlSlope = crater.axis * (2 * crater.depth * depth / crater.width);
+        }
+        if (nextRim > rim) {
+            rim = nextRim;
+            if constexpr (withGradient) {
+                const double slope = radius < 0.99 ? -1 : radius > 0.99 ? 1 : 0;
+                rimSlope = crater.axis * (crater.rim * ridge * slope / (0.4 * crater.width * radius));
+            }
+        }
     }
     constexpr double frequency = planetRadius / 25600.0;
-    const double relief = 85 * std::sin(dot(d, {14, 11, -7}) * frequency + phase_[0])
-                        + 50 * std::sin(dot(d, {29, -19, 25}) * frequency + phase_[1])
-                        + 20 * std::sin(dot(d, {-70, 59, 91}) * frequency + phase_[2]);
+    constexpr Vec directions[] = {{14, 11, -7}, {29, -19, 25}, {-70, 59, 91}};
+    constexpr double amplitudes[] = {85, 50, 20};
+    double relief = 0;
+    if constexpr (withGradient) gradient = rimSlope - bowlSlope;
+    for (int i = 0; i < 3; ++i) {
+        const double phase = dot(d, directions[i]) * frequency + phase_[i];
+        relief += amplitudes[i] * std::sin(phase);
+        if constexpr (withGradient) gradient = gradient + directions[i] * (amplitudes[i] * frequency * std::cos(phase));
+    }
     return relief + rim - bowl;
+}
+
+double Planet::elevation(Vec direction) const {
+    Vec unused;
+    return sampleElevation<false>(direction, unused);
+}
+
+PlanetSurfaceSample Planet::sampleSurface(Vec direction) const {
+    Vec gradient;
+    const double height = sampleElevation<true>(direction, gradient);
+    const Vec tangent = gradient - direction * dot(gradient, direction);
+    return {height, unit(direction - tangent / (planetRadius + height), direction)};
 }
 
 float Planet::sdf(Vec p) const {

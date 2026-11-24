@@ -19,10 +19,33 @@ def bitmap(path):
     return (width, -height), pixels
 
 
+def orbit_shading_edges(path):
+    (width, height), pixels = bitmap(path)
+    radius = int(height * 0.26)
+    stride = width * 4
+    # Sample inside the disk, away from the silhouette. A second difference
+    # catches mesh edges and bands while allowing the gradual daylight gradient.
+    def luma(index):
+        b, g, r = pixels[index:index + 3]
+        return (19 * b + 183 * g + 54 * r + 128) >> 8
+
+    edges = 0
+    for y in range(height // 2 - radius, height // 2 + radius):
+        for x in range(width // 2 - radius, width // 2 + radius):
+            index = y * stride + 4 * x
+            center = 2 * luma(index)
+            for offset in (4, stride):
+                edges += abs(luma(index - offset) + luma(index + offset) - center) > 4
+    return edges / (8 * radius * radius)
+
+
 def validate(directory):
     for backend in ("mesh", "grid", "dag", "vdb"):
         for view in ("orbit", "orbit-wireframe", "surface", "horizon", "wireframe", "ranges", "free", "global-lod-wireframe"):
             bitmap(directory / f"{backend}-{view}.bmp")
+    orbit_edges = orbit_shading_edges(directory / "grid-orbit-no-effects.bmp")
+    if orbit_edges > 0.005:
+        raise ValueError(f"Mesh shading bands visible in the orbit capture: {orbit_edges:.2%}")
     bitmap(directory / "invoker-control.bmp")
     if "invoker_controls=passed" not in (directory / "validation.txt").read_text().splitlines():
         raise ValueError("Invoker movement and camera controls did not finish validation")
@@ -45,15 +68,31 @@ def validate(directory):
     brightened = sum(sum(exposed[i:i+3]) > sum(off[i:i+3]) + 10 for i in range(0, len(off), 4))
     if shadowed < 100 or brightened < 1000:
         raise ValueError(f"Missing visible shadow/exposure response: shadowed={shadowed}, brightened={brightened}")
-    diagnostics = dict(line.split("=", 1) for line in
-                       (directory / "pipeline-csm-on.pipeline.txt").read_text().splitlines())
-    if float(diagnostics["hdr_max_component"]) <= 1 or int(diagnostics["invalid_gpu_values"]) != 0:
+    def pipeline(name, resolution):
+        info = dict(line.split("=", 1) for line in
+                    (directory / f"{name}.pipeline.txt").read_text().splitlines())
+        if int(info["shadow_resolution"]) != resolution or int(info["invalid_gpu_values"]) != 0:
+            raise ValueError(f"Invalid DX12 targets in {name}")
+        if int(info["gbuffer_geometry_pixels"]) < 1000 or any(
+            int(info[f"cascade_{i}_depth_pixels"]) == 0 for i in range(4)
+        ):
+            raise ValueError(f"G-buffer or one of the four CSM layers is empty in {name}")
+        return info
+
+    diagnostics = pipeline("pipeline-csm-on", 1024)
+    if float(diagnostics["hdr_max_component"]) <= 1:
         raise ValueError("HDR target failed float-range/finite-value validation")
-    if int(diagnostics["gbuffer_geometry_pixels"]) < 1000 or any(
-        int(diagnostics[f"cascade_{i}_depth_pixels"]) == 0 for i in range(4)
-    ):
-        raise ValueError("G-buffer or one of the four CSM layers is empty")
-    print(f"40 required captures verified; translation max difference={maximum}/255, mean={mean:.9f}/255; "
+    for edge in (2048, 4096):
+        name = f"pipeline-shadow-{edge}"
+        if bitmap(directory / f"{name}.bmp")[0] != on_size:
+            raise ValueError("Changing shadow resolution changed the viewport size")
+        pipeline(name, edge)
+    for name in ("tone-reinhard", "tone-linear", "atmosphere-tuned"):
+        size, configured = bitmap(directory / f"pipeline-{name}.bmp")
+        if size != on_size or sum(abs(p - q) > 2 for p, q in zip(on, configured)) < 1000:
+            raise ValueError(f"Rendering settings did not reach the GPU in {name}")
+    print(f"46 required captures verified; orbit shading edges={orbit_edges:.2%}; CSM 1024/2048/4096; "
+          f"translation max difference={maximum}/255, mean={mean:.9f}/255; "
           f"shadowed={shadowed}, exposure-brightened={brightened}; HDR max={diagnostics['hdr_max_component']}")
 
 

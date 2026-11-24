@@ -1,8 +1,8 @@
 #include "dx12_renderer.hpp"
 #include "lod_range_dialog.hpp"
+#include "render_settings_dialog.hpp"
 #include "world.hpp"
 #include "free_camera.hpp"
-#include "post_process.hpp"
 
 #include <shellapi.h>
 #include <psapi.h>
@@ -39,14 +39,14 @@ Key terrainPage(Key chunk) {
 }
 
 enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows,
-               RangeSettings, Density = 100, InvokerCount, CameraTarget };
+               RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, RangeSettings> toolbarButtons{{
+constexpr std::array<ToolbarButton, GraphicsSettings> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
     {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108},
-    {L"LOD ranges...", 112}
+    {L"LOD ranges...", 112}, {L"Render settings...", 136}
 }};
 
 struct Options {
@@ -55,8 +55,7 @@ struct Options {
     int invokers{2};
     bool warp{}, morton{};
     double voxelDensity{1};
-    double exposureEV{};
-    bool shadows{true};
+    RenderSettings render;
     std::filesystem::path captures;
 };
 
@@ -78,10 +77,34 @@ Options readOptions() {
             }
             return std::stoull(text);
         };
+        const auto renderOption = [&](const auto& parameters) {
+            for (const auto& parameter : parameters) if (option == parameter.option) {
+                const auto value = readRenderParameter(next(), parameter);
+                if (!value) {
+                    std::string flag(option.size(), ' ');
+                    std::transform(option.begin(), option.end(), flag.begin(), [](wchar_t c) { return static_cast<char>(c); });
+                    throw std::invalid_argument(flag + " requires a finite value within the supported range");
+                }
+                result.render.*parameter.value = *value;
+                return true;
+            }
+            return false;
+        };
         if (option == L"--warp") result.warp = true;
-        else if (option == L"--no-shadows") result.shadows = false;
-        else if (option == L"--exposure") result.exposureEV = parseExposure(next());
-        else if (option == L"--morton") result.morton = true;
+        else if (option == L"--no-shadows") result.render.shadowsEnabled = false;
+        else if (option == L"--no-atmosphere") result.render.atmosphereEnabled = false;
+        else if (option == L"--shadow-resolution") {
+            const auto resolution = integer();
+            if (resolution > shadowResolutions.back() || !validShadowResolution(int(resolution)))
+                throw std::invalid_argument("--shadow-resolution requires 1024, 2048 or 4096");
+            result.render.shadowResolution = int(resolution);
+        } else if (option == L"--tone-map") {
+            const auto value = next();
+            if (value == L"aces") result.render.toneMapping = ToneMapping::Aces;
+            else if (value == L"reinhard") result.render.toneMapping = ToneMapping::Reinhard;
+            else if (value == L"linear") result.render.toneMapping = ToneMapping::Linear;
+            else throw std::invalid_argument("--tone-map requires aces, reinhard or linear");
+        } else if (option == L"--morton") result.morton = true;
         else if (option == L"--capture-dir") result.captures = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
@@ -96,7 +119,8 @@ Options readOptions() {
             else if (value == L"dag" || value == L"3") result.method = 2;
             else if (value == L"vdb" || value == L"4") result.method = 3;
             else throw std::invalid_argument("Choose mesh, grid, dag or vdb");
-        } else throw std::invalid_argument("Unknown viewer option");
+        } else if (!renderOption(shadowParameters) && !renderOption(atmosphereParameters) && !renderOption(hdrParameters))
+            throw std::invalid_argument("Unknown viewer option");
     }
     return result;
 }
@@ -247,6 +271,7 @@ public:
         ShowWindow(window_, show);
         UpdateWindow(window_);
         renderer_ = std::make_unique<Dx12Renderer>(viewport_, opts_.warp, !opts_.captures.empty());
+        renderer_->setShadowResolution(opts_.render.shadowResolution);
         rebuild();
     }
 
@@ -500,17 +525,24 @@ private:
             geometry.reserve(data.triangles * 3);
             for (Key key : data.chunks) {
                 const Chunk& chunk = *world_->chunks.at(key);
+                // Fade relief that this mesh's vertex spacing cannot resolve.
+                const double t = std::clamp((chunk.spacing - 400.0) / 1200.0, 0.0, 1.0);
+                const double reliefDetail = 1 - t * t * (3 - 2 * t);
                 for (const auto& triangle : chunk.mesh) {
-                    const auto& p = triangle.vertices;
-                    const Vec up = unit((p[0] + p[1] + p[2]) / 3);
-                    const Vec n = unit(cross(p[1] - p[0], p[2] - p[0]), up);
-                    const double rock = std::clamp(2.4 * (1 - dot(n, up)), 0.0, 1.0);
-                    for (const Vec point : p) {
+                    for (const Vec point : triangle.vertices) {
                         pageBounds.lo = min(pageBounds.lo, point);
                         pageBounds.hi = max(pageBounds.hi, point);
-                        const double height = std::clamp((length(point) - planetRadius + 660) / 850, 0.0, 1.0);
-                        const Vec tone = Vec{0.35, 0.41, 0.47} + Vec{0.31, 0.18, 0.06} * height + Vec{0.09, 0.04, 0.03} * rock;
-                        geometry.push_back(vertex(point, n, color(tone, chunk.lod)));
+                        const Vec up = unit(point);
+                        Vec normal = up;
+                        double elevation = 0;
+                        if (reliefDetail > 0) {
+                            const auto sample = planet_.sampleSurface(up);
+                            normal = unit(up + (sample.normal - up) * reliefDetail, up);
+                            elevation = sample.elevation * reliefDetail;
+                        }
+                        const double height = std::clamp((elevation + 660) / 850, 0.0, 1.0);
+                        const double rock = std::clamp(2.4 * (1 - dot(normal, up)), 0.0, 1.0);
+                        geometry.push_back(vertex(point, normal, color({height, rock, 0}, chunk.lod)));
                     }
                 }
             }
@@ -560,7 +592,7 @@ private:
     Camera camera() const {
         if (freeView_) {
             return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
-                    lodTint_, wireframe_, {}, atmosphereEnabled_, opts_.exposureEV, opts_.shadows};
+                    lodTint_, wireframe_, {}, opts_.render};
         }
         const Vec target = invokers_[selected_];
         const Vec radial = unit(target);
@@ -587,7 +619,7 @@ private:
         }
         const Vec forward = unit(center - eye), right = unit(cross(forward, nominalUp), basis[0]);
         return {eye, right, unit(cross(right, forward)), forward, nearPlane, 20 * planetRadius,
-                lodTint_, wireframe_, {}, atmosphereEnabled_, opts_.exposureEV, opts_.shadows};
+                lodTint_, wireframe_, {}, opts_.render};
     }
 
     int captureAll() {
@@ -611,9 +643,16 @@ private:
             lodTint_ = false;
             buildObjects();
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-orbit.bmp"));
+            if (methods[i] == Method::Grid) {
+                Camera orbitClear = camera();
+                orbitClear.settings = {};
+                orbitClear.settings.atmosphereEnabled = false;
+                orbitClear.settings.shadowsEnabled = false;
+                renderer_->draw(orbitClear, objects_, opts_.captures / (prefix + "-orbit-no-effects.bmp"));
+            }
             Camera orbitWire = camera();
             orbitWire.wireframe = true;
-            orbitWire.atmosphereEnabled = false;
+            orbitWire.settings.atmosphereEnabled = false;
             renderer_->draw(orbitWire, objects_, opts_.captures / (prefix + "-orbit-wireframe.bmp"));
             int maxContacts = 0;
             for (int step = 0; step < 190; ++step) {
@@ -632,10 +671,10 @@ private:
             if (!freeView_ || length(camera().eye - anchored.eye) > 1e-8 ||
                 length(camera().forward - anchored.forward) > 1e-8)
                 throw std::runtime_error("Free camera did not preserve the entry view");
-            const bool previousWireframe = wireframe_, previousAtmosphere = atmosphereEnabled_;
+            const bool previousWireframe = wireframe_, previousAtmosphere = opts_.render.atmosphereEnabled;
             key('W', true);
             key('A', true);
-            if (wireframe_ != previousWireframe || atmosphereEnabled_ != previousAtmosphere)
+            if (wireframe_ != previousWireframe || opts_.render.atmosphereEnabled != previousAtmosphere)
                 throw std::runtime_error("WASD conflicts with a render shortcut");
             flight_.look(0.12, 0.08);
             flight_.move(1, 1, 0.5, 1, flightSpeed_);
@@ -646,16 +685,16 @@ private:
             if (wireframe_ == previousWireframe) throw std::runtime_error("F2 did not toggle wireframe");
             key(VK_F2, true);
             key('H', true);
-            if (atmosphereEnabled_ == previousAtmosphere) throw std::runtime_error("H did not toggle atmosphere");
+            if (opts_.render.atmosphereEnabled == previousAtmosphere) throw std::runtime_error("H did not toggle atmosphere");
             key('H', true);
             key('C', true);
             if (freeView_ || length(camera().eye - anchored.eye) > 1e-8)
                 throw std::runtime_error("Free camera did not restore the anchored view");
             updateTerrain(false);
             buildObjects();
-            action(Atmosphere);
-            renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-surface-no-atmosphere.bmp"));
-            action(Atmosphere);
+            Camera noAtmosphere = camera();
+            noAtmosphere.settings.atmosphereEnabled = false;
+            renderer_->draw(noAtmosphere, objects_, opts_.captures / (prefix + "-surface-no-atmosphere.bmp"));
             Camera horizon = camera();
             const Vec up = unit(invokers_[selected_]);
             const auto axes = frameAt(up);
@@ -671,7 +710,7 @@ private:
             pullback.right = axes[0];
             pullback.up = cross(pullback.right, pullback.forward);
             pullback.wireframe = true;
-            pullback.atmosphereEnabled = false;
+            pullback.settings.atmosphereEnabled = false;
             pullback.lodTint = true;
             renderer_->draw(pullback, objects_, opts_.captures / (prefix + "-global-lod-wireframe.bmp"));
             action(Wireframe);
@@ -730,9 +769,9 @@ private:
         for (auto pixels : diagnostic.shadowPixels) shadowPixels += pixels;
         if (diagnostic.invalidValues || diagnostic.maxHdrComponent <= 1 || diagnostic.geometryPixels < 1000 || !shadowPixels)
             throw std::runtime_error("Deferred/HDR/CSM validation did not produce expected GPU buffers");
-        validation.shadowsEnabled = false;
+        validation.settings.shadowsEnabled = false;
         renderer_->draw(validation, caster, opts_.captures / "pipeline-csm-off.bmp");
-        validation.exposureEV = 1;
+        validation.settings.exposureEV = 1;
         renderer_->draw(validation, caster, opts_.captures / "pipeline-exposure-plus1.bmp");
         RECT saved{}; GetWindowRect(window_, &saved);
         SetWindowPos(window_, nullptr, 0, 0, 1100, 700, SWP_NOMOVE | SWP_NOZORDER);
@@ -741,6 +780,27 @@ private:
         renderer_->draw(validation, caster, opts_.captures / "pipeline-restored.bmp");
         report << "pipeline=deferred HDR_RGBA16F CSM4\nhdr_max_component=" << diagnostic.maxHdrComponent
                << "\nshadow_depth_pixels=" << shadowPixels << "\nd3d12_debug_layer=" << diagnostic.debugLayer << '\n';
+
+        validation.settings = {};
+        for (int edge : shadowResolutions) {
+            if (edge == RenderSettings{}.shadowResolution) continue;
+            validation.settings.shadowResolution = edge;
+            const auto name = "pipeline-shadow-" + std::to_string(edge) + ".bmp";
+            renderer_->draw(validation, caster, opts_.captures / name, true);
+        }
+        validation.settings = {};
+        validation.settings.toneMapping = ToneMapping::Reinhard;
+        renderer_->draw(validation, caster, opts_.captures / "pipeline-tone-reinhard.bmp");
+        validation.settings.toneMapping = ToneMapping::Linear;
+        renderer_->draw(validation, caster, opts_.captures / "pipeline-tone-linear.bmp");
+        validation.settings = {};
+        validation.settings.atmosphereHeightKm = 18;
+        validation.settings.rayleighHeightKm = 4;
+        validation.settings.mieHeightKm = 0.6;
+        validation.settings.rayleighStrength = 5;
+        validation.settings.mieStrength = 3;
+        validation.settings.mieAnisotropy = 0.55;
+        renderer_->draw(validation, caster, opts_.captures / "pipeline-atmosphere-tuned.bmp");
         captureInvokerControls();
         report << "invoker_controls=passed\n";
         return 0;
@@ -816,6 +876,17 @@ private:
             if (selected >= 0) selectCameraTarget(std::size_t(selected));
         } else if (command == RangeSettings) {
             if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) world_->setLod0Radius(lod0Radius_);
+        } else if (command == GraphicsSettings) {
+            auto next = opts_.render;
+            if (editRenderSettings(window_, next)) {
+                try {
+                    renderer_->setShadowResolution(next.shadowResolution);
+                    opts_.render = next;
+                } catch (const std::exception& error) {
+                    const auto message = std::string("Could not apply the requested shadow-map size.\n") + error.what();
+                    MessageBoxA(window_, message.c_str(), "Render settings", MB_OK | MB_ICONERROR);
+                }
+            }
         } else if (command == View) {
             freeView_ = false;
             detachInvoker();
@@ -830,8 +901,8 @@ private:
             freeView_ = !freeView_;
         } else if (command == Tint) lodTint_ = !lodTint_;
         else if (command == Wireframe) wireframe_ = !wireframe_;
-        else if (command == Atmosphere) atmosphereEnabled_ = !atmosphereEnabled_;
-        else if (command == Shadows) opts_.shadows = !opts_.shadows;
+        else if (command == Atmosphere) opts_.render.atmosphereEnabled = !opts_.render.atmosphereEnabled;
+        else if (command == Shadows) opts_.render.shadowsEnabled = !opts_.render.shadowsEnabled;
         else if (command == Ranges) {
             showRanges_ = !showRanges_;
             refreshRanges();
@@ -879,7 +950,8 @@ private:
         else if (code == 'H') action(Atmosphere);
         else if (code == 'J') action(Shadows);
         else if (code == VK_OEM_4 || code == VK_OEM_6) {
-            opts_.exposureEV = std::clamp(opts_.exposureEV + (code == VK_OEM_6 ? 0.5 : -0.5), -10.0, 10.0);
+            opts_.render.exposureEV = std::clamp(opts_.render.exposureEV + (code == VK_OEM_6 ? 0.5 : -0.5),
+                                                hdrParameters.front().minimum, hdrParameters.front().maximum);
             updateFooter();
         }
         else if (code == 'C') action(FreeView);
@@ -965,7 +1037,9 @@ private:
         } else {
             processInfo << L"N/A";
         }
-        processInfo << L"   |   HDR EV " << opts_.exposureEV << L"   |   CSM " << (opts_.shadows ? L"On [J]" : L"Off [J]");
+        processInfo << L"   |   HDR EV " << opts_.render.exposureEV << L"   |   CSM ";
+        if (opts_.render.shadowsEnabled) processInfo << opts_.render.shadowResolution << L" x " << opts_.render.shadowResolution << L" [J]";
+        else processInfo << L"Off [J]";
         processMemory_ = processInfo.str();
 
         // These are resident terrain allocations, not an additional process total.
@@ -1022,8 +1096,8 @@ private:
         const bool active = button == method_ + Mesh || (button == View && surface_) ||
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
                             (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
-                            (button == Atmosphere && atmosphereEnabled_) || (button == FreeView && freeView_) ||
-                            (button == Shadows && opts_.shadows);
+                            (button == Atmosphere && opts_.render.atmosphereEnabled) || (button == FreeView && freeView_) ||
+                            (button == Shadows && opts_.render.shadowsEnabled);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -1067,7 +1141,7 @@ private:
                 if (command >= Density && command <= CameraTarget) {
                     if (notification == CBN_SELENDOK || (notification == CBN_SELCHANGE &&
                         !SendMessageW(app->combo(command), CB_GETDROPPEDSTATE, 0, 0))) app->pending_ = command;
-                } else if (command >= Mesh && command <= RangeSettings && notification == BN_CLICKED) app->pending_ = command;
+                } else if (command >= Mesh && command <= GraphicsSettings && notification == BN_CLICKED) app->pending_ = command;
                 return 0;
             }
             case WM_CTLCOLORSTATIC:
@@ -1151,7 +1225,6 @@ private:
     std::size_t selected_{}, triangles_{};
     std::wstring status_, processMemory_, terrainMemory_, lodLegend_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
-    bool atmosphereEnabled_{true};
     bool freeView_{}, controlling_{};
     FreeCamera flight_;
     double flightSpeed_{200};

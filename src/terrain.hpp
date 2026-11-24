@@ -58,7 +58,6 @@ bool clip(Box box, Vec start, Vec delta, double& first, double& last);
 
 // World distances are meters. CPU positions, directions and transforms use Vec/double.
 constexpr double planetRadius = 6371000.0;
-constexpr double atmosphereHeight = 100000.0;
 constexpr double chunkSize = 1600.0;
 constexpr int fineCells = 32;
 constexpr int fieldRootLevel() {
@@ -102,16 +101,21 @@ Key keyAt(Vec p, int densityShift = 0);
 Box bounds(Key key);
 bool intersectsPlanetShell(Key key);
 
+struct PlanetSurfaceSample { double elevation; Vec normal; };
+
 class Planet {
 public:
     explicit Planet(std::uint64_t seed);
     double elevation(Vec direction) const;
+    PlanetSurfaceSample sampleSurface(Vec direction) const;
     float sdf(Vec p) const;
     Vec surface(Vec direction) const { return direction * (planetRadius + elevation(direction)); }
     Vec invokerDirection(int index, double frame) const;
 private:
     struct Crater { Vec axis; double width, depth, rim; };
+    template<bool withGradient> double sampleElevation(Vec direction, Vec& gradient) const;
     std::vector<Crater> craters_;
+    std::array<std::vector<std::size_t>, 8> craterOctants_;
     std::array<double, 3> phase_{};
 };
 

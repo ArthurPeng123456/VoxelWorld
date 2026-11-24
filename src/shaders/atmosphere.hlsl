@@ -7,13 +7,14 @@ cbuffer Camera : register(b0) {
     float4 atmosphere; // ground radius, top radius, Rayleigh/Mie scale heights (meters)
     float4 shadowRows[12];
     float4 shadowSplits, shadowTexels, shadowBiases;
-    float4 shadowSettings; // enabled, inverse resolution
-    float4 renderParams; // width, height, exposure multiplier, wireframe
+    float4 shadowSettings; // enabled, inverse resolution, normal bias multiplier
+    float4 renderParams; // width, height, exposure multiplier, tone mapper
+    float4 scatteringParams; // Rayleigh strength, Mie strength, Mie anisotropy
 };
 
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }
-float3 betaR() { return float3(5.802e-6, 13.558e-6, 33.100e-6); }
-float betaM() { return 3.996e-6; }
+float3 betaR() { return scatteringParams.x * float3(5.802e-6, 13.558e-6, 33.100e-6); }
+float betaM() { return scatteringParams.y * 3.996e-6; }
 float2 density(float radiusDelta) {
     // (r² - R²) / (r + R) avoids subtracting two nearly equal radii.
     float r = sqrt(max(0, atmosphere.x * atmosphere.x + radiusDelta));
@@ -45,7 +46,7 @@ float2 sunlightDepth(float radiusDelta, float sunProjection, float sunLengthSqua
 float3 scatter(DF3 eye, float3 ray, float limit, out float3 transmittance) {
     float2 interval;
     transmittance = 1;
-    if (cameraRight.w < 0.5) return 0;
+    if (cameraRight.w < 0.5 || !any(scatteringParams.xy)) return 0;
     if (!dfRaySphere(eye, ray, float2(atmosphere.y, 0), interval)) return 0;
     float start = max(0, interval.x), end = min(limit, interval.y);
     if (end <= start) return 0;
@@ -62,7 +63,7 @@ float3 scatter(DF3 eye, float3 ray, float limit, out float3 transmittance) {
     float viewProjection = dot(anchor.hi, ray) + dot(anchor.lo, ray);
     float sunProjection = dot(anchor.hi, sunlight.xyz) + dot(anchor.lo, sunlight.xyz);
     float rayLengthSquared = dot(ray, ray), sunLengthSquared = dot(sunlight.xyz, sunlight.xyz);
-    float mu = dot(ray, sunlight.xyz), g = 0.76;
+    float mu = dot(ray, sunlight.xyz), g = scatteringParams.z;
     float phaseR = 3.0 / (16.0 * 3.14159265) * (1 + mu * mu);
     float phaseM = 3.0 / (8.0 * 3.14159265) * (1 - g * g) * (1 + mu * mu)
                  / ((2 + g * g) * pow(max(1e-3, 1 + g * g - 2 * g * mu), 1.5));

@@ -12,7 +12,7 @@ CPU 的 `Vec`、相机、网格顶点、变换、LOD 和碰撞查询均使用 do
 
 `src/shaders/df64.hlsli` 实现 Andrew Thall《Extended-Precision Floating-Point Numbers for GPU Computation》的 Two-Sum、Fast-Two-Sum、4097 Split、Two-Product，以及 df64 加减乘除、校正平方根。所有误差变换使用 HLSL `precise`，编译启用 IEEE strictness，避免乘加融合或重排破坏误差项。采用论文的双 float 分支（约 48 位有效数字、float 指数范围），没有实现四 float 的完整 qf128 数学库，也不依赖硬件 FP64。
 
-`src/shaders/atmosphere.hlsl` 用 df64 求大气射线区间和起点高度，然后沿局部射线求半径平方差，由 `(r² - R²) / (r + R)` 求各积分点的高度。大气厚度 100 公里，采用 Rayleigh/Mie 单次散射、太阳遮挡、视线消光和地形空气透视。每条视线使用 16 个积分样本，每个样本使用 6 个太阳光路径样本。相机与星心先在 CPU double 中相减再拆分，支持带巨大公共平移的行星场景。 [大气散射的相函数和积分关系](https://ebruneton.github.io/precomputed_atmospheric_scattering/atmosphere/functions.glsl)
+`src/shaders/atmosphere.hlsl` 用 df64 求大气射线区间和起点高度，然后沿局部射线求半径平方差，由 `(r² - R²) / (r + R)` 求各积分点的高度。大气默认厚度为 100 公里，采用 Rayleigh/Mie 单次散射、太阳遮挡、视线消光和地形空气透视。每条视线使用 16 个积分样本，每个样本使用 6 个太阳光路径样本。相机与星心先在 CPU double 中相减再拆分，支持带巨大公共平移的行星场景。 [大气散射的相函数和积分关系](https://ebruneton.github.io/precomputed_atmospheric_scattering/atmosphere/functions.glsl)
 
 体素场使用八叉树叶节点覆盖整个星球的包围立方体。每个方向的块数根据星球半径向上取整为 2 的幂，当前边界为 ±6,553,600 米。每个 Invoker 和摄像机都细分同一棵树，重叠区域保留最细层。默认 LOD0 采样间距为 50 米，可用界面或命令行切换。采样间距随 LOD 逐级翻倍，LOD4 起块的边长也逐级翻倍。当前表面最粗层间距为 204.8 公里，完整覆盖其余星球。实体内部和空区使用常量存储叶节点，避免将整个体积展开成密集体素。
 
@@ -46,9 +46,11 @@ GPU 测试包含 94 组数据，检查 df64 运算、毫米高度、地平线求
 
 DX12 地形顶点按空间分组缓存到 GPU。主视图和每级阴影各自剔除落在绘制范围外的分组。
 
-原生查看器使用两个 G-buffer：RGBA8 保存线性材质颜色和材质标记，RGBA16F 保存世界法线与粗糙度，另有可读取的 D32 反向深度。全屏光照阶段从深度重建相机相对位置，计算方向光、环境光、镜面高光、级联阴影和大气空气透视。天空和调试线框也在线性 HDR 空间合成，最终统一处理曝光、ACES filmic 近似曲线和 sRGB 输出转换。场景颜色使用 `R16G16B16A16_FLOAT`，可以保留大于 1 的亮度；当前显示输出为色调映射后的 sRGB/SDR。[HDR 渲染参考](https://github.com/microsoft/DirectXTK12/wiki/Using-HDR-rendering) · [色调映射曲线来源](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
+原生查看器的 RGBA8 G-buffer 保存地形高度与坡度权重、其他物体的线性材质颜色及材质标记。RGBA16F G-buffer 保存世界法线与粗糙度，另有可读取的 D32 反向深度。全屏光照阶段从深度重建相机相对位置，计算方向光、环境光、镜面高光、级联阴影和大气空气透视。天空和调试线框也在线性 HDR 空间合成，最终统一处理曝光、ACES filmic 近似曲线和 sRGB 输出转换。场景颜色使用 `R16G16B16A16_FLOAT`，可以保留大于 1 的亮度；当前显示输出为色调映射后的 sRGB/SDR。[HDR 渲染参考](https://github.com/microsoft/DirectXTK12/wiki/Using-HDR-rendering) · [色调映射曲线来源](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
 
-CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分视锥。CPU 使用 double 拟合包围球并在星球坐标系内对齐阴影纹素，GPU 继续在相机相对坐标系计算阴影。接收面使用法线偏移，3×3 PCF 过滤阴影边界，级联末尾 10% 混合到下一层。阴影距离随相机高度在 10–200 公里之间调整，末级向无阴影光照渐变，轨道视角超出局部阴影距离时关闭局部 CSM。[CSM 参考](https://learn.microsoft.com/en-us/windows/win32/dxtecharts/cascaded-shadow-maps)
+地形着色使用程序化海拔与其梯度生成的平滑法线。随着网格采样间距和每像素覆盖面积增大，细节逐步过渡到星球径向法线和基准颜色。远景大气光程也平滑过渡到参考球面深度。截图验证在关闭大气和阴影的轨道画面中检查环纹及块边界。
+
+CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合方式划分视锥。CPU 使用 double 拟合包围球并在星球坐标系内对齐阴影纹素，GPU 继续在相机相对坐标系计算阴影。接收面使用法线偏移，3×3 PCF 过滤阴影边界，级联末尾 10% 混合到下一层。默认阴影距离随相机高度在 10–200 公里之间调整，末级向无阴影光照渐变，轨道视角超出局部阴影距离时关闭局部 CSM。[CSM 参考](https://learn.microsoft.com/en-us/windows/win32/dxtecharts/cascaded-shadow-maps)
 
 `Shadows [J]` 或 J 切换阴影，`[` / `]` 每次降低／提高 0.5 EV。命令行 `--exposure EV` 接受 -10 到 10，默认 0；`--no-shadows` 关闭 CSM。例：
 
@@ -57,7 +59,25 @@ CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分�
 .\build-windows-native\dist\VoxelWorldViewer.exe --no-shadows
 ```
 
-`--capture-dir` 在可用时启用 D3D12 调试层，并增加阴影开关、曝光 +1 EV、窗口缩放／恢复的固定场景。`.pipeline.txt` 记录 G-buffer 有效像素数、HDR 浮点最大值、非有限值检查和四个级联的深度像素数。`python scripts/validate-render-captures.py DIRECTORY` 检查画面对照和缓冲报告。硬件与 WARP 验证均观测到四层阴影数据和超过 1 的 HDR 值；GPU 数值测试还对照 CPU 检查曝光与色调映射结果。
+`--capture-dir` 在可用时启用 D3D12 调试层，并采集阴影开关、三档分辨率、曝光 +1 EV、色调映射、大气调整与窗口缩放的固定场景。`.pipeline.txt` 记录 G-buffer 有效像素数、HDR 浮点最大值、阴影贴图实际分辨率和四个级联的深度像素数。`python scripts/validate-render-captures.py DIRECTORY` 检查画面对照和缓冲报告。GPU 数值测试还对照 CPU 检查曝光与色调映射结果。
+
+### 渲染设置
+
+工具栏 **`Render settings...`** 打开设置窗口。点击 `Apply` 即可应用到当前场景，`Defaults` 恢复初始参数。`J`、`H` 和 `[` / `]` 继续快速切换阴影、大气和曝光。
+
+| 分组 | 可调参数 |
+| --- | --- |
+| CSM | 开关、每级 Shadow Map 分辨率（1024² / 2048² / 4096²）、距离上限、对数分割权重、法线和深度偏移倍率 |
+| 大气 | 开关、厚度、Rayleigh / Mie 各自的尺度高度与散射强度、Mie 各向异性 |
+| HDR | 曝光（−10 到 +10 EV）和色调映射（ACES、Reinhard、线性裁剪） |
+
+四张 D32 阴影贴图的显存用量分别约为 16、64、256 MiB。切换分辨率时会重建阴影资源。HDR 场景仍通过色调映射输出到 sRGB/SDR 交换链。
+
+命令行可用 `--shadow-resolution`、`--shadow-distance-km`、`--shadow-split-blend`、`--shadow-normal-bias`、`--shadow-depth-bias` 设置 CSM。大气对应 `--atmosphere-height-km`、`--rayleigh-height-km`、`--mie-height-km`、`--rayleigh-strength`、`--mie-strength`、`--mie-anisotropy` 和 `--no-atmosphere`。HDR 使用 `--exposure` 和 `--tone-map aces|reinhard|linear`。
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --shadow-resolution 2048 --shadow-distance-km 80 --atmosphere-height-km 80 --exposure -0.5 --tone-map reinhard
+```
 
 双击打包目录里的 `VoxelWorldViewer.exe`。查看器使用 Windows 原生 Direct3D 12，渲染实时生成的 Marching Cubes 网格，并用当前碰撞方案模拟刚体。摄像机实际位置始终参与数据 LOD，默认还有两条移动 Invoker 路径。暂停时仍可移动摄像机并更新驻留范围。轨道相机远离地表时仍保留整个星球的粗层数据，靠近新的地表位置后会逐层细分。
 
@@ -80,6 +100,7 @@ CSM 使用四张 1024×1024 的深度图，按对数与均匀混合方式划分�
 | 切换地形和刚体的三角形线框渲染 | `F2` 或 `Wireframe [F2]` |
 | 开关大气散射和地形空气透视（默认开启） | `H` 或 `Atmosphere [H]` |
 | 开关 CSM 阴影（默认开启） | `J` 或 `Shadows [J]` |
+| 调整 CSM、大气和 HDR | 工具栏 `Render settings...` |
 | 降低／提高曝光 0.5 EV | `[` / `]` |
 | 向当前 Invoker 附近投放一组球、胶囊和盒子 | `B` |
 | 暂停或重置模拟 | `Space`、`R` |

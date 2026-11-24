@@ -682,11 +682,29 @@ void selfTest() {
                   "CSM fitting is invariant under common trillion-meter translations");
         check(!buildShadowCascades(eye, right, up, forward, 300000, 10000000, 1.6, {0.45,0.25,0.86}).enabled,
               "orbital views outside the shadow range disable local cascades");
+        double lastTexel = csm.cascades.front().texelSize;
+        for (int edge : {2048, 4096}) {
+            RenderSettings settings;
+            settings.shadowResolution = edge;
+            const auto finer = buildShadowCascades(eye, right, up, forward, 0.3, 10000000, 1.6, {0.45,0.25,0.86}, settings);
+            check(finer.cascades.front().texelSize < lastTexel * 0.51 &&
+                  finer.cascades.back().farDistance == csm.cascades.back().farDistance,
+                  "higher CSM resolution shrinks texels without changing cascade coverage");
+            lastTexel = finer.cascades.front().texelSize;
+        }
+        RenderSettings settings;
+        settings.shadowDistanceKm = 4;
+        settings.shadowSplitBlend = 0;
+        settings.shadowDepthBias = 0;
+        const auto adjusted = buildShadowCascades(eye, right, up, forward, 0.3, 10000000, 1.6, {0.45,0.25,0.86}, settings);
+        check(adjusted.cascades.back().farDistance == 4000 && adjusted.cascades.front().depthBias == 0 &&
+              std::abs(adjusted.cascades.front().farDistance - 1000.225) < 1e-9,
+              "CSM distance cap, split weight and depth bias reach the cascade fit");
         check(toneMap(0, 0) == 0 && toneMap(4, 0) > toneMap(1, 0) && toneMap(1, 1) > toneMap(1, 0) &&
               toneMap(1000, 0) <= 1, "HDR exposure and highlight compression are monotonic and bounded");
-        bool rejected = false;
-        try { parseExposure(std::string("nan")); } catch (const std::invalid_argument&) { rejected = true; }
-        check(rejected && parseExposure(std::wstring(L"-1.5")) == -1.5, "exposure arguments validate finite EV values");
+        check(!readRenderParameter(L"nan", hdrParameters.front()) && !readRenderParameter(L"11", hdrParameters.front()) &&
+              readRenderParameter(L"-1.5", hdrParameters.front()) == -1.5 && !validShadowResolution(8192),
+              "render arguments validate finite values, bounds and supported shadow sizes");
     }
     {
         FreeCamera camera;
@@ -717,6 +735,25 @@ void selfTest() {
     static_assert(sizeof(Vec) == 3 * sizeof(double), "World vectors must remain double precision");
     check(planetRadius == 6371000.0 && chunkSize / fineCells == 50.0, "Earth radius retains 50 meter local sampling");
     const Planet planet(42);
+    const auto checkSurfaceNormal = [&planet](Vec direction) {
+        const auto axes = frameAt(direction);
+        constexpr double delta = 0.2 / planetRadius;
+        const Vec dx = planet.surface(unit(direction + axes[0] * delta)) -
+                       planet.surface(unit(direction - axes[0] * delta));
+        const Vec dy = planet.surface(unit(direction + axes[1] * delta)) -
+                       planet.surface(unit(direction - axes[1] * delta));
+        const auto sample = planet.sampleSurface(direction);
+        check(std::abs(sample.elevation - planet.elevation(direction)) < 1e-9 &&
+              dot(sample.normal, unit(cross(dx, dy))) > 0.99999,
+              "procedural terrain normal agrees with finite differences of elevation");
+    };
+    checkSurfaceNormal(unit({-0.4, 1, 0.3}));
+    for (int i = 0; i < 3; ++i) {
+        const Vec center = planet.invokerDirection(i, 0);
+        const Vec tangent = frameAt(center)[0];
+        for (double offset : {100.0, 400.0, 900.0})
+            checkSurfaceNormal(unit(center + tangent * (offset / planetRadius)));
+    }
     const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
     for (const auto& text : {"", "0", "0.3", "nan", "inf", "0.5x", "2.0001"}) {
         bool rejected = false;

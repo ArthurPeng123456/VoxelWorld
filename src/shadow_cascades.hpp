@@ -1,9 +1,9 @@
 #pragma once
+#include "render_settings.hpp"
 #include "terrain.hpp"
 
 namespace voxel {
 constexpr int shadowCascadeCount = 4;
-constexpr int shadowResolution = 1024;
 struct ShadowCascade {
     std::array<std::array<double, 4>, 3> rows{};
     double farDistance{}, texelSize{}, depthBias{};
@@ -19,10 +19,11 @@ struct ShadowCascades { std::array<ShadowCascade, shadowCascadeCount> cascades{}
 // CPU fitting and stabilization stay in double. Coordinates are relative to the
 // camera; texel snapping uses the planet's frame, independent of world translation.
 inline ShadowCascades buildShadowCascades(Vec planetEye, Vec right, Vec up, Vec forward,
-                                        double nearPlane, double farPlane, double aspect, Vec sun) {
+                                        double nearPlane, double farPlane, double aspect, Vec sun,
+                                        const RenderSettings& settings = {}) {
     ShadowCascades result;
     const double altitude = std::max(0.0, length(planetEye) - planetRadius);
-    const double farDistance = std::min(farPlane, std::clamp(10000 + altitude * 4, 10000.0, 200000.0));
+    const double farDistance = std::min({farPlane, 10000 + altitude * 4, settings.shadowDistanceKm * 1000});
     if (nearPlane >= farDistance || nearPlane <= 0 || aspect <= 0) return result;
     result.enabled = true;
     const Vec z = unit(sun) * -1;
@@ -31,8 +32,8 @@ inline ShadowCascades buildShadowCascades(Vec planetEye, Vec right, Vec up, Vec 
     double previous = nearPlane;
     for (int i = 0; i < shadowCascadeCount; ++i) {
         const double t = double(i + 1) / shadowCascadeCount;
-        const double split = 0.85 * nearPlane * std::pow(farDistance / nearPlane, t)
-                           + 0.15 * (nearPlane + (farDistance - nearPlane) * t);
+        const double split = settings.shadowSplitBlend * nearPlane * std::pow(farDistance / nearPlane, t)
+                           + (1 - settings.shadowSplitBlend) * (nearPlane + (farDistance - nearPlane) * t);
         // Overlap the fitted intervals for smooth blending at cascade boundaries.
         const double first = i ? previous - (previous - nearPlane) * 0.12 : nearPlane;
         const Vec center = forward * ((first + split) * 0.5);
@@ -45,8 +46,9 @@ inline ShadowCascades buildShadowCascades(Vec planetEye, Vec right, Vec up, Vec 
         double radius = 0;
         for (Vec p : corners) radius = std::max(radius, length(p - center));
         radius = std::ceil(radius * 16) / 16;
-        radius *= 1 + 4.0 / shadowResolution; // Reserve a PCF / texel-snapping border.
-        const double texel = 2 * radius / shadowResolution;
+        const double border = 2 + 2 * std::max(1.0, settings.shadowNormalBias);
+        radius *= 1 + border / settings.shadowResolution; // Reserve a PCF / texel-snapping border.
+        const double texel = 2 * radius / settings.shadowResolution;
         const Vec planetCenter = planetEye + center;
         const double cx = std::round(dot(planetCenter, x) / texel) * texel - dot(planetEye, x);
         const double cy = std::round(dot(planetCenter, y) / texel) * texel - dot(planetEye, y);
@@ -58,7 +60,7 @@ inline ShadowCascades buildShadowCascades(Vec planetEye, Vec right, Vec up, Vec 
                          {z.x / (2 * extent), z.y / (2 * extent), z.z / (2 * extent), -lowZ / (2 * extent)}}};
         cascade.farDistance = split;
         cascade.texelSize = texel;
-        cascade.depthBias = 0.1 * texel / (2 * extent);
+        cascade.depthBias = settings.shadowDepthBias * 0.1 * texel / (2 * extent);
         previous = split;
     }
     return result;

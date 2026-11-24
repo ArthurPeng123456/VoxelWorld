@@ -26,9 +26,9 @@ constexpr DXGI_FORMAT hdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 struct FrameConstants {
     float camera[40]{};
     float shadowRows[4][3][4]{};
-    float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{};
+    float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{}, scattering[4]{};
 };
-static_assert(sizeof(FrameConstants) == 108 * sizeof(float));
+static_assert(sizeof(FrameConstants) == 112 * sizeof(float));
 
 struct RelativeBounds {
     Vec center, extent;
@@ -257,17 +257,6 @@ struct Dx12Renderer::Impl {
         D3D12_DEPTH_STENCIL_VIEW_DESC view{};
         view.Format = depthFormat; view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         device->CreateDepthStencilView(depth.Get(), &view, depthTarget(0));
-        if (!shadows) {
-            clear.DepthStencil.Depth = 1;
-            texture(shadows, shadowResolution, shadowResolution, shadowCascadeCount, DXGI_FORMAT_R32_TYPELESS,
-                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, clear);
-            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-            view.Texture2DArray.ArraySize = 1;
-            for (UINT i = 0; i < shadowCascadeCount; ++i) {
-                view.Texture2DArray.FirstArraySlice = i;
-                device->CreateDepthStencilView(shadows.Get(), &view, depthTarget(i + 1));
-            }
-        }
         D3D12_SHADER_RESOURCE_VIEW_DESC shader{};
         shader.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         shader.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -279,10 +268,35 @@ struct Dx12Renderer::Impl {
         device->CreateShaderResourceView(hdr.Get(), &shader, shaderView(4));
         shader.Format = DXGI_FORMAT_R32_FLOAT;
         device->CreateShaderResourceView(depth.Get(), &shader, shaderView(2));
+    }
+
+    void setShadowResolution(int resolution) {
+        if (!validShadowResolution(resolution)) throw std::invalid_argument("Shadow resolution must be 1024, 2048 or 4096");
+        if (shadowResolution == UINT(resolution)) return;
+        wait();
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = depthFormat;
+        clear.DepthStencil.Depth = 1;
+        ComPtr<ID3D12Resource> next;
+        texture(next, UINT(resolution), UINT(resolution), shadowCascadeCount, DXGI_FORMAT_R32_TYPELESS,
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, clear);
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        view.Format = depthFormat;
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray.ArraySize = 1;
+        for (UINT i = 0; i < shadowCascadeCount; ++i) {
+            view.Texture2DArray.FirstArraySlice = i;
+            device->CreateDepthStencilView(next.Get(), &view, depthTarget(i + 1));
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC shader{};
+        shader.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        shader.Format = DXGI_FORMAT_R32_FLOAT;
         shader.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        shader.Texture2DArray.MostDetailedMip = 0; shader.Texture2DArray.MipLevels = 1;
-        shader.Texture2DArray.FirstArraySlice = 0; shader.Texture2DArray.ArraySize = shadowCascadeCount;
-        device->CreateShaderResourceView(shadows.Get(), &shader, shaderView(3));
+        shader.Texture2DArray.MipLevels = 1;
+        shader.Texture2DArray.ArraySize = shadowCascadeCount;
+        device->CreateShaderResourceView(next.Get(), &shader, shaderView(3));
+        shadows = std::move(next);
+        shadowResolution = UINT(resolution);
     }
 
     void createPipelines() {
@@ -474,6 +488,7 @@ struct Dx12Renderer::Impl {
     void inspect(const Readback& color, const Readback& sceneDepth, const Readback& normals,
                  const std::array<Readback, 4>& maps, const std::filesystem::path& capture) {
         lastDiagnostics = {}; lastDiagnostics.debugLayer = debugLayer;
+        lastDiagnostics.shadowResolution = maps.front().footprint.Footprint.Width;
         readRows(color, [&](UINT, const std::uint8_t* row) {
             const auto* values = reinterpret_cast<const std::uint16_t*>(row);
             for (UINT x = 0; x < width; ++x) for (int c = 0; c < 3; ++c) {
@@ -497,7 +512,7 @@ struct Dx12Renderer::Impl {
         for (int cascade = 0; cascade < shadowCascadeCount; ++cascade) {
             readRows(maps[cascade], [&](UINT, const std::uint8_t* row) {
                 const auto* values = reinterpret_cast<const float*>(row);
-                for (int x = 0; x < shadowResolution; ++x) {
+                for (UINT x = 0; x < maps[cascade].footprint.Footprint.Width; ++x) {
                     if (!std::isfinite(values[x]) || values[x] < 0 || values[x] > 1) ++lastDiagnostics.invalidValues;
                     if (values[x] < 1) ++lastDiagnostics.shadowPixels[cascade];
                 }
@@ -508,6 +523,7 @@ struct Dx12Renderer::Impl {
         report << "gbuffer_geometry_pixels=" << lastDiagnostics.geometryPixels
                << "\nhdr_max_component=" << lastDiagnostics.maxHdrComponent
                << "\ninvalid_gpu_values=" << lastDiagnostics.invalidValues
+               << "\nshadow_resolution=" << lastDiagnostics.shadowResolution
                << "\nd3d12_debug_layer=" << debugLayer << '\n';
         for (int i = 0; i < shadowCascadeCount; ++i) report << "cascade_" << i << "_depth_pixels=" << lastDiagnostics.shadowPixels[i] << '\n';
         if (lastDiagnostics.invalidValues) throw std::runtime_error("Pipeline validation found invalid GPU values");
@@ -524,6 +540,8 @@ struct Dx12Renderer::Impl {
             createTargets();
         }
         if (infoQueue) infoQueue->ClearStoredMessages();
+        const auto& settings = camera.settings;
+        setShadowResolution(settings.shadowResolution);
         upload(objects, vertices);
         FrameConstants frame{};
         const Vec sun = unit(Vec{0.45,0.25,0.86});
@@ -533,17 +551,18 @@ struct Dx12Renderer::Impl {
         const float xScale = float(1.92 * double(height) / width), yScale = 1.92f;
         const float constants[] = {
             ex.hi,ey.hi,ez.hi,0,ex.lo,ey.lo,ez.lo,0,
-            float(camera.right.x),float(camera.right.y),float(camera.right.z),camera.atmosphereEnabled ? 1.0f : 0.0f,
+            float(camera.right.x),float(camera.right.y),float(camera.right.z),settings.atmosphereEnabled ? 1.0f : 0.0f,
             float(camera.up.x),float(camera.up.y),float(camera.up.z),0,
             float(camera.forward.x),float(camera.forward.y),float(camera.forward.z),0,
             xScale,yScale,float(camera.nearPlane),float(camera.farPlane),
             float(sun.x),float(sun.y),float(sun.z),camera.lodTint ? 1.0f : 0.0f,
             px.hi,py.hi,pz.hi,0,px.lo,py.lo,pz.lo,0,
-            float(planetRadius),float(planetRadius + atmosphereHeight),8000,1200
+            float(planetRadius),float(planetRadius + settings.atmosphereHeightKm * 1000),
+            float(settings.rayleighHeightKm * 1000),float(settings.mieHeightKm * 1000)
         };
         std::copy(std::begin(constants), std::end(constants), frame.camera);
         const auto csm = buildShadowCascades(planetEye, camera.right, camera.up, camera.forward,
-            camera.nearPlane, camera.farPlane, double(width) / height, sun);
+            camera.nearPlane, camera.farPlane, double(width) / height, sun, settings);
         for (int i = 0; i < shadowCascadeCount; ++i) {
             for (int row = 0; row < 3; ++row) for (int c = 0; c < 4; ++c)
                 frame.shadowRows[i][row][c] = float(csm.cascades[i].rows[row][c]);
@@ -551,11 +570,15 @@ struct Dx12Renderer::Impl {
             frame.texels[i] = float(csm.cascades[i].texelSize);
             frame.biases[i] = float(csm.cascades[i].depthBias);
         }
-        frame.shadow[0] = camera.shadowsEnabled && csm.enabled ? 1.0f : 0.0f;
+        frame.shadow[0] = settings.shadowsEnabled && csm.enabled ? 1.0f : 0.0f;
         frame.shadow[1] = 1.0f / shadowResolution;
+        frame.shadow[2] = float(settings.shadowNormalBias);
         frame.render[0] = float(width); frame.render[1] = float(height);
-        frame.render[2] = float(std::exp2(std::clamp(camera.exposureEV, -10.0, 10.0)));
-        frame.render[3] = camera.wireframe ? 1.0f : 0.0f;
+        frame.render[2] = float(std::exp2(settings.exposureEV));
+        frame.render[3] = float(settings.toneMapping);
+        frame.scattering[0] = float(settings.rayleighStrength);
+        frame.scattering[1] = float(settings.mieStrength);
+        frame.scattering[2] = float(settings.mieAnisotropy);
         void* mapped = nullptr; const D3D12_RANGE noReads{0,0};
         require(frameUpload->Map(0, &noReads, &mapped), "Map frame constants");
         std::memcpy(mapped, &frame, sizeof(frame));
@@ -588,19 +611,21 @@ struct Dx12Renderer::Impl {
             drawBatch(objects.view, objects.count);
         };
         // Four conventional-depth CSM layers; scene depth remains reverse Z.
-        transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        const D3D12_VIEWPORT shadowViewport{0,0,float(shadowResolution),float(shadowResolution),0,1};
-        const D3D12_RECT shadowScissor{0,0,shadowResolution,shadowResolution};
-        list->RSSetViewports(1, &shadowViewport); list->RSSetScissorRects(1, &shadowScissor);
-        list->SetPipelineState(shadowPipeline.Get());
-        for (UINT i = 0; i < shadowCascadeCount; ++i) {
-            const auto dsvHandle = depthTarget(i + 1);
-            list->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
-            list->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
-            list->SetGraphicsRoot32BitConstant(1, i, 0);
-            if (frame.shadow[0] > 0) geometry(casters[i]);
+        if (frame.shadow[0] > 0 || inspectPipeline) {
+            transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            const D3D12_VIEWPORT shadowViewport{0,0,float(shadowResolution),float(shadowResolution),0,1};
+            const D3D12_RECT shadowScissor{0,0,LONG(shadowResolution),LONG(shadowResolution)};
+            list->RSSetViewports(1, &shadowViewport); list->RSSetScissorRects(1, &shadowScissor);
+            list->SetPipelineState(shadowPipeline.Get());
+            for (UINT i = 0; i < shadowCascadeCount; ++i) {
+                const auto dsvHandle = depthTarget(i + 1);
+                list->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
+                list->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+                list->SetGraphicsRoot32BitConstant(1, i, 0);
+                if (frame.shadow[0] > 0) geometry(casters[i]);
+            }
+            transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
-        transition(*list.Get(), shadows.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const D3D12_VIEWPORT viewport{0,0,float(width),float(height),0,1};
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
         list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
@@ -665,7 +690,7 @@ struct Dx12Renderer::Impl {
     HWND window;
     bool warp{}, submitted{}, debugLayer{};
     RenderDiagnostics lastDiagnostics;
-    UINT width{}, height{}, rtvSize{}, dsvSize{}, srvSize{};
+    UINT width{}, height{}, rtvSize{}, dsvSize{}, srvSize{}, shadowResolution{};
     UINT64 lastFence{};
     HANDLE completed{};
     ComPtr<ID3D12Device> device;
@@ -704,6 +729,7 @@ void Dx12Renderer::setTerrainPage(Key page, Box bounds, const std::vector<Vertex
     }
 }
 void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
+void Dx12Renderer::setShadowResolution(int resolution) { impl_->setShadowResolution(resolution); }
 void Dx12Renderer::draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture, bool inspectPipeline) {
     impl_->draw(camera, objects, capture, inspectPipeline);
 }

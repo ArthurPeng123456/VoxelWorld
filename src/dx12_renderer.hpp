@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render_coordinates.hpp"
+#include "render_settings.hpp"
 
 #include <windows.h>
 
@@ -13,15 +14,14 @@ struct Camera {
     double nearPlane, farPlane;
     bool lodTint, wireframe;
     Vec planetCenter{};
-    bool atmosphereEnabled{true};
-    double exposureEV{};
-    bool shadowsEnabled{true};
+    RenderSettings settings{};
 };
 
 struct RenderDiagnostics {
     double maxHdrComponent{};
     std::size_t geometryPixels{}, invalidValues{};
     std::array<std::size_t, 4> shadowPixels{};
+    unsigned shadowResolution{};
     bool debugLayer{};
 };
 
@@ -33,6 +33,7 @@ public:
     void clearTerrain();
     void setTerrainPage(Key page, Box bounds, const std::vector<Vertex>& vertices);
     void setClipmapLines(const std::vector<Vertex>& lines);
+    void setShadowResolution(int resolution);
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {}, bool inspectPipeline = false);
     RenderDiagnostics diagnostics() const;
     bool isWarp() const;

@@ -1,4 +1,5 @@
 #include "render_coordinates.hpp"
+#include "render_settings.hpp"
 #include "shaders.hpp"
 #include "precision_test_shader.hpp"
 #include "post_process.hpp"
@@ -102,12 +103,16 @@ int main(int argc, char** argv) {
         require(device->CreateUnorderedAccessView(outputBuffer.Get(), nullptr, &uav), "Create output UAV");
         context->CSSetShader(cs.Get(), nullptr, 0);
         const Vec sun = unit(Vec{0.45, 0.25, 0.86});
-        float camera[108]{};
+        constexpr RenderSettings defaults;
+        float camera[112]{};
         camera[11] = 1; // Atmosphere enabled, matching the viewer default.
         camera[24] = float(sun.x); camera[25] = float(sun.y); camera[26] = float(sun.z);
-        camera[36] = float(planetRadius); camera[37] = float(planetRadius + atmosphereHeight);
-        camera[38] = 8000; camera[39] = 1200;
+        camera[36] = float(planetRadius); camera[37] = float(planetRadius + defaults.atmosphereHeightKm * 1000);
+        camera[38] = float(defaults.rayleighHeightKm * 1000); camera[39] = float(defaults.mieHeightKm * 1000);
         camera[106] = 1;
+        camera[108] = float(defaults.rayleighStrength);
+        camera[109] = float(defaults.mieStrength);
+        camera[110] = float(defaults.mieAnisotropy);
         D3D11_BUFFER_DESC cbDesc{};
         cbDesc.ByteWidth = sizeof(camera); cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
         cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
