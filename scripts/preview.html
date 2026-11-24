@@ -54,17 +54,21 @@ function start() {
   }
   const vertex = compile(gl.VERTEX_SHADER, `#version 300 es
     layout(location=0) in vec3 point;
+    layout(location=2) in vec3 pointLow;
     layout(location=1) in uint level;
-    uniform vec3 eye, right, up, forward;
+    uniform vec3 eye, eyeLow, right, up, forward;
     uniform vec4 projection;
     out vec3 world;
     flat out uint lod;
     void main() {
-      vec3 relative = point - eye;
+      vec3 s = point - eye;
+      vec3 v = s - point;
+      vec3 e = (point - (s - v)) + (-eye - v);
+      vec3 relative = s + (e + pointLow - eyeLow);
       float depth = dot(relative, forward);
       gl_Position = vec4(dot(relative,right)*projection.x, dot(relative,up)*projection.y,
                          depth*projection.z + projection.w, depth);
-      world = point;
+      world = relative;
       lod = level;
     }`);
   const fragment = compile(gl.FRAGMENT_SHADER, `#version 300 es
@@ -72,7 +76,7 @@ function start() {
     precision highp int;
     in vec3 world;
     flat in uint lod;
-    uniform vec3 sun, forward;
+    uniform vec3 sun, forward, eye, eyeLow;
     uniform bool useTint, wireMode;
     out vec4 color;
     void main() {
@@ -81,12 +85,13 @@ function start() {
         if (lod == 1u) color = vec4(.40,1,.54,1);
         if (lod == 2u) color = vec4(1,.76,.28,1);
         if (lod == 3u) color = vec4(.81,.53,1,1);
+        if (lod >= 4u) color = vec4(mix(vec3(.95,.35,.22),vec3(.12,.22,.46),clamp((float(lod)-4.0)/8.0,0.0,1.0)),1);
         return;
       }
-      vec3 radial = normalize(world);
+      vec3 radial = normalize(world + eye + eyeLow);
       vec3 n = normalize(cross(dFdx(world), dFdy(world)));
       if (dot(n,radial) < 0.0) n = -n;
-      float height = clamp((length(world)-24940.0)/850.0, 0.0, 1.0);
+      float height = clamp((length(world + eye + eyeLow)-6370340.0)/850.0, 0.0, 1.0);
       float rock = clamp(2.4 * (1.0 - dot(n,radial)), 0.0, 1.0);
       vec3 tone = vec3(.35,.41,.47) + vec3(.31,.18,.06)*height + vec3(.09,.04,.03)*rock;
       if (useTint) {
@@ -94,6 +99,7 @@ function start() {
         if (lod == 1u) tone=vec3(.32,.70,.43);
         if (lod == 2u) tone=vec3(.87,.65,.28);
         if (lod == 3u) tone=vec3(.54,.46,.68);
+        if (lod >= 4u) tone=mix(vec3(.95,.35,.22),vec3(.12,.22,.46),clamp((float(lod)-4.0)/8.0,0.0,1.0));
       }
       float rim = pow(1.0 - abs(dot(n,forward)),3.0);
       color = vec4(tone*(.26+.74*max(0.0,dot(n,sun))) + rim*vec3(.03,.046,.07), 1.0);
@@ -105,11 +111,11 @@ function start() {
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
   gl.useProgram(program);
   const uniforms = {};
-  for (const key of ['eye','right','up','forward','projection','sun','useTint','wireMode']) {
+  for (const key of ['eye','eyeLow','right','up','forward','projection','sun','useTint','wireMode']) {
     uniforms[key] = gl.getUniformLocation(program, key);
   }
   const decode = (encoded) => Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
-  const positions = new Int16Array(decode(mesh.positions).buffer);
+  const positions = new Float64Array(decode(mesh.positions).buffer);
   const levels = decode(mesh.levels);
   const vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
@@ -118,8 +124,15 @@ function start() {
     gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(index);
   }
-  attribute(0, positions);
-  gl.vertexAttribPointer(0, 3, gl.SHORT, false, 0, 0);
+  const uploadPoints = (points) => {
+    const hi = new Float32Array(points.length), lo = new Float32Array(points.length);
+    for (let i = 0; i < points.length; ++i) { hi[i] = points[i]; lo[i] = points[i] - hi[i]; }
+    attribute(0, hi);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    attribute(2, lo);
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+  };
+  uploadPoints(positions);
   attribute(1, levels);
   gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_BYTE, 0, 0);
   const wires = gl.createVertexArray();
@@ -137,8 +150,7 @@ function start() {
   }
   ranges.disabled = lineLevels.length === 0;
   gl.bindVertexArray(wires);
-  attribute(0, new Float32Array(linePoints));
-  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  uploadPoints(linePoints);
   attribute(1, new Uint8Array(lineLevels));
   gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_BYTE, 0, 0);
   gl.enable(gl.DEPTH_TEST);
@@ -154,7 +166,7 @@ function start() {
   let local = initial.get('view') === 'surface', useTint = initial.get('lod') === '1';
   let showRanges = initial.get('ranges') === '1' && lineLevels.length !== 0;
   let selected = clamp((parseInt(initial.get('invoker'), 10) || 1) - 1, 0, mesh.invokers.length - 1);
-  let yaw = .13, pitch = .16, distance = 64100;
+  let yaw = .13, pitch = .16, distance = 2.5 * 6371000;
   let bearing = .42, elevation = .90, surfaceDistance = 1950;
   let updateQueued = false, previous = null;
   const count = (levels.length / 3).toLocaleString('zh-CN');
@@ -179,14 +191,15 @@ function start() {
       center = [0,0,0];
       eye = mul(add(add(mul(radial,Math.cos(yaw)*Math.cos(pitch)),mul(x,Math.sin(yaw)*Math.cos(pitch))),mul(y,Math.sin(pitch))),distance);
       nominalUp = y;
-      near = Math.max(12,(distance-25600)*.03);
+      near = Math.max(12,(distance-6371000)*.03);
     }
     const forward = unit(sub(center,eye)), right = unit(cross(forward,nominalUp)), up = unit(cross(right,forward));
     const sun = unit(add(add(mul(right,-.68),mul(up,.6)),mul(forward,-.64)));
-    const far = 270000;
+    const far = 20 * 6371000;
     gl.viewport(0,0,width,height);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    for (const [key, value] of Object.entries({eye,right,up,forward,sun})) gl.uniform3fv(uniforms[key], value);
+    const eyeHi = eye.map(Math.fround), eyeLow = eye.map((x, i) => x - eyeHi[i]);
+    for (const [key, value] of Object.entries({eye:eyeHi,eyeLow,right,up,forward,sun})) gl.uniform3fv(uniforms[key], value);
     gl.uniform4f(uniforms.projection, 1.92*height/width, 1.92, (far+near)/(far-near), -2*near*far/(far-near));
     gl.uniform1i(uniforms.useTint, useTint ? 1 : 0);
     gl.uniform1i(uniforms.wireMode, 0);
@@ -209,9 +222,9 @@ function start() {
     surface.setAttribute('aria-pressed', String(local));
     tint.setAttribute('aria-pressed', String(useTint));
     ranges.setAttribute('aria-pressed', String(showRanges));
-    const legend = useTint || showRanges ? ' · 青 50 m / 绿 100 m / 金 200 m / 紫 400 m' : '';
+    const legend = useTint || showRanges ? ' · 青 50 m / 绿 100 m / 金 200 m / 紫 400 m / LOD 4+ 红至蓝，间距逐级翻倍' : '';
     const camera = mesh.camera ? ' + 导出摄像机' : '';
-    status.textContent = `25.6 km 基准半径 · ${count} 个三角形 · Invoker ${selected + 1}/${mesh.invokers.length}${camera}${legend}`;
+    status.textContent = `6,371 km 基准半径 · ${count} 个三角形 · Invoker ${selected + 1}/${mesh.invokers.length}${camera}${legend}`;
     schedule();
   }
   orbit.onclick = () => { local = false; updateControls(); };
@@ -237,7 +250,7 @@ function start() {
     e.preventDefault();
     const zoom = Math.exp(clamp(e.deltaY,-200,200)*.0017);
     if (local) surfaceDistance = clamp(surfaceDistance*zoom,150,10500);
-    else distance = clamp(distance*zoom,37000,171000);
+    else distance = clamp(distance*zoom,1.02*6371000,8*6371000);
     schedule();
   }, {passive:false});
   new ResizeObserver(schedule).observe(canvas);

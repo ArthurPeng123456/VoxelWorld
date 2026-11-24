@@ -18,6 +18,16 @@ std::array<float, 8> Storage::corners(Key index) const {
 
 namespace {
 
+class Constant final : public Storage {
+public:
+    explicit Constant(float value) : value_(value) {}
+    float get(int, int, int) const override { return value_; }
+    std::array<float, 8> corners(Key) const override { std::array<float, 8> r; r.fill(value_); return r; }
+    std::size_t bytes() const override { return sizeof(*this); }
+private:
+    float value_;
+};
+
 std::size_t linear(int n, int x, int y, int z) {
     return (std::size_t(z) * n + y) * n + x;
 }
@@ -197,6 +207,8 @@ private:
 
 std::unique_ptr<Storage> makeStorage(Method method, int count, const std::vector<float>& values,
                                      bool morton, double spacing, Vec origin) {
+    if (!values.empty() && std::all_of(values.begin(), values.end(), [&](float v) { return v == values.front(); }))
+        return std::make_unique<Constant>(values.front());
     switch (method) {
         case Method::Mesh: return std::make_unique<Dense>(count, values, false);
         case Method::Grid: return std::make_unique<Dense>(count, values, morton);

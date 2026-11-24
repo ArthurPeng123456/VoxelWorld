@@ -1,4 +1,5 @@
 #include "dx12_renderer.hpp"
+#include "shaders.hpp"
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -27,66 +28,10 @@ void require(HRESULT result, const char* operation) {
     throw std::runtime_error(error.str());
 }
 
-constexpr char shaderSource[] = R"hlsl(
-cbuffer Camera : register(b0) {
-    float4 cameraEye, cameraRight, cameraUp, cameraForward;
-    float4 projection;
-    float4 sunlight;
-};
-
-struct Surface { float4 clip : SV_Position; float3 normal : NORMAL; float4 material : COLOR; };
-
-Surface surfaceVS(float3 position : POSITION, float3 normal : NORMAL, float4 material : COLOR) {
-    float3 relative = position - cameraEye.xyz;
-    float depth = dot(relative, cameraForward.xyz);
-    Surface result;
-    result.clip = float4(dot(relative, cameraRight.xyz) * projection.x,
-                         dot(relative, cameraUp.xyz) * projection.y,
-                         (depth - projection.z) * projection.w, depth);
-    result.normal = normal;
-    result.material = material;
-    return result;
-}
-
-float4 surfacePS(Surface input) : SV_Target {
-    float3 normal = normalize(input.normal);
-    float diffuse = max(0, dot(normal, sunlight.xyz));
-    int code = int(round(input.material.a * 255));
-    float3 color = input.material.rgb;
-    if (code <= 3 && sunlight.w > 0.5) {
-        if (code == 0) color = float3(0.19, 0.72, 0.83);
-        if (code == 1) color = float3(0.28, 0.63, 0.38);
-        if (code == 2) color = float3(0.81, 0.63, 0.29);
-        if (code == 3) color = float3(0.53, 0.43, 0.64);
-    }
-    if (code == 255) return float4(color, 1);
-    float rim = pow(saturate(1 - abs(dot(cameraForward.xyz, normal))), 3);
-    return float4(color * (0.25 + 0.75 * diffuse) + rim * float3(0.030, 0.046, 0.070), 1);
-}
-
-struct Sky { float4 clip : SV_Position; float2 position : TEXCOORD; };
-
-Sky skyVS(uint id : SV_VertexID) {
-    Sky result;
-    result.position = float2(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0);
-    result.clip = float4(result.position, 0, 1);
-    return result;
-}
-
-float4 skyPS(Sky input) : SV_Target {
-    float glow = saturate(1 - 0.65 * length(input.position - float2(-0.3, 0.25)));
-    float2 tile = floor(input.clip.xy / 6);
-    float variation = frac(sin(dot(tile, float2(127.1, 311.7))) * 43758.5453);
-    float star = (variation > 0.982 && length(frac(input.clip.xy / 6) - 0.42) < 0.13)
-        ? 0.15 + (variation - 0.982) * 12 : 0;
-    return float4(float3(0.015, 0.022, 0.040) + glow * float3(0.020, 0.031, 0.055) + star, 1);
-}
-)hlsl";
-
 ComPtr<ID3DBlob> compile(const char* entry, const char* profile) {
     ComPtr<ID3DBlob> shader, message;
     const HRESULT result = D3DCompile(shaderSource, sizeof(shaderSource) - 1, "VoxelWorld", nullptr, nullptr,
-                                      entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                      entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
                                       0, shader.GetAddressOf(), message.GetAddressOf());
     if (FAILED(result) && message) {
         throw std::runtime_error(std::string(static_cast<const char*>(message->GetBufferPointer()), message->GetBufferSize()));
@@ -229,7 +174,7 @@ struct Dx12Renderer::Impl {
         const auto properties = heap(D3D12_HEAP_TYPE_DEFAULT);
         D3D12_CLEAR_VALUE clear{};
         clear.Format = depthFormat;
-        clear.DepthStencil.Depth = 1;
+        clear.DepthStencil.Depth = 0;
         require(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                                  &clear, IID_PPV_ARGS(depth.GetAddressOf())), "Create depth buffer");
         device->CreateDepthStencilView(depth.Get(), nullptr, dsv->GetCPUDescriptorHandleForHeapStart());
@@ -238,7 +183,7 @@ struct Dx12Renderer::Impl {
     void createPipelines() {
         D3D12_ROOT_PARAMETER constants{};
         constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        constants.Constants.Num32BitValues = 24;
+        constants.Constants.Num32BitValues = 40;
         constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC desc{};
         desc.NumParameters = 1;
@@ -250,10 +195,11 @@ struct Dx12Renderer::Impl {
 
         constexpr D3D12_INPUT_ELEMENT_DESC inputs[] = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"COLOR", 0, pixelFormat, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
+            {"POSITION", 1, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, pixelFormat, 0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
         };
-        static_assert(sizeof(Vertex) == 28);
+        static_assert(sizeof(GpuVertex) == 40);
         const auto vs = compile("surfaceVS", "vs_5_0"), ps = compile("surfacePS", "ps_5_0");
         D3D12_GRAPHICS_PIPELINE_STATE_DESC state{};
         state.pRootSignature = root.Get();
@@ -268,7 +214,7 @@ struct Dx12Renderer::Impl {
                                            D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
         state.DepthStencilState.DepthEnable = TRUE;
         state.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        state.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        state.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
         state.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
         state.DepthStencilState.BackFace = state.DepthStencilState.FrontFace;
         state.InputLayout = {inputs, UINT(std::size(inputs))};
@@ -279,9 +225,19 @@ struct Dx12Renderer::Impl {
         state.SampleDesc.Count = 1;
         require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(surfacePipeline.GetAddressOf())), "Create surface pipeline");
 
+        state.PS = {};
+        state.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+        require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(depthPipeline.GetAddressOf())), "Create wireframe depth pipeline");
+        state.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        state.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
         state.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        state.RasterizerState.DepthBias = 2;
+        state.RasterizerState.SlopeScaledDepthBias = 1;
         require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(wireframePipeline.GetAddressOf())), "Create wireframe pipeline");
         state.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        state.RasterizerState.DepthBias = 0;
+        state.RasterizerState.SlopeScaledDepthBias = 0;
 
         state.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         state.DepthStencilState.DepthEnable = FALSE;
@@ -292,6 +248,8 @@ struct Dx12Renderer::Impl {
         state.VS = {skyVs->GetBufferPointer(), skyVs->GetBufferSize()};
         state.PS = {skyPs->GetBufferPointer(), skyPs->GetBufferSize()};
         state.InputLayout = {};
+        state.DepthStencilState.DepthEnable = TRUE;
+        state.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         state.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         require(device->CreateGraphicsPipelineState(&state, IID_PPV_ARGS(skyPipeline.GetAddressOf())), "Create sky pipeline");
     }
@@ -309,7 +267,7 @@ struct Dx12Renderer::Impl {
     }
 
     void upload(Upload& result, const std::vector<Vertex>& vertices) {
-        const UINT64 size = UINT64(vertices.size()) * sizeof(Vertex);
+        const UINT64 size = UINT64(vertices.size()) * sizeof(GpuVertex);
         if (size > std::numeric_limits<UINT>::max()) throw std::runtime_error("Vertex buffer is too large");
         result.count = UINT(vertices.size());
         if (!size) return;
@@ -323,10 +281,11 @@ struct Dx12Renderer::Impl {
         void* pointer = nullptr;
         const D3D12_RANGE noReads{0, 0};
         require(result.resource->Map(0, &noReads, &pointer), "Map vertex buffer");
-        std::memcpy(pointer, vertices.data(), std::size_t(size));
+        auto* packed = static_cast<GpuVertex*>(pointer);
+        for (const auto& vertex : vertices) *packed++ = packVertex(vertex);
         const D3D12_RANGE written{0, SIZE_T(size)};
         result.resource->Unmap(0, &written);
-        result.view = {result.resource->GetGPUVirtualAddress(), UINT(size), UINT(sizeof(Vertex))};
+        result.view = {result.resource->GetGPUVirtualAddress(), UINT(size), UINT(sizeof(GpuVertex))};
     }
 
     void draw(const Camera& camera, const std::vector<Vertex>& vertices, const std::filesystem::path& capture) {
@@ -349,32 +308,48 @@ struct Dx12Renderer::Impl {
         const auto rtvHandle = target(frame), dsvHandle = dsv->GetCPUDescriptorHandleForHeapStart();
         transition(*list.Get(), back[frame].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
-        list->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+        list->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 0, 0, 0, nullptr);
         const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->SetGraphicsRootSignature(root.Get());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const Vec sun = unit(camera.right * -0.68 + camera.up * 0.60 - camera.forward * 0.64);
-        constexpr float vertical = 1.92f;
+        // Fixed world-space sun: lighting does not rotate when the camera turns.
+        const Vec sun = unit(Vec{0.45, 0.25, 0.86});
+        constexpr double vertical = 1.92;
+        const auto ex = splitDouble(camera.eye.x), ey = splitDouble(camera.eye.y), ez = splitDouble(camera.eye.z);
+        const Vec planetEye = camera.eye - camera.planetCenter;
+        const auto px = splitDouble(planetEye.x), py = splitDouble(planetEye.y), pz = splitDouble(planetEye.z);
         const float constants[] = {
-            float(camera.eye.x), float(camera.eye.y), float(camera.eye.z), 0,
-            float(camera.right.x), float(camera.right.y), float(camera.right.z), 0,
+            ex.hi, ey.hi, ez.hi, 0, ex.lo, ey.lo, ez.lo, 0,
+            float(camera.right.x), float(camera.right.y), float(camera.right.z), camera.atmosphereEnabled ? 1.0f : 0.0f,
             float(camera.up.x), float(camera.up.y), float(camera.up.z), 0,
             float(camera.forward.x), float(camera.forward.y), float(camera.forward.z), 0,
-            vertical * float(height) / float(width), vertical, float(camera.nearPlane),
-            float(camera.farPlane / (camera.farPlane - camera.nearPlane)),
-            float(sun.x), float(sun.y), float(sun.z), camera.lodTint ? 1.0f : 0.0f
+            float(vertical * double(height) / double(width)), float(vertical),
+            float(camera.nearPlane), float(camera.farPlane),
+            float(sun.x), float(sun.y), float(sun.z), camera.lodTint ? 1.0f : 0.0f,
+            px.hi, py.hi, pz.hi, 0, px.lo, py.lo, pz.lo, 0,
+            float(planetRadius), float(planetRadius + atmosphereHeight), 8000, 1200
         };
+        static_assert(std::size(constants) == 40);
         list->SetGraphicsRoot32BitConstants(0, UINT(std::size(constants)), constants, 0);
         list->DrawInstanced(3, 1, 0, 0);
-        list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get());
-        for (const auto* batch : {&terrain, &objects}) {
-            if (batch->count == 0) continue;
-            list->IASetVertexBuffers(0, 1, &batch->view);
-            list->DrawInstanced(batch->count, 1, 0, 0);
+        auto geometry = [&] {
+            for (const auto* batch : {&terrain, &objects}) {
+                if (batch->count == 0) continue;
+                list->IASetVertexBuffers(0, 1, &batch->view);
+                list->DrawInstanced(batch->count, 1, 0, 0);
+            }
+        };
+        if (camera.wireframe) {
+            // Full planetary meshes need hidden-line removal; otherwise the
+            // opposite hemisphere's edges show through the front hemisphere.
+            list->SetPipelineState(depthPipeline.Get());
+            geometry();
         }
+        list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get());
+        geometry();
         if (clipmapLines.count) {
             list->SetPipelineState(linePipeline.Get());
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
@@ -432,7 +407,7 @@ struct Dx12Renderer::Impl {
     std::array<ComPtr<ID3D12Resource>, buffers> back;
     ComPtr<ID3D12Resource> depth;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> skyPipeline, surfacePipeline, wireframePipeline, linePipeline;
+    ComPtr<ID3D12PipelineState> skyPipeline, surfacePipeline, depthPipeline, wireframePipeline, linePipeline;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;

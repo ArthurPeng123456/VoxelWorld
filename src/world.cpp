@@ -55,6 +55,41 @@ constexpr std::size_t chunkMetadata = sizeof(Chunk) + sizeof(Chunks::value_type)
 }  // namespace
 
 std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std::size_t& visits) {
+    std::set<Key> changed;
+    if (global) {
+        std::vector<Key> next;
+        for (std::size_t i = 0; i < invokers.size(); ++i) {
+            Key key = keyAt(invokers[i]);
+            if (global_ && i < anchors_.size()) {
+                const Box retained = bounds(anchors_[i]).expanded(splat(anchorMargin));
+                for (int a = 0; a < 3; ++a)
+                    if (invokers[i][a] >= retained.lo[a] && invokers[i][a] < retained.hi[a]) key[a] = anchors_[i][a];
+            }
+            next.push_back(key);
+        }
+        visits = 0;
+        if (global_ && next == anchors_) return changed;
+        std::vector<Vec> centers;
+        for (Key key : next) centers.push_back(bounds(key).center());
+        auto desired = planetLayout(centers, &visits);
+        for (const auto& entry : layout_) {
+            const auto found = desired.find(entry.first);
+            if (found == desired.end() || found->second != entry.second) changed.insert(entry.first);
+        }
+        for (const auto& entry : desired) {
+            const auto found = layout_.find(entry.first);
+            if (found == layout_.end() || found->second != entry.second) changed.insert(entry.first);
+        }
+        layout_ = std::move(desired);
+        anchors_ = std::move(next);
+        coverage_.clear();
+        global_ = true;
+        return changed;
+    }
+    if (global_) {
+        for (const auto& entry : layout_) changed.insert(entry.first);
+        anchors_.clear(); coverage_.clear(); layout_.clear(); global_ = false;
+    }
     std::set<Key> touched;
     visits = 0;
     for (std::size_t i = 0; i < std::max(anchors_.size(), invokers.size()); ++i) {
@@ -92,13 +127,8 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         else if (has) anchors_.push_back(next);
     }
     anchors_.resize(invokers.size());
-    if (global != global_) {
-        for (const auto& entry : selectChunks({}, true)) touched.insert(entry.first);
-        global_ = global;
-    }
-    std::set<Key> changed;
     for (const Key key : touched) {
-        int lod = global_ ? 3 : -1;
+        int lod = -1;
         const auto found = coverage_.find(key);
         if (found != coverage_.end()) {
             const auto& counts = found->second;
@@ -117,6 +147,15 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
 
 std::vector<ClipmapWindow> Clipmap::windows() const {
     std::vector<ClipmapWindow> result;
+    if (global_) {
+        for (std::size_t i = 0; i < anchors_.size(); ++i) for (int lod = 0; lod < lodCount; ++lod) {
+            const Vec center = bounds(anchors_[i]).center();
+            const double radius = lod < 4 ? chunkSize * radii[lod] : 2 * std::ldexp(chunkSize, lod - 3);
+            const double limit = std::ldexp(chunkSize, rootLevel);
+            result.push_back({i, lod, {max(splat(-limit), center - splat(radius)), min(splat(limit), center + splat(radius))}});
+        }
+        return result;
+    }
     result.reserve(anchors_.size() * 4);
     for (std::size_t i = 0; i < anchors_.size(); ++i) for (int lod = 0; lod < 4; ++lod) {
         const auto box = window(anchors_[i], lod);
@@ -134,30 +173,39 @@ std::size_t Clipmap::bytes() const {
 World::World(const Planet& planet, Method method, bool morton)
     : physics(method, chunks), planet_(planet), method_(method), morton_(morton) {}
 
-World::Batch World::planUpdate(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera) {
+World::Prior World::snapshot() const {
+    Prior prior;
+    for (const auto& entry : chunks) prior.emplace(entry.first, std::make_pair(entry.second->lod, entry.second->neighborhood));
+    return prior;
+}
+
+World::Batch World::planUpdate(Clipmap planned, const Prior& prior, const std::vector<Vec>& sources,
+                              bool global, Clock::time_point start) {
     Batch batch{};
-    batch.start = Clock::now();
-    auto sources = invokers;
-    if (camera) sources.push_back(*camera);
-    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits);
-    const auto& layout = clipmap_.layout();
+    batch.start = start;
+    batch.clipmap = std::move(planned);
+    const auto changed = batch.clipmap.update(sources, global, batch.stats.windowVisits);
+    const auto& layout = batch.clipmap.layout();
     batch.stats.changedOwners = changed.size();
-    pending_.insert(changed.begin(), changed.end());
-    auto dirty = pending_;
-    if (!chunks.empty()) for (const Key key : pending_) {
-        visitBox(window(key, 0), [&](Key neighbor) {
-            if (layout.find(neighbor) != layout.end()) dirty.insert(neighbor);
-        });
+    auto dirty = changed;
+    if (!prior.empty()) for (const Key key : changed) {
+        if (global) {
+            for (Key neighbor : intersectingLeaves(layout, bounds(key).expanded(splat(1e-4)))) dirty.insert(neighbor);
+        } else {
+            visitBox(window(key, 0), [&](Key neighbor) {
+                if (layout.find(neighbor) != layout.end()) dirty.insert(neighbor);
+            });
+        }
     }
     for (const Key key : dirty) {
         const auto desired = layout.find(key);
-        const auto prior = chunks.find(key);
+        const auto previous = prior.find(key);
         if (desired != layout.end()) {
-            if (prior != chunks.end() && prior->second->lod == desired->second &&
-                prior->second->neighborhood == neighborhood(layout, key)) continue;
+            if (previous != prior.end() && previous->second.first == desired->second &&
+                previous->second.second == neighborhood(layout, key)) continue;
             batch.build.push_back(key);
         }
-        if (prior != chunks.end()) batch.remove.push_back(key);
+        if (previous != prior.end()) batch.remove.push_back(key);
     }
     batch.stats.selectMs = milliseconds(batch.start);
     return batch;
@@ -183,45 +231,47 @@ WorldStats World::publish(Batch batch) {
         physics.addTerrain(*inserted.position->second);
     }
     batch.stats.physicsLoadMs = milliseconds(activation);
-    pending_.clear();
+    clipmap_ = std::move(batch.clipmap);
     if (batch.stats.windowVisits != 0) publishedWindows_ = clipmap_.windows();
     batch.stats.updateMs = milliseconds(batch.start);
     return batch.stats;
 }
 
 WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera) {
-    if (building_.valid() || completed_) throw std::logic_error("An asynchronous Clipmap update is pending");
-    auto batch = planUpdate(invokers, global, camera);
-    build(batch, planet_, clipmap_.layout(), method_, morton_);
+    if (building_.valid()) throw std::logic_error("An asynchronous Clipmap update is pending");
+    const auto start = Clock::now();
+    auto sources = invokers;
+    if (camera) sources.push_back(*camera);
+    auto batch = planUpdate(clipmap_, snapshot(), sources, global, start);
+    build(batch, planet_, batch.clipmap.layout(), method_, morton_);
     return publish(std::move(batch));
 }
 
 bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera) {
-    if (building_.valid() || completed_) return false;
-    auto batch = planUpdate(invokers, global, camera);
-    if (batch.build.empty()) {
-        completed_ = publish(std::move(batch));
-    } else {
-        // No subsequent plan mutates the layout until this future has been consumed.
-        building_ = std::async(std::launch::async, [planet = &planet_, layout = &clipmap_.layout(),
-                                                     method = method_, morton = morton_, batch = std::move(batch)]() mutable {
-            build(batch, *planet, *layout, method, morton);
-            return std::move(batch);
-        });
-    }
+    if (building_.valid()) return false;
+    const auto start = Clock::now();
+    auto sources = invokers;
+    sources.push_back(camera);
+    // Copy only immutable scheduling metadata. The worker owns the next tree;
+    // rendering, queries, memory statistics and physics retain the published tree.
+    building_ = std::async(std::launch::async, [planet = &planet_, planned = clipmap_, prior = snapshot(),
+            method = method_, morton = morton_, global, start, sources = std::move(sources)]() mutable {
+        auto batch = planUpdate(std::move(planned), prior, sources, global, start);
+        build(batch, *planet, batch.clipmap.layout(), method, morton);
+        return batch;
+    });
     return true;
 }
 
 std::optional<WorldStats> World::pollUpdate() {
-    if (completed_) return std::exchange(completed_, std::nullopt);
     if (building_.valid() && building_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         return publish(building_.get());
     }
     return std::nullopt;
 }
 
-std::array<int, 4> World::lodCounts() const {
-    std::array<int, 4> result{};
+std::array<int, lodCount> World::lodCounts() const {
+    std::array<int, lodCount> result{};
     for (const auto& entry : chunks) ++result[entry.second->lod];
     return result;
 }

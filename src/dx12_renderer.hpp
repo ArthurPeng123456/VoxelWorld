@@ -1,6 +1,6 @@
 #pragma once
 
-#include "terrain.hpp"
+#include "render_coordinates.hpp"
 
 #include <windows.h>
 
@@ -8,16 +8,12 @@
 
 namespace voxel {
 
-struct Vertex {
-    float position[3];
-    float normal[3];
-    std::uint32_t color;
-};
-
 struct Camera {
     Vec eye, right, up, forward;
     double nearPlane, farPlane;
     bool lodTint, wireframe;
+    Vec planetCenter{};
+    bool atmosphereEnabled{true};
 };
 
 class Dx12Renderer {

@@ -1,0 +1,4 @@
+#pragma once
+inline constexpr char precisionTestShader[] = R"voxeltest(
+@VOXEL_TEST_SHADER@
+)voxeltest";

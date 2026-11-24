@@ -1,4 +1,5 @@
 #include "world.hpp"
+#include "free_camera.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -220,7 +221,7 @@ void exportMesh(const fs::path& path, const World& world, const std::vector<Vec>
     for (const auto& entry : world.chunks) {
         const auto& chunk = *entry.second;
         if (chunk.mesh.empty()) continue;
-        out << "o chunk_" << chunk.key.x << '_' << chunk.key.y << '_' << chunk.key.z << "_LOD" << chunk.lod << '\n';
+        out << "o chunk_" << chunk.key.x << '_' << chunk.key.y << '_' << chunk.key.z << "_S" << chunk.key.level << "_LOD" << chunk.lod << '\n';
         for (const auto& triangle : chunk.mesh) {
             for (Vec p : triangle.vertices) out << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
             out << "f " << index << ' ' << index + 1 << ' ' << index + 2 << '\n';
@@ -229,7 +230,7 @@ void exportMesh(const fs::path& path, const World& world, const std::vector<Vec>
     }
 }
 
-void logBuild(std::ostream& out, Method method, int frame, const WorldStats& stats, const std::array<int, 4>& lodCounts,
+void logBuild(std::ostream& out, Method method, int frame, const WorldStats& stats, const std::array<int, lodCount>& lodCounts,
               const TerrainMemory& memory, double stepMs, int contacts, bool scheduled) {
     out << name(method) << ',' << frame << ',' << stats.updateMs << ',' << stats.selectMs << ','
         << stats.build.sampleMs << ',' << stats.build.storageMs << ',' << stats.build.meshMs << ','
@@ -421,6 +422,34 @@ std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, 
 }
 
 void selfTest() {
+    {
+        FreeCamera camera;
+        const Vec eye{planetRadius + 0.125, -planetRadius, 200};
+        camera.reset(eye, {0, 1, 0}, {0, 0, 1});
+        camera.move(1, 0, 0, 0.5, 20);
+        check(length(camera.position() - (eye + Vec{0, 10, 0})) < 1e-8, "free camera moves forward at Earth coordinates");
+        camera.reset(eye, {0, 1, 0}, {0, 0, 1});
+        camera.move(1, 1, 1, 1, 100);
+        check(std::abs(length(camera.position() - eye) - 100) < 1e-8, "diagonal camera movement keeps constant speed");
+        const Vec before = camera.position();
+        camera.move(0, 0, 0, 100, 100);
+        check(length(camera.position() - before) == 0, "released camera keys stop movement");
+        camera.reset({}, {0, 1, 0}, {0, 0, 1});
+        camera.look(1.5707963267948966, 0);
+        check(length(camera.forward() - Vec{1, 0, 0}) < 1e-10, "mouse look rotates toward the camera right");
+        camera.look(10000, 10000);
+        check(std::abs(dot(camera.forward(), camera.right())) < 1e-10 &&
+              std::abs(dot(camera.forward(), camera.up())) < 1e-10 &&
+              std::abs(length(camera.forward()) - 1) < 1e-10, "camera pitch limit preserves an orthonormal frame");
+        FreeCamera subdivided;
+        camera.reset({}, {0, 1, 0}, {0, 0, 1});
+        subdivided.reset({}, {0, 1, 0}, {0, 0, 1});
+        camera.move(1, -1, 0, 1, 123);
+        for (int i = 0; i < 100; ++i) subdivided.move(1, -1, 0, 0.01, 123);
+        check(length(camera.position() - subdivided.position()) < 1e-9, "camera movement is independent of frame rate");
+    }
+    static_assert(sizeof(Vec) == 3 * sizeof(double), "World vectors must remain double precision");
+    check(planetRadius == 6371000.0 && chunkSize / fineCells == 50.0, "Earth radius retains 50 meter local sampling");
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0), both = invokerPositions(planet, 2, 0);
     Clipmap clipmap;
@@ -466,7 +495,21 @@ void selfTest() {
     for (const auto& entry : one) check(two.at(entry.first) <= entry.second, "nearest invoker wins");
     check(two != clipmap.layout(), "moving invokers change LOD");
     fresh.update({}, true, visits);
-    check(fresh.layout().size() > two.size() && fresh.layout().at(keyAt(first[0])) == 3, "global shell falls back to LOD 3");
+    check(!fresh.layout().empty() && fresh.layout().size() < 50000, "global field has bounded hierarchical coverage");
+    double volume = 0;
+    for (const auto& leaf : fresh.layout()) volume += std::ldexp(1.0, 3 * leaf.first.level);
+    check(volume == std::ldexp(8.0, 3 * rootLevel), "octree leaves cover the entire field volume");
+    for (Vec p : {Vec{}, Vec{planetRadius,0,0}, Vec{-planetRadius,0,0}, Vec{0,planetRadius,0},
+                  Vec{0,-planetRadius,0}, Vec{0,0,planetRadius}, Vec{0,0,-planetRadius}})
+        check(leafAt(fresh.layout(), p).has_value(), "global field covers core and all six hemispheres without invokers");
+    fresh.update(both, true, visits);
+    check(fresh.layout().at(keyAt(both[0])) == 0 && fresh.layout().at(keyAt(both[1])) == 0,
+          "multiple invokers refine a common global field");
+    for (const auto& leaf : fresh.layout()) {
+        for (Key neighbor : intersectingLeaves(fresh.layout(), bounds(leaf.first).expanded(splat(1e-4))))
+            check(std::abs(leaf.second - fresh.layout().at(neighbor)) <= 1, "global field has 2:1 balanced sample spacings");
+    }
+    check(fresh.update(both, true, visits).empty() && visits == 0, "stationary global invokers do not rebuild the octree");
     fresh.update({}, false, visits);
     check(fresh.layout().empty(), "unloaded clipmap releases all owners");
     check(std::abs(planet.sdf(planet.surface(both[0] / length(both[0])))) < 1e-4, "planet surface is zero");
@@ -495,6 +538,67 @@ void selfTest() {
         if (seamTested) break;
     }
     check(seamTested, "the test layout contains mixed LOD neighbors");
+
+    // Global LOD must retain real field values and meshes away from every invoker.
+    for (Method method : {Method::Grid, Method::Dag, Method::Vdb, Method::Mesh}) {
+        World globe(planet, method, false);
+        globe.update(first, true);
+        for (int i = 0; i < 32; ++i) {
+            const double z = -0.97 + 1.94 * i / 31;
+            const double angle = i * 2.399963229728653;
+            const Vec up{std::sqrt(1 - z * z) * std::cos(angle), std::sqrt(1 - z * z) * std::sin(angle), z};
+            const Vec center = planet.surface(up);
+            const auto ray = globe.physics.ray(center + up * 100000, center - up * 100000);
+            check(ray.state == Hit::State::Contact && ray.fraction > 0.4 && ray.fraction < 0.6,
+                  "global voxel/mesh ray hits distant terrain across all hemispheres");
+        }
+        if (method != Method::Mesh)
+            check(globe.physics.ray({}, {planetRadius + 100000,0,0}).initial, "constant interior leaves preserve solid queries");
+        if (method == Method::Grid) {
+            int interfaces = 0;
+            Layout layout;
+            for (const auto& c : globe.chunks) layout.emplace(c.first, c.second->lod);
+            for (const auto& item : globe.chunks) {
+                const Chunk& fine = *item.second;
+                if (fine.mesh.empty()) continue;
+                for (Key key : intersectingLeaves(layout, fine.box.expanded(splat(1e-4)))) {
+                    const Chunk& coarse = *globe.chunks.at(key);
+                    if (coarse.lod <= fine.lod || coarse.mesh.empty()) continue;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        if (std::abs(fine.box.hi[axis] - coarse.box.lo[axis]) > 1e-5 &&
+                            std::abs(fine.box.lo[axis] - coarse.box.hi[axis]) > 1e-5) continue;
+                        const Vec lo = max(fine.box.lo, coarse.box.lo), hi = min(fine.box.hi, coarse.box.hi);
+                        const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+                        if (hi[u] - lo[u] < 1e-4 || hi[v] - lo[v] < 1e-4) continue;
+                        for (double a : {0.25,0.75}) for (double b : {0.25,0.75}) {
+                            Vec p = lo; p[u] += (hi[u] - lo[u]) * a; p[v] += (hi[v] - lo[v]) * b;
+                            const double x = fine.cellAt(p).value(p), y = coarse.cellAt(p).value(p);
+                            check(std::abs(x - y) < coarse.spacing * 2e-6 + 0.001,
+                                  "different-sized LOD leaves share a continuous boundary field");
+                        }
+                        ++interfaces;
+                    }
+                }
+            }
+            check(interfaces > 50, "global test exercises many multiscale boundaries");
+            const Vec opposite = first[0] * -1;
+            check(globe.requestUpdate({}, true, opposite), "global camera teleport starts a background build");
+            const Vec oldUp = unit(first[0]);
+            check(globe.physics.ray(first[0] + oldUp * 100000, first[0] - oldUp * 100000).state == Hit::State::Contact,
+                  "old global coverage remains queryable while new LOD leaves are built");
+            const auto deadline = Clock::now() + std::chrono::seconds(20);
+            std::optional<WorldStats> published;
+            while (!(published = globe.pollUpdate()) && Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(published.has_value(), "global multiscale replacement publishes atomically");
+            check(globe.chunks.at(keyAt(opposite))->lod == 0, "camera refines the opposite hemisphere");
+            const auto prior = leafAt(layout, first[0]);
+            check(prior.has_value(), "previous invoker was covered");
+            const Vec up = unit(first[0]);
+            check(globe.physics.ray(first[0] + up * 100000, first[0] - up * 100000).state == Hit::State::Contact,
+                  "moving away coarsens terrain without removing global coverage");
+        }
+    }
 
     const Vec oldPoint = first[0];
     const Vec newPoint = planet.surface(unit(oldPoint) * -1);
@@ -621,6 +725,26 @@ void selfTest() {
         chunks.clear();
         for (int i = 0; i < 40; ++i) physics.step(1.0 / 60, false);
         check(physics.bodyPosition(0).z < 809, "unloading terrain wakes a resting body");
+
+        // Exercise both signs and the Earth-scale Bullet transforms, not just a plane at the origin.
+        for (Key key : {Key{3981, -2700, 3100}, Key{-3981, 2700, -3100}}) {
+            Chunks distant;
+            distant.emplace(key, fixture(method, option.second, false, key));
+            Physics farPhysics(method, distant);
+            farPhysics.addTerrain(*distant.at(key));
+            const Vec base = bounds(key).lo;
+            const auto farRay = farPhysics.ray(base + Vec{400.125, 400.0625, 900}, base + Vec{400.125, 400.0625, 760});
+            check(farRay.state == Hit::State::Contact && std::abs(farRay.position.z - (base.z + 797)) < 0.001,
+                  "Earth-scale ray preserves millimeter precision");
+            const auto farShape = sampleShape(1, {0,0,1});
+            const auto farSweep = farPhysics.sweep(farShape, base + Vec{400,400,900}, base + Vec{400,400,750});
+            check(farSweep.state == Hit::State::Contact && std::abs(farSweep.fraction - 0.6) < 0.01,
+                  "Earth-scale sphere sweep has analytic TOI");
+            farPhysics.addBody(farShape, base + Vec{400,400,850});
+            for (int step = 0; step < 240; ++step) farPhysics.step(1.0 / 60, false);
+            check(std::abs(farPhysics.bodyPosition(0).z - (base.z + 810)) < 0.1,
+                  "Earth-scale body settles without float coordinate quantization");
+        }
     }
     std::cout << "All self-tests passed.\n";
 }
@@ -644,8 +768,9 @@ int main(int argc, char** argv) {
             capsuleReport << "scheme,scenario,queries,hits,initial,unresolved,p50_us,p95_us,p99_us,"
                              "vs_mesh_mismatch,paired_hits,vs_mesh_toi_p95_m\n";
         }
-        frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,"
-                  "lod0,lod1,lod2,lod3,field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts,"
+        frames << "scheme,frame,update_ms,select_ms,sample_ms,storage_ms,render_mesh_ms,register_remove_ms,built,removed,";
+        for (int lod = 0; lod < voxel::lodCount; ++lod) frames << "lod" << lod << ',';
+        frames << "field_bytes,physics_static_bytes,render_mesh_bytes,step_ms,terrain_contacts,"
                   "scheduled,window_visits,changed_owners,metadata_bytes,resident_terrain_bytes,staged_terrain_bytes\n";
         streaming << "scheme,seed,actor_invokers,camera_invokers,global,initial_ms,scheduled_updates,changed_updates,"
                      "changed_p50_ms,changed_p95_ms,changed_max_ms,changed_select_p95_ms,unchanged_p95_ms,"

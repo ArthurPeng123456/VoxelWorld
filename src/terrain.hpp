@@ -53,17 +53,30 @@ struct Box {
 };
 bool clip(Box box, Vec start, Vec delta, double& first, double& last);
 
-constexpr double planetRadius = 25600.0;
+// World distances are meters. CPU positions, directions and transforms use Vec/double.
+constexpr double planetRadius = 6371000.0;
+constexpr double atmosphereHeight = 100000.0;
 constexpr double chunkSize = 1600.0;
 constexpr int fineCells = 32;
+constexpr int fieldRootLevel() {
+    int level = 0;
+    double extent = chunkSize;
+    while (extent < planetRadius + 1000) { extent *= 2; ++level; }
+    return level;
+}
+constexpr int rootLevel = fieldRootLevel();
+constexpr int coarsestSurfaceLevel = rootLevel > 3 ? rootLevel - 3 : 0;
+constexpr int lodCount = rootLevel + 4;
 constexpr float background = 2400.0f;
 
 struct Key {
     int x{}, y{}, z{};
+    // Lower corner in base-chunk units; side length is chunkSize * 2^level.
+    int level{};
     int operator[](int axis) const { return axis == 0 ? x : axis == 1 ? y : z; }
     int& operator[](int axis) { return axis == 0 ? x : axis == 1 ? y : z; }
-    bool operator==(Key b) const { return x == b.x && y == b.y && z == b.z; }
-    bool operator<(Key b) const { return std::tie(x, y, z) < std::tie(b.x, b.y, b.z); }
+    bool operator==(Key b) const { return x == b.x && y == b.y && z == b.z && level == b.level; }
+    bool operator<(Key b) const { return std::tie(level, x, y, z) < std::tie(b.level, b.x, b.y, b.z); }
 };
 inline Vec asVec(Key key) { return {double(key.x), double(key.y), double(key.z)}; }
 Key keyAt(Vec p);
@@ -82,6 +95,7 @@ private:
     std::vector<Crater> craters_;
     std::array<double, 3> phase_{};
 };
+
 
 enum class Method { Mesh, Grid, Dag, Vdb };
 const char* name(Method method);
@@ -131,6 +145,9 @@ struct BuildStats {
 };
 
 using Layout = std::map<Key, int>;
+Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr);
+std::optional<Key> leafAt(const Layout& layout, Vec point);
+std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
 Layout selectChunks(const std::vector<Vec>& invokers, bool global);
 std::array<int, 27> neighborhood(const Layout& layout, Key key);
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,

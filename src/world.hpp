@@ -43,7 +43,7 @@ public:
     WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {});
     bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera);
     std::optional<WorldStats> pollUpdate();
-    std::array<int, 4> lodCounts() const;
+    std::array<int, lodCount> lodCounts() const;
     TerrainMemory terrainMemory() const;
     std::size_t meshBytes() const;
     const std::vector<ClipmapWindow>& clipmapWindows() const { return publishedWindows_; }
@@ -51,22 +51,24 @@ public:
     Chunks chunks;
     Physics physics;
 private:
+    using Prior = std::map<Key, std::pair<int, std::array<int, 27>>>;
     struct Batch {
         Clock::time_point start;
         WorldStats stats;
         std::vector<Key> build, remove;
         Chunks staged;
+        Clipmap clipmap;
     };
-    Batch planUpdate(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera);
+    Prior snapshot() const;
+    static Batch planUpdate(Clipmap planned, const Prior& prior, const std::vector<Vec>& sources,
+                            bool global, Clock::time_point start);
     static void build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton);
     WorldStats publish(Batch batch);
     const Planet& planet_;
     Method method_;
     bool morton_;
     Clipmap clipmap_;
-    std::set<Key> pending_;
     std::vector<ClipmapWindow> publishedWindows_;
-    std::optional<WorldStats> completed_;
     std::future<Batch> building_;
 };
 

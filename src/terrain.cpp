@@ -28,7 +28,7 @@ Key keyAt(Vec p) {
 
 Box bounds(Key key) {
     const Vec lo = asVec(key) * chunkSize;
-    return {lo, lo + splat(chunkSize)};
+    return {lo, lo + splat(std::ldexp(chunkSize, key.level))};
 }
 
 Planet::Planet(std::uint64_t seed) {
@@ -47,7 +47,7 @@ Planet::Planet(std::uint64_t seed) {
         const double azimuth = random() * tau;
         const double r = std::sqrt(1 - z * z);
         const Vec axis{r * std::cos(azimuth), r * std::sin(azimuth), z};
-        const double diameterRatio = 0.015 + 0.12 * std::pow(random(), 2);
+        const double diameterRatio = (0.015 + 0.12 * std::pow(random(), 2)) * (25600.0 / planetRadius);
         craters_.push_back({axis, diameterRatio * diameterRatio * 0.5,
                             180 + random() * 560, 40 + random() * 95});
     }
@@ -65,24 +65,26 @@ double Planet::elevation(Vec d) const {
         bowl = std::max(bowl, crater.depth * depth * depth);
         rim = std::max(rim, crater.rim * ridge * ridge);
     }
-    const double relief = 85 * std::sin(dot(d, {14, 11, -7}) + phase_[0])
-                        + 50 * std::sin(dot(d, {29, -19, 25}) + phase_[1])
-                        + 20 * std::sin(dot(d, {-70, 59, 91}) + phase_[2]);
+    constexpr double frequency = planetRadius / 25600.0;
+    const double relief = 85 * std::sin(dot(d, {14, 11, -7}) * frequency + phase_[0])
+                        + 50 * std::sin(dot(d, {29, -19, 25}) * frequency + phase_[1])
+                        + 20 * std::sin(dot(d, {-70, 59, 91}) * frequency + phase_[2]);
     return relief + rim - bowl;
 }
 
 float Planet::sdf(Vec p) const {
     const double r = length(p);
-    if (r < planetRadius - 1000 - background) return -background;
-    if (r > planetRadius + 1000 + background) return background;
-    return float(std::clamp(r - planetRadius - elevation(unit(p)), -double(background), double(background)));
+    // Coarse planetary cells need actual radial distances: clamping them to a
+    // 2400m band would move roots toward cell midpoints hundreds of km away.
+    return float(r - planetRadius - elevation(unit(p)));
 }
 
 Vec Planet::invokerDirection(int index, double frame) const {
     const Vec axis = craters_[std::size_t(index) % craters_.size()].axis;
     const Vec reference = std::abs(axis.z) < 0.9 ? Vec{0, 0, 1} : Vec{0, 1, 0};
     const Vec tangent = unit(cross(reference, axis));
-    const double angle = 0.07 * std::sin(frame * ((index % 2) == 0 ? 0.039 : -0.051));
+    const double angle = (0.07 * 25600.0 / planetRadius)
+                       * std::sin(frame * ((index % 2) == 0 ? 0.039 : -0.051));
     return axis * std::cos(angle) + tangent * std::sin(angle);
 }
 
@@ -143,23 +145,19 @@ bool intersectsPlanetShell(Key key) {
 }
 
 Layout selectChunks(const std::vector<Vec>& invokers, bool global) {
+    if (global) return planetLayout(invokers);
     Layout result;
     auto offer = [&](Key key) {
         const Box box = bounds(key);
         if (!intersectsPlanetShell(key)) return;
         double distance = std::numeric_limits<double>::infinity();
         for (Vec invoker : invokers) distance = std::min(distance, length(box.clamp(invoker) - invoker));
-        if (!global && distance > 2.3 * chunkSize) return;
+        if (distance > 2.3 * chunkSize) return;
         const int lod = distance < 0.45 * chunkSize ? 0 : distance < 1.2 * chunkSize ? 1
                        : distance < 2.0 * chunkSize ? 2 : 3;
         result.try_emplace(key, lod);
     };
-    if (global) {
-        const int limit = int(std::ceil((planetRadius + 1000) / chunkSize));
-        for (int z = -limit; z < limit; ++z) for (int y = -limit; y < limit; ++y) {
-            for (int x = -limit; x < limit; ++x) offer({x, y, z});
-        }
-    } else {
+    {
         for (Vec p : invokers) {
             const Key center = keyAt(p);
             for (int z = -3; z <= 3; ++z) for (int y = -3; y <= 3; ++y) {
@@ -176,9 +174,15 @@ std::array<int, 27> neighborhood(const Layout& layout, Key key) {
     int i = 0;
     for (int z = -1; z <= 1; ++z) for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            auto found = layout.find({key.x + x, key.y + y, key.z + z});
+            const Box box = bounds(key);
+            Vec p = box.center();
+            for (int a = 0; a < 3; ++a) {
+                const int side = a == 0 ? x : a == 1 ? y : z;
+                if (side) p[a] = side < 0 ? box.lo[a] - 1e-4 : box.hi[a] + 1e-4;
+            }
+            const auto neighbor = leafAt(layout, p);
             // Only a coarser neighbor constrains the boundary samples or stitching of this chunk.
-            result[i++] = found == layout.end() ? lod : std::max(lod, found->second);
+            result[i++] = neighbor ? std::max(lod, layout.at(*neighbor)) : lod;
         }
     }
     return result;
@@ -189,17 +193,12 @@ namespace {
 int floorTo(int value, int step) { return value - ((value % step + step) % step); }
 
 float boundaryValue(const Planet& planet, const Layout& layout, Key grid, int level) {
-    Key upper, lower;
-    for (int a = 0; a < 3; ++a) {
-        upper[a] = floorTo(grid[a], fineCells) / fineCells;
-        lower[a] = upper[a] - (grid[a] % fineCells == 0);
-    }
     int coarsest = level;
-    for (int z = lower.z; z <= upper.z; ++z) for (int y = lower.y; y <= upper.y; ++y) {
-        for (int x = lower.x; x <= upper.x; ++x) {
-            auto found = layout.find({x, y, z});
-            if (found != layout.end()) coarsest = std::max(coarsest, found->second);
-        }
+    const Vec world = asVec(grid) * (chunkSize / fineCells);
+    for (int i = 0; i < 8; ++i) {
+        const Vec probe = world + Vec{(i & 1) ? 1e-4 : -1e-4, (i & 2) ? 1e-4 : -1e-4, (i & 4) ? 1e-4 : -1e-4};
+        const auto neighbor = leafAt(layout, probe);
+        if (neighbor) coarsest = std::max(coarsest, layout.at(*neighbor));
     }
     const int stride = 1 << coarsest;
     const Key base{floorTo(grid.x, stride), floorTo(grid.y, stride), floorTo(grid.z, stride)};
@@ -220,7 +219,81 @@ float boundaryValue(const Planet& planet, const Layout& layout, Key grid, int le
     return float(value);
 }
 
+void stitchHierarchicalFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
+    using Segment = std::array<Vec, 2>;
+    using Face = std::tuple<int, int, int, int, int>;
+    std::map<Face, std::vector<Segment>> contours;
+    for (auto& triangle : chunk.mesh) for (Vec& point : triangle.vertices) {
+        for (int axis = 0; axis < 3; ++axis) for (int side : {-1, 1}) {
+            const double plane = side < 0 ? chunk.box.lo[axis] : chunk.box.hi[axis];
+            if (std::abs(point[axis] - plane) > 1e-5) continue;
+            Vec probe = point;
+            for (int a = 0; a < 3; ++a)
+                probe[a] = a == axis ? plane + side * 1e-4
+                                    : std::clamp(point[a], chunk.box.lo[a] + 1e-4, chunk.box.hi[a] - 1e-4);
+            const auto neighbor = leafAt(layout, probe);
+            if (!neighbor || layout.at(*neighbor) <= chunk.lod) continue;
+            const int lod = layout.at(*neighbor), step = 1 << lod;
+            const double spacing = std::ldexp(chunkSize / fineCells, lod);
+            const Box neighborBox = bounds(*neighbor);
+            Key grid;
+            for (int a = 0; a < 3; ++a) {
+                const int cells = fineCells >> std::min(lod, 3);
+                const int index = std::clamp(int(std::floor((probe[a] - neighborBox.lo[a]) / spacing)), 0, cells - 1);
+                grid[a] = (*neighbor)[a] * fineCells + index * step;
+            }
+            const Face face{axis, side, grid.x, grid.y, grid.z};
+            auto found = contours.find(face);
+            if (found == contours.end()) {
+                const Vec origin = asVec(grid) * (chunkSize / fineCells);
+                Chunk coarse{Key{}, lod, 1, {origin, origin + splat(spacing)}, spacing, {}, {}, {}, {}, {}};
+                std::vector<float> samples;
+                for (int i = 0; i < 8; ++i)
+                    samples.push_back(boundaryValue(planet, layout, {grid.x + (i & 1) * step,
+                        grid.y + ((i >> 1) & 1) * step, grid.z + (i >> 2) * step}, lod));
+                coarse.field = makeStorage(Method::Grid, 2, samples, false, spacing, origin);
+                meshChunk(coarse, false);
+                std::vector<Segment> segments;
+                for (const auto& t : coarse.mesh) for (int i = 0; i < 3; ++i) {
+                    const Vec a = t.vertices[i], b = t.vertices[(i + 1) % 3];
+                    if (std::abs(a[axis] - plane) < 1e-5 && std::abs(b[axis] - plane) < 1e-5 && length(a - b) > 1e-8)
+                        segments.push_back({a, b});
+                }
+                found = contours.emplace(face, std::move(segments)).first;
+            }
+            Vec nearest = point;
+            double distance = std::numeric_limits<double>::infinity();
+            for (const auto& segment : found->second) {
+                const Vec delta = segment[1] - segment[0];
+                const double square = dot(delta, delta);
+                double t = std::clamp(dot(point - segment[0], delta) / square, 0.0, 1.0);
+                bool valid = true;
+                // At chunk edges, preserve the other shared face as well.
+                for (int a = 0; a < 3; ++a) if (a != axis) {
+                    if (std::abs(point[a] - chunk.box.lo[a]) < 1e-5 || std::abs(point[a] - chunk.box.hi[a]) < 1e-5) {
+                        if (std::abs(delta[a]) > 1e-12) t = (point[a] - segment[0][a]) / delta[a];
+                        else if (std::abs(segment[0][a] - point[a]) > 1e-5) valid = false;
+                    }
+                }
+                if (!valid || t < -1e-10 || t > 1 + 1e-10) continue;
+                const Vec candidate = segment[0] + delta * std::clamp(t, 0.0, 1.0);
+                const double d = dot(candidate - point, candidate - point);
+                if (d < distance) { distance = d; nearest = candidate; }
+            }
+            point = nearest;
+        }
+    }
+    chunk.mesh.erase(std::remove_if(chunk.mesh.begin(), chunk.mesh.end(), [](const Triangle& t) {
+        const Vec area = cross(t.vertices[1] - t.vertices[0], t.vertices[2] - t.vertices[0]);
+        return dot(area, area) < 1e-16;
+    }), chunk.mesh.end());
+}
+
 void stitchFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
+    if (!layout.empty() && layout.rbegin()->first.level > 0) {
+        stitchHierarchicalFaces(chunk, planet, layout);
+        return;
+    }
     // Collapse the fine contour onto each unambiguous straight coarse face segment.
     // Selection is based only on the layout, so it does not depend on build order.
     for (int axis = 0; axis < 3; ++axis) for (int side : {-1, 1}) {
@@ -339,21 +412,23 @@ void meshChunk(Chunk& chunk, bool indexField) {
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
                                   Method method, bool morton, BuildStats& stats) {
     const int lod = layout.at(key);
-    const int cells = fineCells >> lod;
+    const int cells = fineCells >> std::min(lod, 3);
     const int count = cells + 1;
     const auto box = bounds(key);
-    auto chunk = std::make_unique<Chunk>(Chunk{key, lod, cells, box, chunkSize / cells,
+    auto chunk = std::make_unique<Chunk>(Chunk{key, lod, cells, box, (box.hi.x - box.lo.x) / cells,
                                                neighborhood(layout, key), {}, {}, {}, {}});
     auto start = Clock::now();
     std::vector<float> samples;
     samples.reserve(std::size_t(count) * count * count);
+    const bool uniform = !intersectsPlanetShell(key);
+    const float uniformValue = length(box.center()) < planetRadius ? -background : background;
     for (int z = 0; z < count; ++z) for (int y = 0; y < count; ++y) {
         for (int x = 0; x < count; ++x) {
             const bool boundary = x == 0 || y == 0 || z == 0 || x == cells || y == cells || z == cells;
             const int stride = 1 << lod;
             const Key grid{key.x * fineCells + x * stride, key.y * fineCells + y * stride,
                            key.z * fineCells + z * stride};
-            samples.push_back(boundary ? boundaryValue(planet, layout, grid, lod)
+            samples.push_back(uniform ? uniformValue : boundary ? boundaryValue(planet, layout, grid, lod)
                                        : planet.sdf(box.lo + Vec{double(x), double(y), double(z)} * chunk->spacing));
         }
     }

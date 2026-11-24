@@ -1,6 +1,7 @@
 #include "collision.hpp"
 
 #include <btBulletDynamicsCommon.h>
+static_assert(sizeof(btScalar) == sizeof(double), "Earth-scale physics requires double-precision Bullet");
 #include <BulletCollision/CollisionDispatch/btCollisionObjectWrapper.h>
 #include <BulletCollision/CollisionDispatch/btManifoldResult.h>
 #include <BulletCollision/CollisionDispatch/btCollisionCreateFunc.h>
@@ -44,6 +45,24 @@ constexpr int sweepBudget = 12000;
 template<class Operation>
 void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation operation) {
     const Vec pad = extents + splat(epsilon);
+    if (!chunks.empty() && chunks.rbegin()->first.level > 0) {
+        const Vec delta = to - from;
+        auto visit = [&](auto&& self, Key key) -> void {
+            double first = 0, last = 1;
+            if (!clip(bounds(key).expanded(pad), from, delta, first, last)) return;
+            const auto found = chunks.find(key);
+            if (found != chunks.end()) { operation(*found->second); return; }
+            if (!key.level) return;
+            const int step = 1 << (key.level - 1);
+            for (int i = 0; i < 8; ++i)
+                self(self, Key{key.x + (i & 1) * step, key.y + ((i >> 1) & 1) * step,
+                               key.z + (i >> 2) * step, key.level - 1});
+        };
+        const int step = 1 << rootLevel;
+        for (int i = 0; i < 8; ++i)
+            visit(visit, Key{(i & 1) ? 0 : -step, (i & 2) ? 0 : -step, (i & 4) ? 0 : -step, rootLevel});
+        return;
+    }
     const Key lo = keyAt(min(from, to) - pad), hi = keyAt(max(from, to) + pad);
     auto emit = [&](int x, int y, int z) {
         const auto found = chunks.find({x, y, z});

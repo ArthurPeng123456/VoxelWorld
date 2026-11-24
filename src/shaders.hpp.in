@@ -1,0 +1,7 @@
+#pragma once
+namespace voxel {
+inline constexpr char shaderSource[] = R"voxelshader(
+@VOXEL_PRECISION_SHADER@
+@VOXEL_ATMOSPHERE_SHADER@
+)voxelshader";
+}
