@@ -45,7 +45,7 @@ vtune -collect hotspots ^
     -result-dir="%RESULT_DIR%" ^
     -search-dir="%WORK_DIR%" ^
     -search-dir="%PROJECT%\out\build\x64-Release" ^
-    -- "%EXE_PATH%" --ray-compare --invokers 75 --frames 1000 --rays-per-invoker 20 --seed 42 --stream-every 6
+    -- "%EXE_PATH%" --ray-compare --invokers 75 --frames 1000 --rays-per-invoker 20 --compare grid
 if errorlevel 1 (
     echo Collection failed.
     pause

@@ -28,6 +28,7 @@ struct Options {
     int streamEvery{6};
     bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{}, rayCompare{};
     int raysPerInvoker{20};
+    std::vector<Method> compare{Method::Grid};
     fs::path output{"results"};
 };
 
@@ -35,7 +36,7 @@ void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
-              << "  [--ray-compare] [--rays-per-invoker N]\n"
+              << "  [--ray-compare] [--rays-per-invoker N] [--compare grid|vdb|dag|all]\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -88,6 +89,14 @@ Options options(int argc, char** argv) {
         else if (arg == "--capsule-stress") opts.capsuleStress = true;
         else if (arg == "--ray-compare") opts.rayCompare = true;
         else if (arg == "--rays-per-invoker") opts.raysPerInvoker = bounded(1, 10000);
+        else if (arg == "--compare") {
+            const auto backend = next();
+            if (backend == "all") opts.compare = {Method::Grid, Method::Dag, Method::Vdb};
+            else if (backend == "grid") opts.compare = {Method::Grid};
+            else if (backend == "dag") opts.compare = {Method::Dag};
+            else if (backend == "vdb") opts.compare = {Method::Vdb};
+            else throw std::invalid_argument("Invalid compare backend: " + backend);
+        }
         else if (arg == "--help" || arg == "-h") opts.help = true;
         else throw std::invalid_argument("Unknown argument: " + arg);
     }
@@ -639,21 +648,21 @@ void selfTest() {
 
 namespace voxel {
 
-// Side-by-side ray benchmark (--ray-compare): the same ray is issued on the mesh
-// backend and the grid backend back-to-back, in the same frame. No clock timing;
-// VTune attributes the cost. Bodies are not spawned because only ray detection
-// is compared and rigid bodies never block a terrain ray.
-void rayCompare(const Options& opts) {
+// Side-by-side ray benchmark: the same ray is issued on the mesh backend and on
+// one field backend back-to-back, in the same frame. No clock timing; VTune
+// attributes the cost. Invokers stay at their frame-0 positions and each
+// backend's clipmap is built exactly once, so no chunk is ever rebuilt or
+// unloaded: every frame only adds more random rays around the same invokers.
+// Bodies are not spawned because only ray detection is compared and rigid
+// bodies never block a terrain ray.
+void compareRayToMesh(const Options& opts, Method other) {
     Planet planet(opts.seed);
     World meshWorld(planet, Method::Mesh, false);
-    World gridWorld(planet, Method::Grid, false);
+    World otherWorld(planet, other, false);
 
-    // Frame-0 coverage for both backends. Later frames move the invokers along
-    // Planet::invokerDirection (the viewer's trajectory) and re-stream the
-    // terrain every --stream-every frames so the casts stay inside coverage.
-    auto invokers = invokerPositions(planet, opts.invokers, 0.0);
-    const WorldStats initialMesh = meshWorld.update(invokers, opts.global, std::nullopt);
-    const WorldStats initialGrid = gridWorld.update(invokers, opts.global, std::nullopt);
+    const auto invokers = invokerPositions(planet, opts.invokers, 0.0);
+    const WorldStats meshBuild = meshWorld.update(invokers, opts.global, std::nullopt);
+    const WorldStats otherBuild = otherWorld.update(invokers, opts.global, std::nullopt);
 
     std::mt19937_64 rng(opts.seed ^ 0x9e3779b97f4a7c15ULL);
     auto random = [&] { return (rng() >> 11) * 0x1p-53; };
@@ -674,51 +683,47 @@ void rayCompare(const Options& opts) {
         for (std::size_t i = 0; i < invokers.size(); ++i) {
             const auto [from, to] = shot(invokers[i]);
             meshWorld.physics.ray(from, to);
-            gridWorld.physics.ray(from, to);
+            otherWorld.physics.ray(from, to);
         }
     }
 
-    double travel = 0, updateTotal = 0;
-    int updates = 0, rays = 0, meshContacts = 0, gridContacts = 0, mismatches = 0;
-    std::vector<double> updateTimes;
-    auto previous = invokers;
+    int rays = 0, meshContacts = 0, otherContacts = 0, mismatches = 0;
     for (int frame = 0; frame < opts.frames; ++frame) {
-        const auto moving = invokerPositions(planet, opts.invokers, frame);
-        // Terrain streaming for both backends, outside the ray loop so the
-        // build cost never hides inside a single cast.
-        if (frame > 0 && frame % opts.streamEvery == 0) {
-            const auto timer = Clock::now();
-            meshWorld.update(moving, opts.global, std::nullopt);
-            gridWorld.update(moving, opts.global, std::nullopt);
-            const double elapsed = milliseconds(timer);
-            updateTimes.push_back(elapsed);
-            updateTotal += elapsed;
-            ++updates;
-        }
-        for (std::size_t i = 0; i < moving.size(); ++i) {
+        for (std::size_t i = 0; i < invokers.size(); ++i) {
             for (int r = 0; r < opts.raysPerInvoker; ++r) {
-                const auto [from, to] = shot(moving[i]);
+                const auto [from, to] = shot(invokers[i]);
                 const Hit meshHit = meshWorld.physics.ray(from, to);
-                const Hit gridHit = gridWorld.physics.ray(from, to);
+                const Hit otherHit = otherWorld.physics.ray(from, to);
                 ++rays;
                 meshContacts += meshHit.state == Hit::State::Contact;
-                gridContacts += gridHit.state == Hit::State::Contact;
-                mismatches += meshHit.state != gridHit.state;
+                otherContacts += otherHit.state == Hit::State::Contact;
+                mismatches += meshHit.state != otherHit.state;
             }
         }
     }
-    std::sort(updateTimes.begin(), updateTimes.end());
-    const int perFrame = opts.frames * opts.invokers;
-    std::cout << "ray-compare done: " << opts.frames << " frames, " << opts.invokers
-              << " moving invokers x " << opts.raysPerInvoker << " rays per frame = " << rays
-              << " mesh/grid ray pairs\n";
-    std::cout << "  invoker travel " << travel << " m total, " << travel / std::max(1, perFrame)
-              << " m per frame per invoker\n";
-    std::cout << "  terrain streamed " << updates << " times (every " << opts.streamEvery
-              << " frames), initial " << initialMesh.updateMs << '/' << initialGrid.updateMs
-              << " ms, later total " << updateTotal << " ms, p95 " << percentile(updateTimes, 0.95) << " ms\n";
-    std::cout << "  contacts mesh " << meshContacts << ", grid " << gridContacts << ", state mismatches "
+    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh: " << opts.frames << " frames, "
+              << opts.invokers << " static invokers x " << opts.raysPerInvoker << " rays per frame = " << rays
+              << " ray pairs\n"
+              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n"
+              << "  contacts mesh " << meshContacts << ", " << name(other) << ' ' << otherContacts << ", state mismatches "
               << mismatches << '\n';
+}
+
+// Each entry point compares one field backend against the mesh baseline on the
+// same rays; main() dispatches with --compare (default grid).
+void gridRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Grid); }
+void vdbRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Vdb); }
+void dagRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Dag); }
+
+void rayCompare(const Options& opts) {
+    for (const Method method : opts.compare) {
+        switch (method) {
+            case Method::Grid: gridRayCompare(opts); break;
+            case Method::Vdb: vdbRayCompare(opts); break;
+            case Method::Dag: dagRayCompare(opts); break;
+            default: break;  // mesh has no field counterpart to compare against
+        }
+    }
 }
 
 }  // namespace voxel
