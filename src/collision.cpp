@@ -914,6 +914,14 @@ void Physics::removeTerrain(Key key) {
 }
 
 std::size_t Physics::addBody(Shape shape, Vec position, Vec velocity) {
+    return addBodyImpl(std::move(shape), position, velocity, terrainGroup | bodyGroup);
+}
+
+std::size_t Physics::addTerrainOnlyBody(Shape shape, Vec position, Vec velocity) {
+    return addBodyImpl(std::move(shape), position, velocity, terrainGroup);
+}
+
+std::size_t Physics::addBodyImpl(Shape shape, Vec position, Vec velocity, short mask) {
     Impl::Body value;
     value.shape = bulletShape(shape);
     btVector3 inertia;
@@ -923,7 +931,7 @@ std::size_t Physics::addBody(Shape shape, Vec position, Vec velocity) {
     ci.m_friction = btScalar(0.75);
     value.body = std::make_unique<btRigidBody>(ci);
     value.body->setLinearVelocity(bullet(velocity));
-    impl_->world.addRigidBody(value.body.get(), bodyGroup, terrainGroup | bodyGroup);
+    impl_->world.addRigidBody(value.body.get(), bodyGroup, mask);
     impl_->bodies.push_back(std::move(value));
     return impl_->bodies.size() - 1;
 }
@@ -936,6 +944,29 @@ BodyPose Physics::bodyPose(std::size_t index) const {
     return {voxelVec(transform.getOrigin()), {voxelVec(basis.getColumn(0)), voxelVec(basis.getColumn(1)), voxelVec(basis.getColumn(2))}};
 }
 
+BodyState Physics::bodyState(std::size_t index) const {
+    const auto& body = *impl_->bodies.at(index).body;
+    const auto& transform = body.getWorldTransform();
+    const auto& basis = transform.getBasis();
+    return {{voxelVec(transform.getOrigin()),
+             {voxelVec(basis.getColumn(0)), voxelVec(basis.getColumn(1)), voxelVec(basis.getColumn(2))}},
+            voxelVec(body.getLinearVelocity()), voxelVec(body.getAngularVelocity())};
+}
+
+void Physics::setBodyState(std::size_t index, const BodyState& state) {
+    auto& body = *impl_->bodies.at(index).body;
+    btMatrix3x3 basis;
+    const auto x = bullet(state.pose.axes[0]), y = bullet(state.pose.axes[1]), z = bullet(state.pose.axes[2]);
+    basis.setValue(x.x(), y.x(), z.x(), x.y(), y.y(), z.y(), x.z(), y.z(), z.z());
+    const btTransform transform(basis, bullet(state.pose.position));
+    body.setCenterOfMassTransform(transform);
+    body.setInterpolationWorldTransform(transform);
+    body.setLinearVelocity(bullet(state.velocity));
+    body.setAngularVelocity(bullet(state.angularVelocity));
+    body.clearForces();
+    body.activate();
+}
+
 double Physics::bodySpeed(std::size_t i) const { return impl_->bodies.at(i).body->getLinearVelocity().length(); }
 
 int Physics::terrainContacts() const {
@@ -943,6 +974,20 @@ int Physics::terrainContacts() const {
     for (int i = 0; i < impl_->dispatcher.getNumManifolds(); ++i) {
         const auto* manifold = impl_->dispatcher.getManifoldByIndexInternal(i);
         if (!manifold->getBody0()->isStaticObject() && !manifold->getBody1()->isStaticObject()) continue;
+        for (int c = 0; c < manifold->getNumContacts(); ++c) {
+            count += manifold->getContactPoint(c).getDistance() <= contactMargin;
+        }
+    }
+    return count;
+}
+
+// Non-terrain contacts: both sides dynamic. Any count above zero means a body
+// pair was generated, which the collision benchmark treats as a failed premise.
+int Physics::bodyContacts() const {
+    int count = 0;
+    for (int i = 0; i < impl_->dispatcher.getNumManifolds(); ++i) {
+        const auto* manifold = impl_->dispatcher.getManifoldByIndexInternal(i);
+        if (manifold->getBody0()->isStaticObject() || manifold->getBody1()->isStaticObject()) continue;
         for (int c = 0; c < manifold->getNumContacts(); ++c) {
             count += manifold->getContactPoint(c).getDistance() <= contactMargin;
         }

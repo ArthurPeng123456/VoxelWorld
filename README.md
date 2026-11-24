@@ -101,3 +101,17 @@ cmake --build build --parallel
 此项目输出渲染网格文件，并通过独立 CLI 测量地形碰撞。混合 LOD 使用边界 SDF 插值，并把细网格边界折线贴到无歧义的粗网格轮廓上。交错符号的鞍形面仍可能有缝隙。碰撞覆盖以当前驻留的块为准，超出加载范围的查询结果只能解释为当前数据的结果。ShapeCast 固定朝向，时间和空间细分有预算，返回 `Unresolved` 时应把该次计为未判定。刚体使用离散接触，速度过高或特征小于采样间距时可能穿透。CCD、编辑挖掘和原生 UE 集成超出本次基准范围。
 
 Marching Cubes 查表数据来自 VTK 9.3.1，许可见 [VTK-Copyright.txt](third_party/VTK-Copyright.txt)。
+
+### main中的性能测式
+
+## （1）ray: dag、grid、vdb
+
+```powershell
+ .\voxel_world.exe --invokers 75 --frames 1000 --rays-per-invoker 20 --compare dag > ./mesh2dag.txt
+```
+
+## （2）sweep: dag、grid、vdb
+
+```powershell
+ .\voxel_world.exe --sweep --invokers 75 --frames 100 --shapes-per-invoker 21 --compare vdb > sweepMesh2vdb.txt
+```

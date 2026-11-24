@@ -45,7 +45,7 @@ vtune -collect hotspots ^
     -result-dir="%RESULT_DIR%" ^
     -search-dir="%WORK_DIR%" ^
     -search-dir="%PROJECT%\out\build\x64-Release" ^
-    -- "%EXE_PATH%" --ray-compare --invokers 75 --frames 1000 --rays-per-invoker 20 --compare grid
+    -- "%EXE_PATH%" --trajectory --scheme grid --invokers 6 --frames 600 --spawn-every 10 --stream-every 6 --obj --out traj_mesh600
 if errorlevel 1 (
     echo Collection failed.
     pause

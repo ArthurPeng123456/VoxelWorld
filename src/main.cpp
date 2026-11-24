@@ -17,6 +17,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Which query the mesh/field comparison issues: a cast, a shape sweep, or a
+// rigid body collision step that only pairs bodies with the terrain.
+enum class QueryMode { Ray, Sweep, Collision, Trajectory };
+
 struct Options {
     std::vector<Method> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
     std::uint64_t seed{42};
@@ -28,6 +32,11 @@ struct Options {
     int streamEvery{6};
     bool morton{}, global{}, obj{}, selfTest{}, help{}, capsuleStress{}, rayCompare{};
     int raysPerInvoker{20};
+    int shapesPerInvoker{21};
+    int spawnEvery{10};
+    bool bodyPairs{};
+    int settle{240};
+    QueryMode mode{QueryMode::Ray};
     std::vector<Method> compare{Method::Grid};
     fs::path output{"results"};
 };
@@ -36,7 +45,10 @@ void help() {
     std::cout << "voxel_world [--scheme all|mesh|grid|dag|vdb] [--seed N] [--frames N]\n"
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
-              << "  [--ray-compare] [--rays-per-invoker N] [--compare grid|vdb|dag|all]\n"
+              << "  [--ray-compare] [--rays-per-invoker N] [--sweep] [--shapes-per-invoker N]\n"
+              << "  [--collision] [--settle N] [--compare grid|vdb|dag|all]\n"
+              << "  [--trajectory] [--spawn-every N] [--body-pairs]  one backend per run, chosen by --scheme\n"
+              << "  --obj dumps the final frame: mesh.obj, <backend>.obj and bodies_<backend>.csv under --out\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
 }
@@ -89,6 +101,13 @@ Options options(int argc, char** argv) {
         else if (arg == "--capsule-stress") opts.capsuleStress = true;
         else if (arg == "--ray-compare") opts.rayCompare = true;
         else if (arg == "--rays-per-invoker") opts.raysPerInvoker = bounded(1, 10000);
+        else if (arg == "--sweep") opts.mode = QueryMode::Sweep;
+        else if (arg == "--collision") opts.mode = QueryMode::Collision;
+        else if (arg == "--shapes-per-invoker") opts.shapesPerInvoker = bounded(1, 84);
+        else if (arg == "--trajectory") opts.mode = QueryMode::Trajectory;
+        else if (arg == "--spawn-every") opts.spawnEvery = bounded(1, 10000);
+        else if (arg == "--body-pairs") opts.bodyPairs = true;
+        else if (arg == "--settle") opts.settle = bounded(0, 10000);
         else if (arg == "--compare") {
             const auto backend = next();
             if (backend == "all") opts.compare = {Method::Grid, Method::Dag, Method::Vdb};
@@ -678,50 +697,560 @@ void compareRayToMesh(const Options& opts, Method other) {
         return std::make_pair(surface + dir * 130.0, surface - dir * 85.0);
     };
 
-    // Warmup primes caches; no measurement here (VTune samples regardless).
-    for (int w = 0; w < opts.warmup; ++w) {
+    // The ray list is materialised once, so both backends receive exactly the
+    // same queries while each one is timed in its own pass. Interleaving the two
+    // inside a single loop would let one backend evict the other's data.
+    struct Ray { Vec from, to; };
+    std::vector<Ray> rays;
+    rays.reserve(std::size_t(opts.frames) * invokers.size() * std::size_t(opts.raysPerInvoker));
+    for (int frame = 0; frame < opts.frames; ++frame)
+        for (std::size_t i = 0; i < invokers.size(); ++i)
+            for (int r = 0; r < opts.raysPerInvoker; ++r) {
+                const auto [from, to] = shot(invokers[i]);
+                rays.push_back({from, to});
+            }
+
+    // Warmup primes caches per backend over a prefix of the same list; nothing
+    // here is measured (VTune samples regardless).
+    const std::size_t warmupRays =
+        std::min(rays.size(), std::size_t(opts.warmup) * invokers.size() * std::size_t(opts.raysPerInvoker));
+    auto warmup = [&](World& world) {
+        for (std::size_t r = 0; r < warmupRays; ++r) world.physics.ray(rays[r].from, rays[r].to);
+    };
+    warmup(meshWorld);
+    warmup(otherWorld);
+
+    // One timed block per backend. At ~1 us per ray the two steady_clock reads
+    // around a single call would eat a few percent of the measurement itself,
+    // so the stamp sits outside the loop and only the ray call is inside; the
+    // per-ray figure is then total / rays.
+    auto timePass = [&](World& world) {
+        const auto timer = Clock::now();
+        for (const Ray& ray : rays) world.physics.ray(ray.from, ray.to);
+        return milliseconds(timer) * 1000;  // microseconds
+    };
+
+    // Correctness is collected in a separate untimed pass, so the bookkeeping
+    // never lands inside the timed region while both backends still report
+    // exact hit counts and per-ray states for the mismatch check.
+    struct Outcome { int hits{}, unresolved{}; std::vector<Hit::State> states; };
+    auto verify = [&](World& world) {
+        Outcome outcome;
+        outcome.states.reserve(rays.size());
+        for (const Ray& ray : rays) {
+            const Hit hit = world.physics.ray(ray.from, ray.to);
+            outcome.hits += hit.state == Hit::State::Contact;
+            outcome.unresolved += hit.state == Hit::State::Unresolved;
+            outcome.states.push_back(hit.state);
+        }
+        return outcome;
+    };
+
+    const double meshMicro = timePass(meshWorld);
+    const double fieldMicro = timePass(otherWorld);
+    const Outcome meshOutcome = verify(meshWorld);
+    const Outcome fieldOutcome = verify(otherWorld);
+
+    int mismatches = 0;
+    for (std::size_t i = 0; i < meshOutcome.states.size(); ++i)
+        mismatches += meshOutcome.states[i] != fieldOutcome.states[i];
+
+    const double queries = double(std::max<std::size_t>(1, rays.size()));
+    auto report = [&](double micro, const char* label) {
+        std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
+                  << micro / queries << " us, "
+                  << (micro > 0 ? queries / (micro / 1e6) : 0) << " rays/s\n";
+    };
+
+    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [ray]: " << opts.invokers
+              << " static invokers x " << opts.raysPerInvoker << " rays x " << opts.frames << " frames = " << rays.size()
+              << " rays per backend (identical list, " << warmupRays << " warmup rays)\n"
+              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
+    report(meshMicro, "mesh");
+    report(fieldMicro, name(other));
+    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? meshMicro / fieldMicro : 0) << "x\n"
+              << "  contacts mesh " << meshOutcome.hits << ", " << name(other) << ' ' << fieldOutcome.hits
+              << ", state mismatches " << mismatches << ", unresolved " << meshOutcome.unresolved << '/'
+              << fieldOutcome.unresolved << '\n';
+
+
+}
+
+// Side-by-side sweep benchmark (--sweep): every invoker gets
+// --shapes-per-invoker shapes per frame (by default 21: seven spheres, seven
+// capsules, seven boxes), each with a random tilt and scale, so tilted boxes and
+// capsules are exercised and every kind sees its own support height. The cast
+// list of a frame is regenerated from a frame-seeded generator, so both backends
+// issue exactly the same shapes in the same order. Invokers stay at their frame-0
+// positions and the clipmap is built once, so no chunk is rebuilt; each backend
+// is timed in its own pass, one timed region per frame that contains nothing but
+// the sweep calls (the cast generation sits outside the clock stamps).
+void compareSweepToMesh(const Options& opts, Method other) {
+    Planet planet(opts.seed);
+    World meshWorld(planet, Method::Mesh, false);
+    World otherWorld(planet, other, false);
+
+    const auto invokers = invokerPositions(planet, opts.invokers, 0.0);
+    const WorldStats meshBuild = meshWorld.update(invokers, opts.global, std::nullopt);
+    const WorldStats otherBuild = otherWorld.update(invokers, opts.global, std::nullopt);
+
+    // One shape of the invoker's three kinds: the up axis is tilted by up to
+    // ~0.22 rad in a random azimuth and the size is scaled 0.7x..1.5x.
+    auto shapeAt = [&](Vec anchor, int index, auto& random) {
+        const Vec up = unit(anchor);
+        const auto axes = frameAt(up);
+        const double azimuth = 6.283185307179586 * random();
+        const double tilt = 0.45 * (random() - 0.5);
+        const Vec tilted = unit(up + (axes[0] * std::cos(azimuth) + axes[1] * std::sin(azimuth)) * tilt);
+        Shape shape = sampleShape(index % 3 + 1, tilted);
+        shape.size = shape.size * (0.7 + 0.8 * random());
+        return shape;
+    };
+
+    // Sweep a random surface target near the invoker, starting clear above the
+    // surface and ending well below it, so a contact exists exactly once.
+    auto placement = [&](Vec anchor, const Shape& shape, auto& random) {
+        const Vec up = unit(anchor);
+        const auto axes = frameAt(up);
+        const Vec dir = unit(up * planetRadius + axes[0] * (1100 * (random() - 0.5))
+                                                + axes[1] * (1100 * (random() - 0.5)));
+        const Vec surface = planet.surface(dir);
+        const double support = dot(abs(dir), shape.extents());
+        return std::make_pair(surface + dir * (support + 120.0), surface - dir * (support + 60.0));
+    };
+
+    struct Cast { Shape shape; Vec from, to; };
+
+    // The casts of one frame are regenerated from a frame-seeded generator, so
+    // every pass issues exactly the same shapes, placements and order without
+    // having to keep a copy of the whole run in memory.
+    auto fillFrame = [&](int frame, std::uint64_t salt, std::vector<Cast>& casts) {
+        std::mt19937_64 rng(opts.seed ^ (salt * std::uint64_t(frame + 1)));
+        auto random = [&] { return (rng() >> 11) * 0x1p-53; };
+        casts.clear();
         for (std::size_t i = 0; i < invokers.size(); ++i) {
-            const auto [from, to] = shot(invokers[i]);
-            meshWorld.physics.ray(from, to);
-            otherWorld.physics.ray(from, to);
+            for (int k = 0; k < opts.shapesPerInvoker; ++k) {
+                const Shape shape = shapeAt(invokers[i], k, random);
+                const auto [from, to] = placement(invokers[i], shape, random);
+                casts.push_back({shape, from, to});
+            }
+        }
+    };
+
+    constexpr std::uint64_t measuredSalt = 0x51ed270b1a6c3f27ULL;
+    constexpr std::uint64_t warmupSalt = 0x2545f4914f6cdd1dULL;
+    const std::size_t perFrame = invokers.size() * std::size_t(opts.shapesPerInvoker);
+    const double sweeps = double(std::max<std::size_t>(1, std::size_t(opts.frames) * perFrame));
+
+    // Warmup primes caches per backend on its own set of casts; nothing here is
+    // measured.
+    std::vector<Cast> casts;
+    for (int w = 0; w < opts.warmup; ++w) {
+        fillFrame(w, warmupSalt, casts);
+        for (const Cast& cast : casts) meshWorld.physics.sweep(cast.shape, cast.from, cast.to);
+        for (const Cast& cast : casts) otherWorld.physics.sweep(cast.shape, cast.from, cast.to);
+    }
+
+    // One timed region per frame per backend: the cast generation sits outside
+    // the stamps, so only the sweep calls are inside and the per-frame
+    // microseconds are summed. The 2 x frames clock reads (20-40 ns each) are the
+    // whole overhead -- about 0.002 us per sweep at the default sizes -- and
+    // nothing has to be subtracted afterwards.
+    auto timePass = [&](World& world) {
+        std::vector<Cast> local;
+        local.reserve(perFrame);
+        double micro = 0.0;
+        for (int frame = 0; frame < opts.frames; ++frame) {
+            fillFrame(frame, measuredSalt, local);
+            const auto timer = Clock::now();
+            for (const Cast& cast : local) world.physics.sweep(cast.shape, cast.from, cast.to);
+            micro += milliseconds(timer) * 1000;
+        }
+        return micro;  // microseconds
+    };
+
+    // Correctness is checked in a separate untimed pass, which issues both
+    // backends on the same cast so it can also compare the times of impact.
+    struct Verdict { int meshContacts{}, otherContacts{}, mismatches{}, initial{}; std::vector<double> errors; };
+    auto verify = [&]() {
+        Verdict verdict;
+        std::vector<Cast> local;
+        local.reserve(perFrame);
+        for (int frame = 0; frame < opts.frames; ++frame) {
+            fillFrame(frame, measuredSalt, local);
+            for (const Cast& cast : local) {
+                const Hit meshHit = meshWorld.physics.sweep(cast.shape, cast.from, cast.to);
+                const Hit otherHit = otherWorld.physics.sweep(cast.shape, cast.from, cast.to);
+                verdict.meshContacts += meshHit.state == Hit::State::Contact;
+                verdict.otherContacts += otherHit.state == Hit::State::Contact;
+                verdict.mismatches += meshHit.state != otherHit.state;
+                verdict.initial += meshHit.initial || otherHit.initial;
+                if (meshHit.state == Hit::State::Contact && otherHit.state == Hit::State::Contact)
+                    verdict.errors.push_back(std::abs(meshHit.fraction - otherHit.fraction) * length(cast.to - cast.from));
+            }
+        }
+        std::sort(verdict.errors.begin(), verdict.errors.end());
+        return verdict;
+    };
+
+    const double meshMicro = timePass(meshWorld);
+    const double fieldMicro = timePass(otherWorld);
+    Verdict verdict = verify();
+
+    auto report = [&](double micro, const char* label) {
+        std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
+                  << micro / sweeps << " us, " << (micro > 0 ? sweeps / (micro / 1e6) : 0) << " sweeps/s\n";
+    };
+    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [sweep]: " << opts.invokers
+              << " static invokers x " << opts.shapesPerInvoker << " shapes x " << opts.frames << " frames = "
+              << std::size_t(opts.frames) * perFrame << " sweeps per backend (identical list)\n"
+              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
+    report(meshMicro, "mesh");
+    report(fieldMicro, name(other));
+    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? meshMicro / fieldMicro : 0) << "x\n"
+              << "  contacts mesh " << verdict.meshContacts << ", " << name(other) << ' ' << verdict.otherContacts
+              << ", initial " << verdict.initial << ", state mismatches " << verdict.mismatches << '\n';
+    if (!verdict.errors.empty()) {
+        std::cout << "  paired " << verdict.errors.size() << ", p95 TOI difference " << percentile(verdict.errors, 0.95)
+                  << " m, max " << verdict.errors.back() << " m\n";
+    }
+}
+
+// Side-by-side collision benchmark (--collision): the same shapes are dropped
+// onto the terrain in the mesh world and in one field world, then both are
+// stepped in lockstep, so every narrowphase and manifold build runs twice per
+// frame. After --settle frames the mesh world's body states are captured once
+// and re-applied to both worlds at the start of every measured frame, so the
+// two backends always process identical inputs and no body drifts into a
+// neighbour: the only collision pairs that can appear are body-terrain ones.
+// Body-body contacts are counted and reported, so a broken premise is visible.
+void compareCollisionToMesh(const Options& opts, Method other) {
+    Planet planet(opts.seed);
+    World meshWorld(planet, Method::Mesh, false);
+    World otherWorld(planet, other, false);
+
+    const auto invokers = invokerPositions(planet, opts.invokers, 0.0);
+    const WorldStats meshBuild = meshWorld.update(invokers, opts.global, std::nullopt);
+    const WorldStats otherBuild = otherWorld.update(invokers, opts.global, std::nullopt);
+
+    std::mt19937_64 rng(opts.seed ^ 0x2545f4914f6cdd1dULL);
+    auto random = [&] { return (rng() >> 11) * 0x1p-53; };
+
+    struct Drop { Shape shape; Vec position; Vec velocity; };
+    std::vector<Drop> drops;
+    drops.reserve(invokers.size() * std::size_t(opts.shapesPerInvoker));
+    for (std::size_t i = 0; i < invokers.size(); ++i) {
+        const auto axes = frameAt(unit(invokers[i]));
+        for (int k = 0; k < opts.shapesPerInvoker; ++k) {
+            // 3 columns x 7 rows for the default 21 shapes, 160 m apart.
+            const double column = double(k % 3) - 1.0;
+            const double row = double(k / 3) - 3.0;
+            const Vec up = unit(invokers[i] + axes[0] * (160.0 * column) + axes[1] * (160.0 * row));
+            const auto basis = frameAt(up);
+            const double azimuth = 6.283185307179586 * random();
+            const double tilt = 0.45 * (random() - 0.5);
+            const Vec tilted = unit(up + (basis[0] * std::cos(azimuth) + basis[1] * std::sin(azimuth)) * tilt);
+            Shape shape = sampleShape(k % 3 + 1, tilted);
+            shape.size = shape.size * (0.7 + 0.8 * random());
+            const double support = dot(abs(up), shape.extents());
+            const Vec position = planet.surface(up) + up * (support + 40.0 + 25.0 * random());
+            drops.push_back({shape, position, up * -18.0});
+        }
+    }
+    for (const Drop& drop : drops) {
+        meshWorld.physics.addBody(drop.shape, drop.position, drop.velocity);
+        otherWorld.physics.addBody(drop.shape, drop.position, drop.velocity);
+    }
+
+    constexpr double dt = 1.0 / 60;
+    // Track when the first terrain contact appears, so an undersized --settle is
+    // visible instead of silently measuring a free fall.
+    int meshLanding = -1, otherLanding = -1;
+    for (int i = 0; i < opts.settle; ++i) {
+        meshWorld.physics.step(dt, true);
+        otherWorld.physics.step(dt, true);
+        if (meshLanding < 0 && meshWorld.physics.terrainContacts() > 0) meshLanding = i + 1;
+        if (otherLanding < 0 && otherWorld.physics.terrainContacts() > 0) otherLanding = i + 1;
+    }
+    int meshMoving = 0, otherMoving = 0;
+    double meshSpeed = 0, otherSpeed = 0;
+    for (std::size_t i = 0; i < drops.size(); ++i) {
+        const double a = meshWorld.physics.bodySpeed(i), b = otherWorld.physics.bodySpeed(i);
+        meshMoving += a > 0.5;
+        otherMoving += b > 0.5;
+        meshSpeed += a;
+        otherSpeed += b;
+    }
+    meshSpeed /= std::max<std::size_t>(1, drops.size());
+    otherSpeed /= std::max<std::size_t>(1, drops.size());
+
+    // Canonical state captured once after settling; every measured frame starts
+    // from it in both worlds.
+    std::vector<BodyState> canonical(drops.size());
+    for (std::size_t i = 0; i < drops.size(); ++i) canonical[i] = meshWorld.physics.bodyState(i);
+
+    int meshContacts = 0, otherContacts = 0, meshMax = 0, otherMax = 0, worstGap = 0;
+    int meshBody = 0, otherBody = 0, bodyFrames = 0;
+    for (int frame = 0; frame < opts.frames; ++frame) {
+        for (std::size_t i = 0; i < drops.size(); ++i) {
+            meshWorld.physics.setBodyState(i, canonical[i]);
+            otherWorld.physics.setBodyState(i, canonical[i]);
+        }
+        meshWorld.physics.step(dt, true);
+        otherWorld.physics.step(dt, true);
+        const int a = meshWorld.physics.terrainContacts(), b = otherWorld.physics.terrainContacts();
+        meshContacts += a;
+        otherContacts += b;
+        meshMax = std::max(meshMax, a);
+        otherMax = std::max(otherMax, b);
+        worstGap = std::max(worstGap, std::abs(a - b));
+        const int c = meshWorld.physics.bodyContacts(), d = otherWorld.physics.bodyContacts();
+        meshBody = std::max(meshBody, c);
+        otherBody = std::max(otherBody, d);
+        bodyFrames += c > 0 || d > 0;
+    }
+
+    int meshBelow = 0, otherBelow = 0;
+    double meanDrift = 0, maxDrift = 0, closestGap = 0;
+    std::vector<Vec> centers(drops.size()), halfExtents(drops.size());
+    for (std::size_t i = 0; i < drops.size(); ++i) {
+        const BodyPose meshPose = meshWorld.physics.bodyPose(i);
+        const Vec b = otherWorld.physics.bodyPosition(i);
+        meshBelow += planet.sdf(meshPose.position) < -1;
+        otherBelow += planet.sdf(b) < -1;
+        const double drift = length(meshPose.position - b);
+        meanDrift += drift;
+        maxDrift = std::max(maxDrift, drift);
+        Shape posed = drops[i].shape;
+        posed.axes = meshPose.axes;                     // current orientation
+        centers[i] = meshPose.position;
+        halfExtents[i] = posed.extents();               // half extents on world axes
+    }
+    meanDrift /= std::max<std::size_t>(1, drops.size());
+    // The most separated world axis decides whether two AABBs can overlap, so a
+    // positive gap for every pair means the only pairs Bullet produced were
+    // body-terrain ones.
+    bool firstPair = true;
+    for (std::size_t i = 0; i < centers.size(); ++i) {
+        for (std::size_t j = i + 1; j < centers.size(); ++j) {
+            const Vec delta = abs(centers[i] - centers[j]);
+            const Vec reach = halfExtents[i] + halfExtents[j];
+            const double gap = std::max(std::max(delta.x - reach.x, delta.y - reach.y), delta.z - reach.z);
+            closestGap = firstPair ? gap : std::min(closestGap, gap);
+            firstPair = false;
         }
     }
 
-    int rays = 0, meshContacts = 0, otherContacts = 0, mismatches = 0;
+    // Final frame snapshot: the terrain mesh of both worlds plus one row per
+    // rigid body with its resting center, so the two backends can be diffed
+    // offline instead of only through the aggregate contact counts above.
+    if (opts.obj) {
+        fs::create_directories(opts.output);
+        const Vec camera = replayCamera(invokers.front(), 0);
+        const fs::path meshPath = opts.output / "mesh.obj";
+        const fs::path otherPath = opts.output / (std::string(name(other)) + ".obj");
+        const fs::path bodyPath = opts.output / (std::string("bodies_") + name(other) + ".csv");
+        exportMesh(meshPath, meshWorld, invokers, camera);
+        exportMesh(otherPath, otherWorld, invokers, camera);
+        auto bodies = createFile(bodyPath);
+        bodies << "# kind is sphere, capsule or box; positions are the final centers of mass in meters\n";
+        bodies << "id,kind,size_x,size_y,size_z,mesh_x,mesh_y,mesh_z,other_x,other_y,other_z,drift,mesh_speed,other_speed\n";
+        for (std::size_t i = 0; i < drops.size(); ++i) {
+            const Shape& shape = drops[i].shape;
+            const char* kind = shape.kind == ShapeKind::Sphere ? "sphere"
+                             : shape.kind == ShapeKind::Capsule ? "capsule" : "box";
+            const Vec a = meshWorld.physics.bodyPose(i).position;
+            const Vec b = otherWorld.physics.bodyPosition(i);
+            bodies << i << ',' << kind << ',' << shape.size.x << ',' << shape.size.y << ',' << shape.size.z
+                   << ',' << a.x << ',' << a.y << ',' << a.z << ',' << b.x << ',' << b.y << ',' << b.z
+                   << ',' << length(a - b) << ',' << meshWorld.physics.bodySpeed(i) << ','
+                   << otherWorld.physics.bodySpeed(i) << '\n';
+        }
+        std::cout << "  wrote " << meshPath.string() << ", " << otherPath.string() << ", " << bodyPath.string()
+                  << '\n';
+    }
+
+    const double steps = std::max(1, opts.frames);
+    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [collision]: " << opts.invokers
+              << " static invokers x " << opts.shapesPerInvoker << " shapes = " << drops.size() << " bodies, settle "
+              << opts.settle << ", " << opts.frames << " measured steps\n"
+              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n"
+              << "  terrain contacts per step: mesh mean " << meshContacts / steps << " max " << meshMax << ", "
+              << name(other) << " mean " << otherContacts / steps << " max " << otherMax << ", worst gap " << worstGap
+              << '\n'
+              << "  settle " << opts.settle << " steps (" << opts.settle * dt << " s): first terrain contact at step mesh "
+              << meshLanding << ", " << name(other) << ' ' << otherLanding << '\n'
+              << "  at measurement start: still moving (>0.5 m/s) mesh " << meshMoving << '/' << drops.size()
+              << " (mean " << meshSpeed << " m/s), " << name(other) << ' ' << otherMoving << '/' << drops.size()
+              << " (mean " << otherSpeed << " m/s); every frame restarts from that captured state\n"
+              << "  body-body contacts (max per frame): mesh " << meshBody << ", " << name(other) << ' ' << otherBody
+              << " over " << bodyFrames << " frames"
+              << ((meshBody || otherBody) ? "  WARNING: a body pair was generated\n" : "  (pairs stayed body-terrain)\n")
+              << "  bodies below analytic surface: mesh " << meshBelow << ", " << name(other) << ' ' << otherBelow
+              << '\n'
+              << "  body drift after " << opts.settle << '+' << opts.frames << " steps: mean " << meanDrift
+              << " m, max " << maxDrift << " m\n"
+              << "  closest body AABB gap " << closestGap << " m (positive means no body-body pair)\n";
+}
+
+// One backend per process: the trajectory, the spawn schedule, the shapes and
+// the launch velocities are all prescribed here, so two runs only differ in the
+// terrain representation. Nothing in this loop reads the physics state back, so
+// the runs are independent and can be launched as separate processes.
+void compareTrajectory(const Options& opts, Method method) {
+    Planet planet(opts.seed);
+    World world(planet, method, opts.morton);
+    const auto start = invokerPositions(planet, opts.invokers, 0.0);
+    const WorldStats initial = world.update(start, opts.global, std::nullopt);
+
+    struct Spawned { Shape shape; Vec position; Vec velocity; int frame; int invoker; };
+    std::vector<Spawned> spawned;
+    std::mt19937_64 rng(opts.seed ^ 0x5f2b7cd19e4a83c7ULL);
+    auto random = [&] { return (rng() >> 11) * 0x1p-53; };
+
+    constexpr double dt = 1.0 / 60;
+    double updateMs = 0;
+    int updates = 0, built = 0, contactSum = 0, contactMax = 0, bodyPairMax = 0;
+
     for (int frame = 0; frame < opts.frames; ++frame) {
-        for (std::size_t i = 0; i < invokers.size(); ++i) {
-            for (int r = 0; r < opts.raysPerInvoker; ++r) {
-                const auto [from, to] = shot(invokers[i]);
-                const Hit meshHit = meshWorld.physics.ray(from, to);
-                const Hit otherHit = otherWorld.physics.ray(from, to);
-                ++rays;
-                meshContacts += meshHit.state == Hit::State::Contact;
-                otherContacts += otherHit.state == Hit::State::Contact;
-                mismatches += meshHit.state != otherHit.state;
+        const auto moving = invokerPositions(planet, opts.invokers, double(frame));
+        if (frame > 0 && frame % opts.streamEvery == 0) {
+            const WorldStats stats = world.update(moving, opts.global, std::nullopt);
+            updateMs += stats.updateMs;
+            built += stats.build.built;
+            ++updates;
+        }
+        // Terrain first, then the batch, so the new bodies land on coverage
+        // that already includes this frame's invoker positions.
+        if (frame % opts.spawnEvery == 0) {
+            for (std::size_t i = 0; i < moving.size(); ++i) {
+                const auto axes = frameAt(unit(moving[i]));
+                for (int k = 0; k < opts.shapesPerInvoker; ++k) {
+                    // 3 columns x 7 rows, 160 m apart, around the invoker.
+                    const double column = double(k % 3) - 1.0;
+                    const double row = double(k / 3) - 3.0;
+                    const Vec up = unit(moving[i] + axes[0] * (160.0 * column) + axes[1] * (160.0 * row));
+                    const auto basis = frameAt(up);
+                    const double azimuth = 6.283185307179586 * random();
+                    const double tilt = 0.45 * (random() - 0.5);
+                    const Vec tilted = unit(up + (basis[0] * std::cos(azimuth) + basis[1] * std::sin(azimuth)) * tilt);
+                    Shape shape = sampleShape(k % 3 + 1, tilted);
+                    shape.size = shape.size * (0.7 + 0.8 * random());
+                    const double support = dot(abs(up), shape.extents());
+                    const Vec position = planet.surface(up) + up * (support + 40.0 + 25.0 * random());
+                    const Vec velocity = up * -18.0;
+                    if (opts.bodyPairs) world.physics.addBody(shape, position, velocity);
+                    else world.physics.addTerrainOnlyBody(shape, position, velocity);
+                    spawned.push_back({shape, position, velocity, frame, int(i)});
+                }
             }
         }
+        world.physics.step(dt, true);
+        const int contacts = world.physics.terrainContacts();
+        contactSum += contacts;
+        contactMax = std::max(contactMax, contacts);
+        bodyPairMax = std::max(bodyPairMax, world.physics.bodyContacts());
     }
-    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh: " << opts.frames << " frames, "
-              << opts.invokers << " static invokers x " << opts.raysPerInvoker << " rays per frame = " << rays
-              << " ray pairs\n"
-              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n"
-              << "  contacts mesh " << meshContacts << ", " << name(other) << ' ' << otherContacts << ", state mismatches "
-              << mismatches << '\n';
+
+    int below = 0, resting = 0;
+    double speedSum = 0, speedMax = 0;
+    for (std::size_t i = 0; i < spawned.size(); ++i) {
+        below += planet.sdf(world.physics.bodyPosition(i)) < -1;
+        const double speed = world.physics.bodySpeed(i);
+        speedSum += speed;
+        speedMax = std::max(speedMax, speed);
+        resting += speed < 0.5;
+    }
+    const double bodies = double(std::max<std::size_t>(1, spawned.size()));
+    const double frames = double(std::max(1, opts.frames));
+
+    if (opts.obj) {
+        fs::create_directories(opts.output);
+        const Vec camera = replayCamera(start.front(), 0);
+        const auto finalInvokers = invokerPositions(planet, opts.invokers, double(opts.frames - 1));
+        const fs::path meshPath = opts.output / (std::string(name(method)) + ".obj");
+        const fs::path bodyPath = opts.output / (std::string("trajectory_") + name(method) + ".csv");
+        exportMesh(meshPath, world, finalInvokers, camera);
+        auto out = createFile(bodyPath);
+        out << "# one row per spawned body; positions are centers of mass in meters, velocities in m/s\n";
+        out << "# spawn_p* is the prescribed launch pose, identical for every backend\n";
+        out << "id,spawn_frame,age,invoker,kind,size_x,size_y,size_z,spawn_px,spawn_py,spawn_pz,"
+               "px,py,pz,vx,vy,vz,speed\n";
+        for (std::size_t i = 0; i < spawned.size(); ++i) {
+            const Spawned& body = spawned[i];
+            const Vec p = world.physics.bodyPose(i).position;
+            const Vec v = world.physics.bodyState(i).velocity;
+            const char* kind = body.shape.kind == ShapeKind::Sphere ? "sphere"
+                             : body.shape.kind == ShapeKind::Capsule ? "capsule" : "box";
+            out << i << ',' << body.frame << ',' << (opts.frames - 1 - body.frame) << ',' << body.invoker << ',' << kind
+                << ',' << body.shape.size.x << ',' << body.shape.size.y << ',' << body.shape.size.z
+                << ',' << body.position.x << ',' << body.position.y << ',' << body.position.z
+                << ',' << p.x << ',' << p.y << ',' << p.z
+                << ',' << v.x << ',' << v.y << ',' << v.z << ',' << length(v) << '\n';
+        }
+        std::cout << "  wrote " << meshPath.string() << ", " << bodyPath.string() << '\n';
+    }
+
+    std::cout << std::fixed << std::setprecision(3) << name(method) << " [trajectory]: " << opts.invokers
+              << " moving invokers, spawn " << opts.shapesPerInvoker << " shapes every " << opts.spawnEvery
+              << " frames for " << opts.frames << " frames (" << opts.frames * dt << " s) -> " << spawned.size()
+              << " bodies" << (opts.bodyPairs ? ", body-body pairs enabled\n" : ", terrain-only pairs\n")
+              << "  build " << initial.updateMs << " ms, " << updates << " terrain updates " << updateMs << " ms ("
+              << built << " chunks built)\n"
+              << "  terrain contacts per step: mean " << contactSum / frames << " max " << contactMax
+              << ", body-body contacts max " << bodyPairMax << '\n'
+              << "  at the end: still moving (>0.5 m/s) " << (int(spawned.size()) - resting) << '/' << spawned.size()
+              << " (mean " << speedSum / bodies << " m/s, max " << speedMax << " m/s)\n"
+              << "  bodies below analytic surface: " << below << '\n';
 }
 
 // Each entry point compares one field backend against the mesh baseline on the
-// same rays; main() dispatches with --compare (default grid).
+// same queries; queryCompare() dispatches with --compare (default grid).
 void gridRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Grid); }
 void vdbRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Vdb); }
 void dagRayCompare(const Options& opts) { compareRayToMesh(opts, Method::Dag); }
+void gridSweepCompare(const Options& opts) { compareSweepToMesh(opts, Method::Grid); }
+void vdbSweepCompare(const Options& opts) { compareSweepToMesh(opts, Method::Vdb); }
+void dagSweepCompare(const Options& opts) { compareSweepToMesh(opts, Method::Dag); }
+void gridCollisionCompare(const Options& opts) { compareCollisionToMesh(opts, Method::Grid); }
+void vdbCollisionCompare(const Options& opts) { compareCollisionToMesh(opts, Method::Vdb); }
+void dagCollisionCompare(const Options& opts) { compareCollisionToMesh(opts, Method::Dag); }
 
-void rayCompare(const Options& opts) {
+void queryCompare(const Options& opts) {
+    if (opts.mode == QueryMode::Trajectory) {
+        // One world at a time, and it is destroyed before the next backend starts,
+        // so memory and cache never mix two representations.
+        for (const Method method : opts.methods) compareTrajectory(opts, method);
+        return;
+    }
     for (const Method method : opts.compare) {
-        switch (method) {
-            case Method::Grid: gridRayCompare(opts); break;
-            case Method::Vdb: vdbRayCompare(opts); break;
-            case Method::Dag: dagRayCompare(opts); break;
-            default: break;  // mesh has no field counterpart to compare against
+        switch (opts.mode) {
+            case QueryMode::Ray:
+                switch (method) {
+                    case Method::Grid: gridRayCompare(opts); break;
+                    case Method::Vdb: vdbRayCompare(opts); break;
+                    case Method::Dag: dagRayCompare(opts); break;
+                    default: break;  // mesh has no field counterpart to compare against
+                }
+                break;
+            case QueryMode::Sweep:
+                switch (method) {
+                    case Method::Grid: gridSweepCompare(opts); break;
+                    case Method::Vdb: vdbSweepCompare(opts); break;
+                    case Method::Dag: dagSweepCompare(opts); break;
+                    default: break;
+                }
+                break;
+            case QueryMode::Collision:
+                switch (method) {
+                    case Method::Grid: gridCollisionCompare(opts); break;
+                    case Method::Vdb: vdbCollisionCompare(opts); break;
+                    case Method::Dag: dagCollisionCompare(opts); break;
+                    default: break;
+                }
+                break;
+            case QueryMode::Trajectory:
+                break;  // handled above, one backend per run
         }
     }
 }
@@ -732,7 +1261,7 @@ int main(int argc, char** argv) {
     using namespace voxel;
     try {
         const auto opts = options(argc, argv);
-        rayCompare(opts); return 0;
+        queryCompare(opts); return 0;
         //if (opts.help) { help(); return 0; }
         //if (opts.selfTest) { selfTest(); return 0; }
         //if (opts.rayCompare) { rayCompare(opts); return 0; }
