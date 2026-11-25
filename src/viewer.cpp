@@ -6,6 +6,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,13 +24,13 @@ constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Sweep };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, Wireframe> toolbarButtons{{
+constexpr std::array<ToolbarButton, Sweep> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
-    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}
+    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}, {L"Sweep [S]", 96}
 }};
 
 struct Options {
@@ -149,6 +150,17 @@ void appendBeacon(std::vector<Vertex>& batch, Vec surface, double size, bool sel
     }
 }
 
+// A small three axis cross marks the point a sweep reported as its contact.
+void appendCross(std::vector<Vertex>& lines, Vec p, double size, std::uint32_t material) {
+    for (int axis = 0; axis < 3; ++axis) {
+        Vec a = p, b = p;
+        a[axis] -= size;
+        b[axis] += size;
+        lines.push_back(vertex(a, {0, 0, 1}, material));
+        lines.push_back(vertex(b, {0, 0, 1}, material));
+    }
+}
+
 class App {
 public:
     explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed), method_(opts_.method) {}
@@ -247,6 +259,7 @@ public:
                 updateFooter();
                 statsElapsed = 0;
             }
+            if (sweepView_) retarget();
             buildObjects();
             renderer_->draw(camera(), objects_);
         }
@@ -255,10 +268,22 @@ public:
 
 private:
     struct VisibleBody { std::size_t index; Shape shape; std::uint32_t material; };
+    // One frame of the sweep test that main.cpp benchmarks: a random capsule cast
+    // near the selected invoker, answered by the active backend and, when the
+    // active backend is a field, by a mesh world built alongside it.
+    struct SweepProbe {
+        Shape shape;
+        Vec from{}, to{};
+        Hit hit{}, meshHit{};
+        bool valid{}, hasMesh{};
+    };
 
     void rebuild() {
         simulationTime_ = 0;
         shapes_.clear();
+        sweepProbe_ = SweepProbe{};
+        sweepRng_.seed(opts_.seed ^ 0x51ed270b1a6c3f27ULL);
+        if (method_ == 0) sweepMesh_.reset();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton);
         refreshTerrain(true);
         for (int i = 0; i < opts_.invokers; ++i) spawn(i);
@@ -287,6 +312,48 @@ private:
         invokers_ = invokerPositions(planet_, opts_.invokers, simulationTime_ * 2.0);
     }
 
+    // The mesh reference only exists while the sweep view is on and the active
+    // backend is a field: the comparison is mesh BVH against the field answer.
+    void ensureSweepMesh() {
+        if (method_ == 0) {
+            sweepMesh_.reset();
+            return;
+        }
+        if (sweepMesh_) return;
+        sweepMesh_ = std::make_unique<World>(planet_, Method::Mesh, opts_.morton);
+        sweepMesh_->update(invokers_, true, camera().eye);
+    }
+
+    // One random capsule per frame, built the same way compareSweepToMesh carries
+    // its casts: a tilt of up to ~0.22 rad and a 0.7x..1.5x scale, swept from
+    // clear above a random surface point near the invoker to well below it.
+    void retarget() {
+        ensureSweepMesh();
+        const Vec anchor = invokers_[selected_];
+        const Vec up = unit(anchor);
+        const auto axes = frameAt(up);
+        auto random = [&] { return (sweepRng_() >> 11) * 0x1p-53; };
+        const double azimuth = 2 * pi * random();
+        const double tilt = 0.45 * (random() - 0.5);
+        const Vec tilted = unit(up + (axes[0] * std::cos(azimuth) + axes[1] * std::sin(azimuth)) * tilt);
+        Shape shape = sampleShape(2, tilted);
+        shape.size = shape.size * (0.7 + 0.8 * random());
+        const Vec dir = unit(up * planetRadius + axes[0] * (1100 * (random() - 0.5)) + axes[1] * (1100 * (random() - 0.5)));
+        const Vec surface = planet_.surface(dir);
+        const double support = dot(abs(dir), shape.extents());
+        sweepProbe_ = SweepProbe{};
+        sweepProbe_.shape = shape;
+        sweepProbe_.from = surface + dir * (support + 120.0);
+        sweepProbe_.to = surface - dir * (support + 60.0);
+        const auto timer = Clock::now();
+        sweepProbe_.hit = world_->physics.sweep(shape, sweepProbe_.from, sweepProbe_.to);
+        sweepUs_ = milliseconds(timer) * 1000;
+        sweepProbe_.hasMesh = sweepMesh_ != nullptr;
+        if (sweepProbe_.hasMesh) sweepProbe_.meshHit = sweepMesh_->physics.sweep(shape, sweepProbe_.from, sweepProbe_.to);
+        sweepProbe_.valid = true;
+        refreshLines();
+    }
+
     void refreshTerrain(bool force) {
         invokers_ = invokerPositions(planet_, opts_.invokers, simulationTime_ * 2.0);
         updateTerrain(force);
@@ -298,7 +365,11 @@ private:
 
     void applyTerrain(const WorldStats& stats, bool force) {
         streamMs_ = stats.updateMs;
-        if (showRanges_) refreshRanges();
+        // Keep the mesh reference on the same published terrain, otherwise a sweep
+        // near an invoker that just streamed in would compare against old chunks.
+        if (sweepMesh_ && (force || stats.build.built != 0 || stats.build.removed != 0))
+            sweepMesh_->update(invokers_, true, camera().eye);
+        if (showRanges_ || sweepView_) refreshLines();
         if (!force && stats.build.built == 0 && stats.build.removed == 0) return;
         std::vector<Vertex> geometry;
         geometry.reserve(world_->meshBytes() / sizeof(Triangle) * 3);
@@ -321,7 +392,9 @@ private:
         renderer_->setTerrain(geometry);
     }
 
-    void refreshRanges() {
+    // Clipmap windows and the sweep overlay share one line buffer, because the
+    // renderer only owns a single line list.
+    void refreshLines() {
         std::vector<Vertex> lines;
         if (showRanges_) {
             constexpr Vec shades[] = {{0.25, 0.91, 1}, {0.40, 1, 0.54}, {1, 0.76, 0.28}, {0.81, 0.53, 1}};
@@ -337,6 +410,15 @@ private:
                     lines.push_back(vertex(b, {0, 0, 1}, tint));
                 }
             }
+        }
+        if (sweepView_ && sweepProbe_.valid) {
+            const auto path = color(Vec{0.62, 0.70, 0.82}, 255);
+            lines.push_back(vertex(sweepProbe_.from, {0, 0, 1}, path));
+            lines.push_back(vertex(sweepProbe_.to, {0, 0, 1}, path));
+            if (sweepProbe_.hasMesh && sweepProbe_.meshHit.state == Hit::State::Contact)
+                appendCross(lines, sweepProbe_.meshHit.position, 9.0, color(Vec{1.0, 0.62, 0.30}, 255));
+            if (sweepProbe_.hit.state == Hit::State::Contact)
+                appendCross(lines, sweepProbe_.hit.position, 6.0, color(Vec{0.30, 0.96, 1.0}, 255));
         }
         renderer_->setClipmapLines(lines);
     }
@@ -357,6 +439,20 @@ private:
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             appendBeacon(objects_, invokers_[i], surface_ ? 24 : 380, i == selected_);
         }
+        if (sweepView_ && sweepProbe_.valid) appendSweepCapsules();
+    }
+
+    // The capsule is drawn where each backend stopped: the mesh answer first in
+    // warm orange, then the active backend in cyan on top, so when they agree the
+    // cyan silhouette covers the orange one.
+    void appendSweepCapsules() {
+        const Vec delta = sweepProbe_.to - sweepProbe_.from;
+        auto centerOf = [&](const Hit& hit) {
+            return hit.state == Hit::State::Contact ? sweepProbe_.from + delta * hit.fraction : sweepProbe_.from;
+        };
+        if (sweepProbe_.hasMesh)
+            appendRound(objects_, sweepProbe_.shape, centerOf(sweepProbe_.meshHit), color(Vec{1.0, 0.62, 0.30}, 255));
+        appendRound(objects_, sweepProbe_.shape, centerOf(sweepProbe_.hit), color(Vec{0.30, 0.96, 1.0}, 255));
     }
 
     Camera camera() const {
@@ -421,10 +517,10 @@ private:
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-wireframe.bmp"));
             action(Wireframe);
             showRanges_ = true;
-            refreshRanges();
+            refreshLines();
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-ranges.bmp"));
             showRanges_ = false;
-            refreshRanges();
+            refreshLines();
             report << prefix << " triangles=" << triangles_ << " invokers=" << opts_.invokers << " bodies=" << shapes_.size()
                    << " peak_contacts=" << maxContacts << '\n';
             if (maxContacts == 0) throw std::runtime_error("Capture scenario did not observe terrain contact");
@@ -443,7 +539,22 @@ private:
         else if (command == Wireframe) wireframe_ = !wireframe_;
         else if (command == Ranges) {
             showRanges_ = !showRanges_;
-            refreshRanges();
+            refreshLines();
+        }
+        else if (command == Sweep) {
+            sweepView_ = !sweepView_;
+            if (sweepView_) {
+                surface_ = true;
+                // A cast is only ~200 m long, so the surface view pulls in close
+                // enough to read the capsule and its contact.
+                surfaceDistance_ = std::min(surfaceDistance_, 900.0);
+                ensureSweepMesh();
+                retarget();
+            } else {
+                sweepProbe_ = SweepProbe{};
+                sweepMesh_.reset();
+                refreshLines();
+            }
         }
         else if (command == Pause) paused_ = !paused_;
         else if (command == Drop) {
@@ -476,6 +587,7 @@ private:
         else if (code == 'L') action(Tint);
         else if (code == 'K') action(Ranges);
         else if (code == 'W') action(Wireframe);
+        else if (code == 'S') action(Sweep);
         else if (code == 'B') action(Drop);
         else if (code == 'R') action(Reset);
         else if (code == VK_SPACE) action(Pause);
@@ -538,10 +650,35 @@ private:
         SetTextColor(dc, RGB(152, 170, 193));
         row.top += 22;
         row.bottom += 22;
-        const wchar_t* controls = lodTint_ || showRanges_
-            ? L"LOD 0 Cyan 50 m   /   LOD 1 Green 100 m   /   LOD 2 Gold 200 m   /   LOD 3 Violet 400 m"
-            : L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
-        DrawTextW(dc, controls, -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        std::wstring controls;
+        if (sweepView_) {
+            std::wostringstream sweep;
+            constexpr const wchar_t* labels[] = {L"miss", L"contact", L"unresolved"};
+            sweep << std::fixed;
+            if (sweepProbe_.valid) {
+                const double span = length(sweepProbe_.to - sweepProbe_.from);
+                sweep << L"Sweep " << labels[int(sweepProbe_.hit.state)];
+                if (sweepProbe_.hit.state == Hit::State::Contact)
+                    sweep << L" at " << std::setprecision(1) << sweepProbe_.hit.fraction * span << L" m";
+                if (sweepProbe_.hasMesh) {
+                    sweep << L"   /   mesh " << labels[int(sweepProbe_.meshHit.state)];
+                    if (sweepProbe_.meshHit.state == Hit::State::Contact)
+                        sweep << L" at " << std::setprecision(1) << sweepProbe_.meshHit.fraction * span << L" m";
+                    if (sweepProbe_.hit.state == Hit::State::Contact
+                        && sweepProbe_.meshHit.state == Hit::State::Contact)
+                        sweep << L" (delta " << std::setprecision(2)
+                              << length(sweepProbe_.hit.position - sweepProbe_.meshHit.position) << L" m)";
+                }
+                sweep << L"   /   " << std::setprecision(0) << sweepUs_ << L" us";
+            } else sweep << L"Sweep: waiting for the first cast";
+            sweep << L"   /   Orange = mesh BVH   /   Cyan = active backend";
+            controls = sweep.str();
+        } else if (lodTint_ || showRanges_) {
+            controls = L"LOD 0 Cyan 50 m   /   LOD 1 Green 100 m   /   LOD 2 Gold 200 m   /   LOD 3 Violet 400 m";
+        } else {
+            controls = L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
+        }
+        DrawTextW(dc, controls.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         EndPaint(window_, &paintInfo);
     }
 
@@ -549,7 +686,8 @@ private:
         const int button = int(item.CtlID);
         const bool active = button == method_ + Mesh || (button == View && surface_) ||
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
-                            (button == Wireframe && wireframe_) || (button == Pause && paused_);
+                            (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
+                            (button == Sweep && sweepView_);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -585,7 +723,7 @@ private:
         switch (message) {
             case WM_GETMINMAXINFO: {
                 auto* limits = reinterpret_cast<MINMAXINFO*>(l);
-                limits->ptMinTrackSize = {1080, 560};
+                limits->ptMinTrackSize = {1200, 560};
                 return 0;
             }
             case WM_COMMAND: if (HIWORD(w) == BN_CLICKED) app->pending_ = LOWORD(w); return 0;
@@ -647,14 +785,19 @@ private:
     HBRUSH background_{};
     std::unique_ptr<Dx12Renderer> renderer_;
     std::unique_ptr<World> world_;
+    // Mesh reference for the sweep view: only alive while sweep mode is on and
+    // the active backend is a field.
+    std::unique_ptr<World> sweepMesh_;
+    SweepProbe sweepProbe_;
+    std::mt19937_64 sweepRng_{42};
     std::vector<Vec> invokers_;
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
     std::size_t selected_{}, triangles_{};
     std::wstring status_;
-    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
+    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{}, sweepView_{};
     POINT mouse_{};
-    double simulationTime_{}, streamMs_{}, fps_{};
+    double simulationTime_{}, streamMs_{}, fps_{}, sweepUs_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{64100}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
 };
 
