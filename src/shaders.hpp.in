@@ -1,9 +1,17 @@
 #pragma once
 namespace voxel {
+// Keep each HLSL module in its own literal for VS2022's 16,380-byte limit.
+// Adjacent literals are concatenated into the same null-terminated array.
 inline constexpr char shaderSource[] = R"voxelshader(
 @VOXEL_PRECISION_SHADER@
+)voxelshader"
+R"voxelshader(
 @VOXEL_ATMOSPHERE_SHADER@
+)voxelshader"
+R"voxelshader(
 @VOXEL_TERRAIN_MATERIAL_SHADER@
+)voxelshader"
+R"voxelshader(
 @VOXEL_DEFERRED_SHADER@
 )voxelshader";
 }
