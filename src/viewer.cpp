@@ -6,6 +6,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -18,19 +19,19 @@ namespace {
 constexpr wchar_t windowClass[] = L"VoxelWorldWindow";
 constexpr wchar_t viewportClass[] = L"VoxelWorldViewport";
 constexpr int toolbarHeight = 52;
-constexpr int footerHeight = 58;
+constexpr int footerHeight = 80;
 constexpr double pi = 3.14159265358979323846;
 constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Sweep };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, Sweep> toolbarButtons{{
+constexpr std::array<ToolbarButton, Wireframe> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
-    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}, {L"Sweep [S]", 96}
+    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}
 }};
 
 struct Options {
@@ -39,6 +40,19 @@ struct Options {
     int invokers{2};
     bool warp{}, morton{};
     std::filesystem::path captures;
+    // --sweep turns the window into the visual twin of main.cpp's --sweep
+    // benchmark: static invokers that only host the cast loop's shapes.
+    bool sweep{};
+    int shapesPerInvoker{21};
+    // --sweep-frames is main.cpp's --frames: the untimed validation pass walks
+    // every frame's frame-seeded cast set, exactly like main's validate loop.
+    int sweepFrames{1};
+    // Negative means "start on the cast that went wrong worst", which is what a
+    // comparison is usually opened for; a value >= 0 starts on that frame instead.
+    int sweepFrame{-1};
+    int sweepWarmup{1};
+    int sweepBudget{48000};
+    double sweepTolerance{0.75};
 };
 
 Options readOptions() {
@@ -59,10 +73,34 @@ Options readOptions() {
             }
             return std::stoull(text);
         };
+        auto bounded = [&](std::uint64_t lo, std::uint64_t hi) {
+            const auto value = integer();
+            if (value < lo || value > hi) throw std::invalid_argument("Option value is out of range");
+            return int(value);
+        };
+        auto real = [&](double lo, double hi) {
+            const std::wstring text = next();
+            double value = 0;
+            std::size_t parsed = 0;
+            try {
+                value = std::stod(text, &parsed);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("Expected a decimal number");
+            }
+            if (parsed != text.size() || !(value >= lo && value <= hi)) throw std::invalid_argument("Option value is out of range");
+            return value;
+        };
         if (option == L"--warp") result.warp = true;
         else if (option == L"--morton") result.morton = true;
+        else if (option == L"--sweep") result.sweep = true;
         else if (option == L"--capture-dir") result.captures = next();
         else if (option == L"--seed") result.seed = integer();
+        else if (option == L"--shapes-per-invoker") result.shapesPerInvoker = bounded(1, 84);
+        else if (option == L"--sweep-frame") result.sweepFrame = bounded(0, 100000);
+        else if (option == L"--sweep-frames") result.sweepFrames = bounded(1, 400);
+        else if (option == L"--sweep-warmup") result.sweepWarmup = bounded(0, 20);
+        else if (option == L"--sweep-budget") result.sweepBudget = bounded(1, 10000000);
+        else if (option == L"--sweep-tolerance") result.sweepTolerance = real(0.01, 10.0);
         else if (option == L"--invokers") {
             const auto n = integer();
             if (n < 1 || n > 16) throw std::invalid_argument("Invoker count must be from 1 to 16");
@@ -150,20 +188,64 @@ void appendBeacon(std::vector<Vertex>& batch, Vec surface, double size, bool sel
     }
 }
 
-// A small three axis cross marks the point a sweep reported as its contact.
-void appendCross(std::vector<Vertex>& lines, Vec p, double size, std::uint32_t material) {
-    for (int axis = 0; axis < 3; ++axis) {
-        Vec a = p, b = p;
-        a[axis] -= size;
-        b[axis] += size;
-        lines.push_back(vertex(a, {0, 0, 1}, material));
-        lines.push_back(vertex(b, {0, 0, 1}, material));
+// Seven-segment digits, drawn as line segments in the camera plane, so a
+// coordinate can sit next to its contact point without a font texture. Segment
+// order: a top, b top right, c bottom right, d bottom, e bottom left, f top left,
+// g middle, each as two corners in a 1 x 2 cell.
+constexpr double glyphSegments[7][4] = {
+    {0, 2, 1, 2}, {1, 2, 1, 1}, {1, 1, 1, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}, {0, 1, 0, 2}, {0, 1, 1, 1}};
+
+int glyphBits(char c) {
+    switch (c) {
+        case '0': return 63;    // a b c d e f
+        case '1': return 6;     // b c
+        case '2': return 91;    // a b d e g
+        case '3': return 79;    // a b c d g
+        case '4': return 102;   // b c f g
+        case '5': return 109;   // a c d f g
+        case '6': return 125;   // a c d e f g
+        case '7': return 7;     // a b c
+        case '8': return 127;
+        case '9': return 111;   // a b c d f g
+        case '-': return 64;    // g
+        default: return 0;
+    }
+}
+
+void appendLabel(std::vector<Vertex>& lines, const std::string& text, Vec origin, Vec right, Vec up,
+                 double height, std::uint32_t material) {
+    const double width = 0.55 * height, advance = 0.85 * height;
+    auto segment = [&](const Vec& cell, double u0, double v0, double u1, double v1) {
+        lines.push_back(vertex(cell + right * (u0 * width) + up * (v0 * 0.5 * height), {0, 0, 1}, material));
+        lines.push_back(vertex(cell + right * (u1 * width) + up * (v1 * 0.5 * height), {0, 0, 1}, material));
+    };
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        const Vec cell = origin + right * (double(i) * advance);
+        if (c == '.') {
+            segment(cell, 0.30, 0, 0.70, 0);
+            continue;
+        }
+        const int bits = glyphBits(c);
+        for (int s = 0; s < 7; ++s) {
+            if ((bits & (1 << s)) == 0) continue;
+            segment(cell, glyphSegments[s][0], glyphSegments[s][1], glyphSegments[s][2], glyphSegments[s][3]);
+        }
+    }
+}
+
+// A screen-aligned asterisk marks a point that a sweep reported as its contact.
+void appendMarker(std::vector<Vertex>& lines, Vec point, Vec right, Vec up, double size, std::uint32_t material) {
+    for (const Vec direction : {right, up, unit(right + up)}) {
+        lines.push_back(vertex(point - direction * size, {0, 0, 1}, material));
+        lines.push_back(vertex(point + direction * size, {0, 0, 1}, material));
     }
 }
 
 class App {
 public:
-    explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed), method_(opts_.method) {}
+    explicit App(Options options)
+        : opts_(std::move(options)), planet_(opts_.seed), method_(opts_.method), sweepMode_(opts_.sweep) {}
     ~App() {
         renderer_.reset();
         if (IsWindow(window_)) DestroyWindow(window_);
@@ -195,7 +277,9 @@ public:
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &screen, 0);
         const int width = std::min(1340L, screen.right - screen.left);
         const int height = std::min(850L, screen.bottom - screen.top);
-        window_ = CreateWindowExW(0, windowClass, L"VoxelWorld  |  Planet collision viewer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        window_ = CreateWindowExW(0, windowClass,
+                                   sweepMode_ ? L"VoxelWorld  |  Sweep: mesh vs field" : L"VoxelWorld  |  Planet collision viewer",
+                                   WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                    screen.left + (screen.right - screen.left - width) / 2,
                                    screen.top + (screen.bottom - screen.top - height) / 2,
                                    width, height, nullptr, nullptr, instance, this);
@@ -208,15 +292,26 @@ public:
             if (!buttons_[i]) throw std::runtime_error("Create viewer toolbar failed");
             SendMessageW(buttons_[i], WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
         }
+        // Sweep mode has no rigid bodies, so the drop button would do nothing.
+        if (sweepMode_) EnableWindow(buttons_[Drop - 1], FALSE);
         arrange();
         ShowWindow(window_, show);
         UpdateWindow(window_);
         renderer_ = std::make_unique<Dx12Renderer>(viewport_, opts_.warp);
+        if (sweepMode_) {
+            // The cast budget and tolerance are the knobs main.cpp's sweep
+            // benchmark exposes, so they are wired straight through.
+            setSweepBudget(opts_.sweepBudget);
+            setSweepTolerance(opts_.sweepTolerance);
+        }
         rebuild();
     }
 
     int run() {
-        if (!opts_.captures.empty()) return captureAll();
+        if (!opts_.captures.empty()) {
+            if (sweepMode_) throw std::invalid_argument("--capture-dir is not available in --sweep mode");
+            return captureAll();
+        }
         MSG message{};
         auto previous = Clock::now();
         double accumulator = 0, statsElapsed = 0, streamElapsed = 0;
@@ -253,13 +348,15 @@ public:
             if (streamElapsed >= 0.15 && world_->requestUpdate(invokers_, true, camera().eye)) {
                 streamElapsed = 0;
             }
+            // The labels are billboards that follow the camera, so the overlay is
+            // rebuilt every frame in sweep mode.
+            if (sweepMode_) refreshLines();
             fps_ = fps_ * 0.94 + 0.06 / std::max(0.001, elapsed);
             statsElapsed += elapsed;
             if (statsElapsed >= 0.25) {
                 updateFooter();
                 statsElapsed = 0;
             }
-            if (sweepView_) retarget();
             buildObjects();
             renderer_->draw(camera(), objects_);
         }
@@ -268,25 +365,53 @@ public:
 
 private:
     struct VisibleBody { std::size_t index; Shape shape; std::uint32_t material; };
-    // One frame of the sweep test that main.cpp benchmarks: a random capsule cast
-    // near the selected invoker, answered by the active backend and, when the
-    // active backend is a field, by a mesh world built alongside it.
-    struct SweepProbe {
+    // One cast of main.cpp's --sweep loop: the shape, its path, and the answers the
+    // mesh reference and the active backend gave for it.
+    struct SweepCast {
         Shape shape;
         Vec from{}, to{};
         Hit hit{}, meshHit{};
-        bool valid{}, hasMesh{};
+        int frame{}, index{};
+        bool hasMesh{};
+    };
+    // main.cpp's Verdict, widened with the space metrics of its --sweep-last dump,
+    // so the window prints the same numbers the benchmark prints.
+    struct SweepTally {
+        int meshContacts{}, backendContacts{}, meshMiss{}, backendMiss{};
+        int meshUnresolved{}, backendUnresolved{}, initial{}, conflicts{}, refusals{}, paired{};
+        int negativeGap{}, beyond{};
+        double meanError{}, maxError{}, medianError{}, p95Error{};
+        double meanPath{}, meanPoint{}, maxPoint{}, meanGap{};
+        // Where the worst cast of the pass lives, so the window can open on it.
+        int worstError{-1}, worstPoint{-1};
+        std::vector<double> errors;
+        std::vector<int> mismatches;
     };
 
     void rebuild() {
         simulationTime_ = 0;
         shapes_.clear();
-        sweepProbe_ = SweepProbe{};
-        sweepRng_.seed(opts_.seed ^ 0x51ed270b1a6c3f27ULL);
+        sweepCasts_.clear();
         if (method_ == 0) sweepMesh_.reset();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton);
         refreshTerrain(true);
-        for (int i = 0; i < opts_.invokers; ++i) spawn(i);
+        if (sweepMode_) {
+            ensureSweepMesh();
+            validateSweep();
+            // Open on the cast that disagrees worst, unless --sweep-frame named a
+            // frame to start from.
+            if (opts_.sweepFrame >= 0) {
+                castIndex_ = std::clamp(opts_.sweepFrame * int(invokers_.size()) * opts_.shapesPerInvoker, 0,
+                                        std::max(0, int(sweepCasts_.size()) - 1));
+            } else {
+                castIndex_ = std::clamp(tally_.worstError >= 0 ? tally_.worstError : 0, 0,
+                                        std::max(0, int(sweepCasts_.size()) - 1));
+            }
+            focusCurrent();
+            refreshLines();
+        } else {
+            for (int i = 0; i < opts_.invokers; ++i) spawn(i);
+        }
         updateFooter();
         repaintButtons();
     }
@@ -307,13 +432,16 @@ private:
     }
 
     void tick() {
+        // Sweep mode is the benchmark loop made visible: every invoker stays at its
+        // frame-0 position and no rigid body exists, so there is nothing to step.
+        if (sweepMode_) return;
         world_->physics.step(dt, true);
         simulationTime_ += dt;
         invokers_ = invokerPositions(planet_, opts_.invokers, simulationTime_ * 2.0);
     }
 
-    // The mesh reference only exists while the sweep view is on and the active
-    // backend is a field: the comparison is mesh BVH against the field answer.
+    // The mesh reference only exists while sweep mode is on and the active backend
+    // is a field: the comparison is mesh BVH against the field answer.
     void ensureSweepMesh() {
         if (method_ == 0) {
             sweepMesh_.reset();
@@ -324,38 +452,187 @@ private:
         sweepMesh_->update(invokers_, true, camera().eye);
     }
 
-    // One random capsule per frame, built the same way compareSweepToMesh carries
-    // its casts: a tilt of up to ~0.22 rad and a 0.7x..1.5x scale, swept from
-    // clear above a random surface point near the invoker to well below it.
-    void retarget() {
-        ensureSweepMesh();
-        const Vec anchor = invokers_[selected_];
+    static double randomPick(std::mt19937_64& rng) { return (rng() >> 11) * 0x1p-53; }
+
+    // main.cpp's shapeAt: one of the invoker's three kinds, the up axis tilted by
+    // up to ~0.22 rad in a random azimuth, size scaled 0.7x..1.5x.
+    Shape castShape(Vec anchor, int index, std::mt19937_64& rng) const {
         const Vec up = unit(anchor);
         const auto axes = frameAt(up);
-        auto random = [&] { return (sweepRng_() >> 11) * 0x1p-53; };
-        const double azimuth = 2 * pi * random();
-        const double tilt = 0.45 * (random() - 0.5);
+        const double azimuth = 2 * pi * randomPick(rng);
+        const double tilt = 0.45 * (randomPick(rng) - 0.5);
         const Vec tilted = unit(up + (axes[0] * std::cos(azimuth) + axes[1] * std::sin(azimuth)) * tilt);
-        Shape shape = sampleShape(2, tilted);
-        shape.size = shape.size * (0.7 + 0.8 * random());
-        const Vec dir = unit(up * planetRadius + axes[0] * (1100 * (random() - 0.5)) + axes[1] * (1100 * (random() - 0.5)));
+        Shape shape = sampleShape(index % 3 + 1, tilted);
+        shape.size = shape.size * (0.7 + 0.8 * randomPick(rng));
+        return shape;
+    }
+
+    // main.cpp's placement: a random surface target within ~1100 m of the invoker,
+    // entered from clear above it and left well below it.
+    std::pair<Vec, Vec> castPlacement(Vec anchor, const Shape& shape, std::mt19937_64& rng) const {
+        const Vec up = unit(anchor);
+        const auto axes = frameAt(up);
+        const Vec dir = unit(up * planetRadius + axes[0] * (1100 * (randomPick(rng) - 0.5))
+                                                + axes[1] * (1100 * (randomPick(rng) - 0.5)));
         const Vec surface = planet_.surface(dir);
         const double support = dot(abs(dir), shape.extents());
-        sweepProbe_ = SweepProbe{};
-        sweepProbe_.shape = shape;
-        sweepProbe_.from = surface + dir * (support + 120.0);
-        sweepProbe_.to = surface - dir * (support + 60.0);
+        return {surface + dir * (support + 120.0), surface - dir * (support + 60.0)};
+    }
+
+    // The cast set of one frame, frame-seeded exactly like main.cpp's fillFrame, so
+    // the same seed and frame always issue the same shapes, in the same order.
+    void fillFrame(int frame, std::uint64_t salt, std::vector<SweepCast>& casts) const {
+        std::mt19937_64 rng(opts_.seed ^ (salt * std::uint64_t(frame + 1)));
+        for (const Vec& anchor : invokers_) {
+            for (int k = 0; k < opts_.shapesPerInvoker; ++k) {
+                SweepCast cast;
+                cast.shape = castShape(anchor, k, rng);
+                const auto [from, to] = castPlacement(anchor, cast.shape, rng);
+                cast.frame = frame;
+                cast.index = int(casts.size()) % std::max(1, int(invokers_.size()) * opts_.shapesPerInvoker);
+                cast.from = from;
+                cast.to = to;
+                casts.push_back(cast);
+            }
+        }
+    }
+
+    // main.cpp's sweep validation, run against the live streaming world instead of
+    // an offline pair: warm up on its own cast set, time the backend pass over every
+    // frame, then issue both backends on the same cast and tally the verdict --
+    // contacts and misses per backend, refusals (a field search declining to decide)
+    // kept apart from conflicts (contact vs miss), the per-cast toi error, and the
+    // contact-point distance, the normal-projected gap and the path delta.
+    void validateSweep() {
+        constexpr std::uint64_t measuredSalt = 0x51ed270b1a6c3f27ULL, warmupSalt = 0x2545f4914f6cdd1dULL;
+        const int perFrame = int(invokers_.size()) * opts_.shapesPerInvoker;
+        setSweepBudget(opts_.sweepBudget);
+        setSweepTolerance(opts_.sweepTolerance);
+        resetSweepDiagnostics();
+
+        sweepCasts_.clear();
+        tally_ = SweepTally{};
+        sweepCasts_.reserve(std::size_t(perFrame) * std::size_t(opts_.sweepFrames));
+        for (int frame = 0; frame < opts_.sweepFrames; ++frame) fillFrame(frame, measuredSalt, sweepCasts_);
+
+        std::vector<SweepCast> casts;
+        casts.reserve(std::size_t(perFrame));
+        for (int w = 0; w < opts_.sweepWarmup; ++w) {
+            casts.clear();
+            fillFrame(w, warmupSalt, casts);
+            for (const SweepCast& cast : casts) {
+                world_->physics.sweep(cast.shape, cast.from, cast.to);
+                if (sweepMesh_) sweepMesh_->physics.sweep(cast.shape, cast.from, cast.to);
+            }
+        }
+
+        // The backend pass is the one that is timed, exactly like main's timePass.
         const auto timer = Clock::now();
-        sweepProbe_.hit = world_->physics.sweep(shape, sweepProbe_.from, sweepProbe_.to);
+        for (SweepCast& cast : sweepCasts_) cast.hit = world_->physics.sweep(cast.shape, cast.from, cast.to);
         sweepUs_ = milliseconds(timer) * 1000;
-        sweepProbe_.hasMesh = sweepMesh_ != nullptr;
-        if (sweepProbe_.hasMesh) sweepProbe_.meshHit = sweepMesh_->physics.sweep(shape, sweepProbe_.from, sweepProbe_.to);
-        sweepProbe_.valid = true;
+
+        // The untimed pass issues both backends on every cast of every frame.
+        for (SweepCast& cast : sweepCasts_) {
+            cast.hasMesh = sweepMesh_ != nullptr;
+            if (!cast.hasMesh) continue;
+            cast.meshHit = sweepMesh_->physics.sweep(cast.shape, cast.from, cast.to);
+            const Hit& meshHit = cast.meshHit;
+            const Hit& otherHit = cast.hit;
+            const double span = length(cast.to - cast.from);
+            tally_.meshContacts += meshHit.state == Hit::State::Contact;
+            tally_.backendContacts += otherHit.state == Hit::State::Contact;
+            tally_.meshMiss += meshHit.state == Hit::State::Miss;
+            tally_.backendMiss += otherHit.state == Hit::State::Miss;
+            tally_.meshUnresolved += meshHit.state == Hit::State::Unresolved;
+            tally_.backendUnresolved += otherHit.state == Hit::State::Unresolved;
+            tally_.initial += meshHit.initial || otherHit.initial;
+            if (meshHit.state != otherHit.state) {
+                const bool refusal = meshHit.state == Hit::State::Unresolved || otherHit.state == Hit::State::Unresolved;
+                tally_.refusals += refusal;
+                tally_.conflicts += !refusal;
+                tally_.mismatches.push_back(int(&cast - sweepCasts_.data()));
+            }
+            if (meshHit.state == Hit::State::Contact && otherHit.state == Hit::State::Contact) {
+                tally_.errors.push_back(std::abs(meshHit.fraction - otherHit.fraction) * span);
+                if (tally_.errors.back() > (tally_.worstError >= 0 ? tally_.errors[std::size_t(tally_.worstError)] : 0.0)) {
+                    tally_.worstError = int(&cast - sweepCasts_.data());
+                }
+                const double path = tally_.errors.back();
+                const double point = length(otherHit.position - meshHit.position);
+                const double gap = dot(otherHit.position - meshHit.position, meshHit.normal);
+                ++tally_.paired;
+                if (point > tally_.maxPoint) {
+                    tally_.maxPoint = point;
+                    tally_.worstPoint = int(&cast - sweepCasts_.data());
+                }
+                tally_.meanPath += path;
+                tally_.meanPoint += point;
+                tally_.meanGap += gap;
+                tally_.negativeGap += gap < 0;
+                tally_.beyond += std::abs(gap) > sweepToleranceMeters();
+            }
+        }
+        std::sort(tally_.errors.begin(), tally_.errors.end());
+        const std::size_t paired = std::size_t(std::max(1, tally_.paired));
+        if (!tally_.errors.empty()) {
+            tally_.meanError = std::accumulate(tally_.errors.begin(), tally_.errors.end(), 0.0) / double(paired);
+            tally_.maxError = tally_.errors.back();
+            tally_.medianError = tally_.errors[tally_.errors.size() / 2];
+            // Same percentile main.cpp prints: linear interpolation between the two
+            // neighbours, matching its percentile() helper.
+            const double rank = 0.95 * double(tally_.errors.size() - 1);
+            const std::size_t lower = std::size_t(rank);
+            const double weight = rank - double(lower);
+            tally_.p95Error = lower + 1 < tally_.errors.size()
+                                  ? tally_.errors[lower] + (tally_.errors[lower + 1] - tally_.errors[lower]) * weight
+                                  : tally_.errors.back();
+        }
+        tally_.meanPath /= double(paired);
+        tally_.meanPoint /= double(paired);
+        tally_.meanGap /= double(paired);
+    }
+
+    // Point the camera at the cast under inspection, close enough that the path,
+    // the shapes and the coordinate labels all read.
+    void focusCurrent() {
+        if (sweepCasts_.empty()) {
+            focusValid_ = false;
+            return;
+        }
+        castIndex_ = std::clamp(castIndex_, 0, int(sweepCasts_.size()) - 1);
+        const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+        focus_ = (cast.from + cast.to) * 0.5;
+        focusValid_ = true;
+        surface_ = true;
+        // Frame the whole path: main.cpp's casts run from 120 m above the surface
+        // to 60 m below, so long ones need a wider view.
+        surfaceDistance_ = std::clamp(length(cast.to - cast.from) * 1.8, 260.0, 1000.0);
+    }
+
+    // Re-issue the two backends on the cast on screen only. A terrain publish can
+    // change its answer, but re-running the whole validated set on every publish
+    // would cost a frame's worth of sweeps at 6720 casts, so the verdict row keeps
+    // the numbers of the last full pass (key V re-runs it).
+    void resweepCurrent() {
+        if (sweepCasts_.empty()) return;
+        SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+        cast.hit = world_->physics.sweep(cast.shape, cast.from, cast.to);
+        cast.hasMesh = sweepMesh_ != nullptr;
+        if (cast.hasMesh) cast.meshHit = sweepMesh_->physics.sweep(cast.shape, cast.from, cast.to);
+    }
+
+    void stepCast(int delta) {
+        if (!sweepMode_ || sweepCasts_.empty()) return;
+        const int count = int(sweepCasts_.size());
+        castIndex_ = ((castIndex_ + delta) % count + count) % count;
+        focusCurrent();
         refreshLines();
+        updateFooter();
     }
 
     void refreshTerrain(bool force) {
-        invokers_ = invokerPositions(planet_, opts_.invokers, simulationTime_ * 2.0);
+        // Sweep mode pins every invoker to its frame-0 position, like the benchmark.
+        invokers_ = invokerPositions(planet_, opts_.invokers, sweepMode_ ? 0.0 : simulationTime_ * 2.0);
         updateTerrain(force);
     }
 
@@ -365,11 +642,20 @@ private:
 
     void applyTerrain(const WorldStats& stats, bool force) {
         streamMs_ = stats.updateMs;
-        // Keep the mesh reference on the same published terrain, otherwise a sweep
+        // Keep the mesh reference on the same published terrain, otherwise a cast
         // near an invoker that just streamed in would compare against old chunks.
-        if (sweepMesh_ && (force || stats.build.built != 0 || stats.build.removed != 0))
+        // Re-running the sweep pass there also refreshes the verdict, which is what
+        // main.cpp's offline worlds can never do.
+        if (sweepMesh_ && (force || stats.build.built != 0 || stats.build.removed != 0)) {
             sweepMesh_->update(invokers_, true, camera().eye);
-        if (showRanges_ || sweepView_) refreshLines();
+            if (sweepMode_) {
+                resweepCurrent();
+                focusCurrent();
+                refreshLines();
+                updateFooter();
+            }
+        }
+        if (showRanges_) refreshLines();
         if (!force && stats.build.built == 0 && stats.build.removed == 0) return;
         std::vector<Vertex> geometry;
         geometry.reserve(world_->meshBytes() / sizeof(Triangle) * 3);
@@ -392,39 +678,88 @@ private:
         renderer_->setTerrain(geometry);
     }
 
-    // Clipmap windows and the sweep overlay share one line buffer, because the
-    // renderer only owns a single line list.
+    // Clipmap debug windows plus, in sweep mode, the overlay of the cast being
+    // inspected: its sweep direction, both contact markers and the coordinate
+    // labels, all of which follow the camera so they are rebuilt every frame.
     void refreshLines() {
-        std::vector<Vertex> lines;
-        if (showRanges_) {
-            constexpr Vec shades[] = {{0.25, 0.91, 1}, {0.40, 1, 0.54}, {1, 0.76, 0.28}, {0.81, 0.53, 1}};
-            for (const auto& w : world_->clipmapWindows()) {
-                const auto tint = color(shades[w.lod], 255);
-                for (int i = 0; i < 8; ++i) for (int axis = 0; axis < 3; ++axis) {
-                    if (i & (1 << axis)) continue;
-                    const Vec a{(i & 1) ? w.box.hi.x : w.box.lo.x, (i & 2) ? w.box.hi.y : w.box.lo.y,
-                                (i & 4) ? w.box.hi.z : w.box.lo.z};
-                    Vec b = a;
-                    b[axis] = w.box.hi[axis];
-                    lines.push_back(vertex(a, {0, 0, 1}, tint));
-                    lines.push_back(vertex(b, {0, 0, 1}, tint));
-                }
+        lines_.clear();
+        if (showRanges_) appendRanges(lines_);
+        if (sweepMode_) appendSweepOverlay(lines_);
+        renderer_->setClipmapLines(lines_);
+    }
+
+    void appendRanges(std::vector<Vertex>& lines) const {
+        constexpr Vec shades[] = {{0.25, 0.91, 1}, {0.40, 1, 0.54}, {1, 0.76, 0.28}, {0.81, 0.53, 1}};
+        for (const auto& w : world_->clipmapWindows()) {
+            const auto tint = color(shades[w.lod], 255);
+            for (int i = 0; i < 8; ++i) for (int axis = 0; axis < 3; ++axis) {
+                if (i & (1 << axis)) continue;
+                const Vec a{(i & 1) ? w.box.hi.x : w.box.lo.x, (i & 2) ? w.box.hi.y : w.box.lo.y,
+                            (i & 4) ? w.box.hi.z : w.box.lo.z};
+                Vec b = a;
+                b[axis] = w.box.hi[axis];
+                lines.push_back(vertex(a, {0, 0, 1}, tint));
+                lines.push_back(vertex(b, {0, 0, 1}, tint));
             }
         }
-        if (sweepView_ && sweepProbe_.valid) {
-            const auto path = color(Vec{0.62, 0.70, 0.82}, 255);
-            lines.push_back(vertex(sweepProbe_.from, {0, 0, 1}, path));
-            lines.push_back(vertex(sweepProbe_.to, {0, 0, 1}, path));
-            if (sweepProbe_.hasMesh && sweepProbe_.meshHit.state == Hit::State::Contact)
-                appendCross(lines, sweepProbe_.meshHit.position, 9.0, color(Vec{1.0, 0.62, 0.30}, 255));
-            if (sweepProbe_.hit.state == Hit::State::Contact)
-                appendCross(lines, sweepProbe_.hit.position, 6.0, color(Vec{0.30, 0.96, 1.0}, 255));
+    }
+
+    void appendSweepOverlay(std::vector<Vertex>& lines) const {
+        if (sweepCasts_.empty()) return;
+        const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+        const Camera view = camera();
+        const auto meshTint = color(Vec{1.0, 0.62, 0.30}, 255), backendTint = color(Vec{0.30, 0.96, 1.0}, 255);
+        const Vec delta = cast.to - cast.from, down = unit(delta);
+        const double span = length(delta);
+
+        // The sweep direction: the whole path, with an arrow head where it starts.
+        const auto path = color(Vec{0.60, 0.68, 0.80}, 255);
+        lines.push_back(vertex(cast.from, {0, 0, 1}, path));
+        lines.push_back(vertex(cast.to, {0, 0, 1}, path));
+        const Vec head = cast.from + down * (0.10 * span);
+        for (const Vec side : {unit(down + view.right * 0.22), unit(down - view.right * 0.22),
+                               unit(down + view.up * 0.22), unit(down - view.up * 0.22)}) {
+            lines.push_back(vertex(head, {0, 0, 1}, path));
+            lines.push_back(vertex(head + side * (0.06 * span), {0, 0, 1}, path));
         }
-        renderer_->setClipmapLines(lines);
+
+        // Contact markers and their coordinates, one label above and one below so
+        // the two answers stay apart even when they agree to a few centimetres.
+        // Seven-segment cells can only draw digits, so the backend is told apart by
+        // colour and vertical side, and spelled out in the footer.
+        constexpr double labelHeight = 24.0;
+        auto label = [&](const Hit& hit, std::uint32_t tint, double lift) {
+            if (hit.state != Hit::State::Contact) return;
+            appendMarker(lines, hit.position, view.right, view.up, 9.0, tint);
+            std::ostringstream position;
+            position << std::llround(hit.position.x) << ' ' << std::llround(hit.position.y) << ' '
+                     << std::llround(hit.position.z);
+            appendLabel(lines, position.str(), hit.position + view.up * lift, view.right, view.up, labelHeight, tint);
+        };
+        if (cast.hasMesh) label(cast.meshHit, meshTint, 1.5 * labelHeight);
+        label(cast.hit, backendTint, -2.9 * labelHeight);
+    }
+
+    static const wchar_t* kindName(ShapeKind kind) {
+        switch (kind) {
+            case ShapeKind::Sphere: return L"sphere";
+            case ShapeKind::Capsule: return L"capsule";
+            case ShapeKind::Box: return L"box";
+        }
+        return L"?";
+    }
+
+    static void drawShape(std::vector<Vertex>& batch, const Shape& shape, Vec center, std::uint32_t material) {
+        if (shape.kind == ShapeKind::Box) appendBox(batch, shape, center, material);
+        else appendRound(batch, shape, center, material);
     }
 
     void buildObjects() {
         objects_.clear();
+        if (sweepMode_) {
+            appendSweepShapes();
+            return;
+        }
         if (surface_) {
             const Vec focus = invokers_[selected_];
             for (const auto& body : shapes_) {
@@ -432,31 +767,34 @@ private:
                 if (length(pose.position - focus) > surfaceDistance_ * 2.7) continue;
                 Shape shape = body.shape;
                 shape.axes = pose.axes;
-                if (shape.kind == ShapeKind::Box) appendBox(objects_, shape, pose.position, body.material);
-                else appendRound(objects_, shape, pose.position, body.material);
+                drawShape(objects_, shape, pose.position, body.material);
             }
         }
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             appendBeacon(objects_, invokers_[i], surface_ ? 24 : 380, i == selected_);
         }
-        if (sweepView_ && sweepProbe_.valid) appendSweepCapsules();
     }
 
-    // The capsule is drawn where each backend stopped: the mesh answer first in
-    // warm orange, then the active backend in cyan on top, so when they agree the
-    // cyan silhouette covers the orange one.
-    void appendSweepCapsules() {
-        const Vec delta = sweepProbe_.to - sweepProbe_.from;
+    // The shape of the cast being inspected, drawn at the pose it started from and
+    // where each backend stopped: the mesh BVH answer in warm orange, the active
+    // backend in cyan on top, so a visible orange rim is a visible disagreement.
+    void appendSweepShapes() {
+        if (sweepCasts_.empty()) return;
+        const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+        const auto meshTint = color(Vec{1.0, 0.62, 0.30}, 255), backendTint = color(Vec{0.30, 0.96, 1.0}, 255);
+        const auto startTint = color(Vec{0.34, 0.42, 0.52}, 255);
         auto centerOf = [&](const Hit& hit) {
-            return hit.state == Hit::State::Contact ? sweepProbe_.from + delta * hit.fraction : sweepProbe_.from;
+            return hit.state == Hit::State::Contact ? cast.from + (cast.to - cast.from) * hit.fraction : cast.from;
         };
-        if (sweepProbe_.hasMesh)
-            appendRound(objects_, sweepProbe_.shape, centerOf(sweepProbe_.meshHit), color(Vec{1.0, 0.62, 0.30}, 255));
-        appendRound(objects_, sweepProbe_.shape, centerOf(sweepProbe_.hit), color(Vec{0.30, 0.96, 1.0}, 255));
+        drawShape(objects_, cast.shape, cast.from, startTint);
+        if (cast.hasMesh) drawShape(objects_, cast.shape, centerOf(cast.meshHit), meshTint);
+        drawShape(objects_, cast.shape, centerOf(cast.hit), cast.hasMesh ? backendTint : meshTint);
     }
 
     Camera camera() const {
-        const Vec target = invokers_[selected_];
+        // Sweep inspection follows the cast it is showing; the interactive mode
+        // follows the selected invoker.
+        const Vec target = focusValid_ ? focus_ : invokers_[selected_];
         const Vec radial = unit(target);
         const auto basis = frameAt(radial);
         Vec eye, center, nominalUp;
@@ -541,23 +879,9 @@ private:
             showRanges_ = !showRanges_;
             refreshLines();
         }
-        else if (command == Sweep) {
-            sweepView_ = !sweepView_;
-            if (sweepView_) {
-                surface_ = true;
-                // A cast is only ~200 m long, so the surface view pulls in close
-                // enough to read the capsule and its contact.
-                surfaceDistance_ = std::min(surfaceDistance_, 900.0);
-                ensureSweepMesh();
-                retarget();
-            } else {
-                sweepProbe_ = SweepProbe{};
-                sweepMesh_.reset();
-                refreshLines();
-            }
-        }
         else if (command == Pause) paused_ = !paused_;
-        else if (command == Drop) {
+        // Sweep mode has no rigid bodies to drop.
+        else if (command == Drop && !sweepMode_) {
             surface_ = true;
             spawn(int(selected_));
         } else if (command == Reset) {
@@ -565,7 +889,7 @@ private:
             yaw_ = 0.13;
             pitch_ = 0.16;
             orbitDistance_ = 64100;
-            surfaceDistance_ = 1950;
+            surfaceDistance_ = sweepMode_ ? 2600.0 : 1950.0;
             bearing_ = 0.42;
             elevation_ = 0.90;
             paused_ = false;
@@ -587,7 +911,62 @@ private:
         else if (code == 'L') action(Tint);
         else if (code == 'K') action(Ranges);
         else if (code == 'W') action(Wireframe);
-        else if (code == 'S') action(Sweep);
+        else if (code == 'N' && sweepMode_) {
+            // Jump to the first cast of the next frame in the validated set.
+            const int perFrame = int(invokers_.size()) * opts_.shapesPerInvoker;
+            if (!sweepCasts_.empty()) castIndex_ = (castIndex_ / perFrame + 1) * perFrame % int(sweepCasts_.size());
+            focusCurrent();
+            refreshLines();
+            updateFooter();
+        }
+        else if (code == 'C' && sweepMode_) {
+            // Jump to the next cast whose two backends disagree.
+            for (const int index : tally_.mismatches) {
+                if (index > castIndex_) {
+                    castIndex_ = index;
+                    focusCurrent();
+                    refreshLines();
+                    updateFooter();
+                    return true;
+                }
+            }
+            if (!tally_.mismatches.empty()) {
+                castIndex_ = tally_.mismatches.front();
+                focusCurrent();
+                refreshLines();
+                updateFooter();
+            }
+            return true;
+        }
+        else if (code == 'V' && sweepMode_) {
+            // Re-run main.cpp's whole validation pass on the terrain as it is now.
+            validateSweep();
+            focusCurrent();
+            refreshLines();
+            updateFooter();
+        }
+        else if (code == 'E' && sweepMode_) {
+            // Jump to the cast with the largest TOI error of the last pass.
+            if (tally_.worstError >= 0) {
+                castIndex_ = tally_.worstError;
+                focusCurrent();
+                refreshLines();
+                updateFooter();
+            }
+            return true;
+        }
+        else if (code == 'O' && sweepMode_) {
+            // Jump to the cast whose two contact points are furthest apart.
+            if (tally_.worstPoint >= 0) {
+                castIndex_ = tally_.worstPoint;
+                focusCurrent();
+                refreshLines();
+                updateFooter();
+            }
+            return true;
+        }
+        else if (code == VK_RIGHT && sweepMode_) stepCast(1);
+        else if (code == VK_LEFT && sweepMode_) stepCast(-1);
         else if (code == 'B') action(Drop);
         else if (code == 'R') action(Reset);
         else if (code == VK_SPACE) action(Pause);
@@ -622,10 +1001,30 @@ private:
     void updateFooter() {
         const auto counts = world_->lodCounts();
         std::wostringstream info;
-        info << methodLabels[method_] << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
-             << L"   |   LOD 0/1/2/3  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3]
-             << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
-             << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update";
+        if (sweepMode_) {
+            info << std::fixed << methodLabels[method_] << L" vs mesh   |   " << opts_.sweepFrames << L" frames x "
+                 << (invokers_.size() * std::size_t(opts_.shapesPerInvoker)) << L" = " << sweepCasts_.size()
+                 << L" casts   |   cast " << (sweepCasts_.empty() ? 0 : castIndex_ + 1) << L"/" << sweepCasts_.size();
+            if (!sweepCasts_.empty()) {
+                const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+                info << L" (frame " << cast.frame << L", invoker " << cast.index / std::max(1, opts_.shapesPerInvoker)
+                     << L", shape " << cast.index % std::max(1, opts_.shapesPerInvoker) << L", "
+                     << kindName(cast.shape.kind) << L')';
+                // Flag the two casts the pass points at, so the picture is known to
+                // be the worst case rather than an arbitrary one.
+                if (castIndex_ == tally_.worstError)
+                    info << L"   WORST toi " << std::setprecision(3) << tally_.maxError << L" m";
+                else if (castIndex_ == tally_.worstPoint)
+                    info << L"   WORST point " << std::setprecision(3) << tally_.maxPoint << L" m";
+                info << std::setprecision(0);
+            }
+            info << L"   |   " << triangles_ << L" triangles";
+        } else {
+            info << methodLabels[method_] << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
+                 << L"   |   LOD 0/1/2/3  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3]
+                 << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
+                 << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update";
+        }
         if (fps_ > 0) info << L"   |   " << std::setprecision(0) << fps_ << L" FPS";
         if (paused_) info << L"   |   Paused";
         if (renderer_->isWarp()) info << L"   |   WARP";
@@ -645,33 +1044,40 @@ private:
         SelectObject(dc, font_);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(220, 231, 243));
-        RECT row{13, client.bottom - 49, client.right - 10, client.bottom - 28};
+        RECT row{13, client.bottom - footerHeight + 6, client.right - 10, client.bottom - footerHeight + 27};
         DrawTextW(dc, status_.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         SetTextColor(dc, RGB(152, 170, 193));
         row.top += 22;
         row.bottom += 22;
         std::wstring controls;
-        if (sweepView_) {
+        if (sweepMode_) {
             std::wostringstream sweep;
-            constexpr const wchar_t* labels[] = {L"miss", L"contact", L"unresolved"};
             sweep << std::fixed;
-            if (sweepProbe_.valid) {
-                const double span = length(sweepProbe_.to - sweepProbe_.from);
-                sweep << L"Sweep " << labels[int(sweepProbe_.hit.state)];
-                if (sweepProbe_.hit.state == Hit::State::Contact)
-                    sweep << L" at " << std::setprecision(1) << sweepProbe_.hit.fraction * span << L" m";
-                if (sweepProbe_.hasMesh) {
-                    sweep << L"   /   mesh " << labels[int(sweepProbe_.meshHit.state)];
-                    if (sweepProbe_.meshHit.state == Hit::State::Contact)
-                        sweep << L" at " << std::setprecision(1) << sweepProbe_.meshHit.fraction * span << L" m";
-                    if (sweepProbe_.hit.state == Hit::State::Contact
-                        && sweepProbe_.meshHit.state == Hit::State::Contact)
-                        sweep << L" (delta " << std::setprecision(2)
-                              << length(sweepProbe_.hit.position - sweepProbe_.meshHit.position) << L" m)";
+            if (!sweepCasts_.empty()) {
+                const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
+                const double span = length(cast.to - cast.from);
+                sweep << L"start (" << std::llround(cast.from.x) << L' ' << std::llround(cast.from.y) << L' '
+                      << std::llround(cast.from.z) << L") sweep " << std::setprecision(0) << span << L" m   |   ";
+                if (cast.hasMesh) {
+                    const auto& hit = cast.meshHit;
+                    if (hit.state == Hit::State::Contact) {
+                        sweep << L"M (" << std::llround(hit.position.x) << L' ' << std::llround(hit.position.y) << L' '
+                              << std::llround(hit.position.z) << L") f " << std::setprecision(3) << hit.fraction << L"   |   ";
+                    } else sweep << L"M miss   |   ";
                 }
-                sweep << L"   /   " << std::setprecision(0) << sweepUs_ << L" us";
-            } else sweep << L"Sweep: waiting for the first cast";
-            sweep << L"   /   Orange = mesh BVH   /   Cyan = active backend";
+                const auto& hit = cast.hit;
+                if (hit.state == Hit::State::Contact) {
+                    sweep << L"S (" << std::llround(hit.position.x) << L' ' << std::llround(hit.position.y) << L' '
+                          << std::llround(hit.position.z) << L") f " << std::setprecision(3) << hit.fraction << L"   |   ";
+                    if (cast.hasMesh && cast.meshHit.state == Hit::State::Contact) {
+                        // Same three numbers as main's --sweep-last row.
+                        sweep << L"path " << std::abs(hit.fraction - cast.meshHit.fraction) * span << L" point "
+                              << length(hit.position - cast.meshHit.position) << L" gap "
+                              << dot(hit.position - cast.meshHit.position, cast.meshHit.normal) << L" m   |   ";
+                    }
+                } else sweep << L"S miss   |   ";
+            }
+            sweep << std::setprecision(0) << sweepUs_ << L" us   |   L/R step   /   N next frame   /   C next mismatch   /   E worst toi   /   O worst point   /   V revalidate";
             controls = sweep.str();
         } else if (lodTint_ || showRanges_) {
             controls = L"LOD 0 Cyan 50 m   /   LOD 1 Green 100 m   /   LOD 2 Gold 200 m   /   LOD 3 Violet 400 m";
@@ -679,6 +1085,30 @@ private:
             controls = L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
         }
         DrawTextW(dc, controls.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        if (sweepMode_) {
+            // A third row for the whole-run verdict, so the per-cast numbers above
+            // never get ellipsised away.
+            row.top += 22;
+            row.bottom += 22;
+            std::wostringstream totals;
+            totals << std::fixed;
+            if (sweepMesh_) {
+                // The same verdict main.cpp prints: contacts per backend, refusals
+                // kept apart from conflicts, the toi error distribution, and the
+                // space metrics of the --sweep-last dump.
+                totals << L"all " << sweepCasts_.size() << L" | contacts mesh/backend " << tally_.meshContacts << L'/'
+                       << tally_.backendContacts << L", conf " << tally_.conflicts << L", refuse " << tally_.refusals
+                       << L", init " << tally_.initial << L", paired " << tally_.paired << L" | toi err mean/med/p95/max "
+                       << std::setprecision(2) << tally_.meanError << L'/' << tally_.medianError << L'/' << tally_.p95Error
+                       << L'/' << tally_.maxError << L" m | path/point/gap " << std::setprecision(3) << tally_.meanPath
+                       << L'/' << tally_.meanPoint << L'/' << tally_.meanGap << L" (pt max " << tally_.maxPoint << L", "
+                       << tally_.negativeGap << L" in, " << tally_.beyond << L" >" << std::setprecision(2)
+                       << sweepToleranceMeters() << L")";
+            } else {
+                totals << L"all " << sweepCasts_.size() << L": the active backend is the mesh, nothing to compare";
+            }
+            DrawTextW(dc, totals.str().c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        }
         EndPaint(window_, &paintInfo);
     }
 
@@ -686,8 +1116,7 @@ private:
         const int button = int(item.CtlID);
         const bool active = button == method_ + Mesh || (button == View && surface_) ||
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
-                            (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
-                            (button == Sweep && sweepView_);
+                            (button == Wireframe && wireframe_) || (button == Pause && paused_);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -768,7 +1197,8 @@ private:
             case WM_CAPTURECHANGED: app->dragging_ = false; return 0;
             case WM_MOUSEWHEEL: {
                 const double factor = std::pow(0.84, double(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA);
-                if (app->surface_) app->surfaceDistance_ = std::clamp(app->surfaceDistance_ * factor, 110.0, 10500.0);
+                const double closest = app->sweepMode_ ? 40.0 : 110.0;
+                if (app->surface_) app->surfaceDistance_ = std::clamp(app->surfaceDistance_ * factor, closest, 10500.0);
                 else app->orbitDistance_ = std::clamp(app->orbitDistance_ * factor, 37000.0, 171000.0);
                 return 0;
             }
@@ -779,23 +1209,29 @@ private:
     Options opts_;
     Planet planet_;
     int method_, pending_{};
+    bool sweepMode_{};
     HWND window_{}, viewport_{};
     std::array<HWND, toolbarButtons.size()> buttons_{};
     HFONT font_{};
     HBRUSH background_{};
     std::unique_ptr<Dx12Renderer> renderer_;
     std::unique_ptr<World> world_;
-    // Mesh reference for the sweep view: only alive while sweep mode is on and
-    // the active backend is a field.
+    // Mesh reference for the sweep comparison: only alive while sweep mode is on
+    // and the active backend is a field.
     std::unique_ptr<World> sweepMesh_;
-    SweepProbe sweepProbe_;
-    std::mt19937_64 sweepRng_{42};
+    std::vector<SweepCast> sweepCasts_;
+    SweepTally tally_;
+    // The cast the sweep inspection view is showing, and the point it frames.
+    int castIndex_{};
+    Vec focus_{};
+    bool focusValid_{};
+    std::vector<Vertex> lines_;
     std::vector<Vec> invokers_;
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
     std::size_t selected_{}, triangles_{};
     std::wstring status_;
-    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{}, sweepView_{};
+    bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
     POINT mouse_{};
     double simulationTime_{}, streamMs_{}, fps_{}, sweepUs_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{64100}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
