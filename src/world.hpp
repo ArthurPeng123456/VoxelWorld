@@ -2,6 +2,7 @@
 
 #include "collision.hpp"
 
+#include <functional>
 #include <future>
 #include <set>
 
@@ -12,7 +13,6 @@ struct WorldStats {
     double selectMs{}, updateMs{}, physicsLoadMs{};
     std::size_t windowVisits{}, changedOwners{}, stagingBytes{};
     bool windowsChanged{};
-    std::vector<Key> meshChanges;
 };
 
 class Clipmap {
@@ -52,7 +52,8 @@ struct TerrainMemory {
 
 class World {
 public:
-    World(const Planet& planet, Method method, bool morton, double density = 1);
+    using TerrainPreparation = std::function<void(const Chunks& live, const Chunks& staged, const std::vector<Key>& removed)>;
+    World(const Planet& planet, Method method, bool morton, double density = 1, TerrainPreparation prepareTerrain = {});
     void setVoxelDensity(double density) { densityShift_ = voxelDensityShift(density); }
     double voxelDensity() const { return std::ldexp(1.0, publishedDensityShift_); }
     void setLod0Radius(std::uint32_t radius);
@@ -60,7 +61,7 @@ public:
     bool hasFinestLod(Vec point) const;
     WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {});
     bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling = false);
-    std::optional<WorldStats> pollUpdate();
+    std::optional<WorldStats> pollUpdate(const std::function<bool()>& uploadReady = {});
     std::array<int, lodCount> lodCounts() const;
     TerrainMemory terrainMemory() const;
     std::size_t meshBytes() const;
@@ -74,6 +75,7 @@ private:
         WorldStats stats;
         std::vector<Key> build, remove;
         Chunks staged;
+        std::map<Key, Physics::Terrain> colliders;
     };
     Batch prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
                         std::uint32_t lod0Radius, Clock::time_point start, bool rolling);
@@ -89,9 +91,15 @@ private:
     int publishedDensityShift_{};
     std::uint32_t publishedLod0Radius_{defaultLod0Radius};
     std::size_t publishedClipmapBytes_{};
+    std::array<int, lodCount> lodCounts_{};
+    std::size_t fieldBytes_{}, meshBytes_{};
     bool recoverPlan_{};
     Clipmap clipmap_;
     std::vector<ClipmapWindow> publishedWindows_;
+    TerrainPreparation prepareTerrain_;
+    Chunks retiredChunks_;
+    std::vector<Physics::Terrain> retiredColliders_;
+    std::optional<Batch> ready_;
     std::future<Batch> building_;
 };
 

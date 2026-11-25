@@ -259,9 +259,10 @@ std::size_t Clipmap::bytes() const {
          + (layout_.size() + idealLayout_.size()) * (sizeof(Layout::value_type) + mapNodeOverhead);
 }
 
-World::World(const Planet& planet, Method method, bool morton, double density)
+World::World(const Planet& planet, Method method, bool morton, double density, TerrainPreparation prepareTerrain)
     : physics(method, chunks), planet_(planet), method_(method), morton_(morton),
-      densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_), clipmap_(densityShift_, planet.elevationRange()) {
+      densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_),
+      clipmap_(densityShift_, planet.elevationRange()), prepareTerrain_(std::move(prepareTerrain)) {
     publishedClipmapBytes_ = clipmap_.bytes();
 }
 
@@ -273,8 +274,13 @@ void World::setLod0Radius(std::uint32_t radius) {
 World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
                                   std::uint32_t lod0Radius, Clock::time_point start, bool rolling) {
     try {
+        // Destruction of VDB trees and mesh BVHs can be expensive. Detach them
+        // at publication and free them before the next background build.
+        retiredColliders_.clear();
+        retiredChunks_.clear();
         auto batch = planUpdate(sources, global, densityShift, lod0Radius, start, rolling);
         build(batch, planet_, clipmap_.layout(), method_, morton_);
+        if (prepareTerrain_) prepareTerrain_(chunks, batch.staged, batch.remove);
         recoverPlan_ = false;
         return batch;
     } catch (...) {
@@ -323,13 +329,15 @@ World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int
 
 void World::build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton) {
     if (batch.build.empty()) return;
-    struct BuiltChunk { std::unique_ptr<Chunk> chunk; BuildStats stats; };
+    struct BuiltChunk { std::unique_ptr<Chunk> chunk; BuildStats stats; Physics::Terrain collider; };
     std::vector<BuiltChunk> built(batch.build.size());
     tbb::task_arena arena(8);
     arena.execute([&] {
         tbb::parallel_for(tbb::blocked_range<std::size_t>(0, built.size(), 4), [&](const auto& range) {
-            for (auto i = range.begin(); i != range.end(); ++i)
+            for (auto i = range.begin(); i != range.end(); ++i) {
                 built[i].chunk = buildChunk(planet, layout, batch.build[i], method, morton, built[i].stats);
+                built[i].collider = Physics::prepareTerrain(*built[i].chunk, method);
+            }
         });
     });
     for (auto& item : built) {
@@ -338,7 +346,10 @@ void World::build(Batch& batch, const Planet& planet, const Layout& layout, Meth
         batch.stats.build.storageMs += item.stats.storageMs;
         batch.stats.build.meshMs += item.stats.meshMs;
         batch.stats.build.built += item.stats.built;
-        batch.stats.stagingBytes += chunkMetadata + fieldSize(*chunk) + chunk->mesh.capacity() * sizeof(Triangle);
+        chunk->fieldBytes = fieldSize(*chunk);
+        batch.stats.stagingBytes += chunkMetadata + chunk->fieldBytes + chunk->mesh.capacity() * sizeof(Triangle)
+                                 + Physics::preparedTerrainBytes(item.collider);
+        if (item.collider) batch.colliders.emplace(chunk->key, std::move(item.collider));
         batch.staged.emplace(chunk->key, std::move(chunk));
     }
 }
@@ -346,15 +357,22 @@ void World::build(Batch& batch, const Planet& planet, const Layout& layout, Meth
 WorldStats World::publish(Batch batch) {
     const auto activation = Clock::now();
     for (const Key key : batch.remove) {
-        if (!chunks.at(key)->mesh.empty()) batch.stats.meshChanges.push_back(key);
-        physics.removeTerrain(key);
-        chunks.erase(key);
+        const auto old = chunks.find(key);
+        --lodCounts_[old->second->lod];
+        fieldBytes_ -= old->second->fieldBytes;
+        meshBytes_ -= old->second->mesh.capacity() * sizeof(Triangle);
+        if (auto collider = physics.removeTerrain(key)) retiredColliders_.push_back(std::move(collider));
+        retiredChunks_.insert(retiredChunks_.end(), chunks.extract(old));
         ++batch.stats.build.removed;
     }
     while (!batch.staged.empty()) {
         auto inserted = chunks.insert(batch.staged.extract(batch.staged.begin()));
-        if (!inserted.position->second->mesh.empty()) batch.stats.meshChanges.push_back(inserted.position->first);
-        physics.addTerrain(*inserted.position->second);
+        const auto& chunk = *inserted.position->second;
+        ++lodCounts_[chunk.lod];
+        fieldBytes_ += chunk.fieldBytes;
+        meshBytes_ += chunk.mesh.capacity() * sizeof(Triangle);
+        const auto collider = batch.colliders.find(chunk.key);
+        if (collider != batch.colliders.end()) physics.addTerrain(chunk, std::move(collider->second));
     }
     batch.stats.physicsLoadMs = milliseconds(activation);
     publishedDensityShift_ = clipmap_.densityShift();
@@ -366,7 +384,7 @@ WorldStats World::publish(Batch batch) {
 }
 
 WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera) {
-    if (building_.valid()) throw std::logic_error("An asynchronous Clipmap update is pending");
+    if (building_.valid() || ready_) throw std::logic_error("An asynchronous Clipmap update is pending");
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
@@ -374,7 +392,7 @@ WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::opt
 }
 
 bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling) {
-    if (building_.valid()) return false;
+    if (building_.valid() || ready_) return false;
     const auto start = Clock::now();
     auto sources = invokers;
     sources.push_back(camera);
@@ -387,9 +405,14 @@ bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec cam
     return true;
 }
 
-std::optional<WorldStats> World::pollUpdate() {
+std::optional<WorldStats> World::pollUpdate(const std::function<bool()>& uploadReady) {
     if (building_.valid() && building_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-        return publish(building_.get());
+        ready_.emplace(building_.get());
+    }
+    if (ready_ && (!uploadReady || uploadReady())) {
+        auto batch = std::move(*ready_);
+        ready_.reset();
+        return publish(std::move(batch));
     }
     return std::nullopt;
 }
@@ -400,26 +423,16 @@ bool World::hasFinestLod(Vec point) const {
 }
 
 std::array<int, lodCount> World::lodCounts() const {
-    std::array<int, lodCount> result{};
-    for (const auto& entry : chunks) ++result[entry.second->lod];
-    return result;
+    return lodCounts_;
 }
 
 TerrainMemory World::terrainMemory() const {
-    TerrainMemory result;
-    result.physics = physics.terrainBytes();
-    result.metadata = publishedClipmapBytes_ + chunks.size() * chunkMetadata + publishedWindows_.capacity() * sizeof(ClipmapWindow);
-    for (const auto& entry : chunks) {
-        result.fields += fieldSize(*entry.second);
-        result.meshes += entry.second->mesh.capacity() * sizeof(Triangle);
-    }
-    return result;
+    return {fieldBytes_, physics.terrainBytes(), meshBytes_, publishedClipmapBytes_ + chunks.size() * chunkMetadata +
+            publishedWindows_.capacity() * sizeof(ClipmapWindow)};
 }
 
 std::size_t World::meshBytes() const {
-    std::size_t result = 0;
-    for (const auto& entry : chunks) result += entry.second->mesh.capacity() * sizeof(Triangle);
-    return result;
+    return meshBytes_;
 }
 
 std::vector<Vec> invokerPositions(const Planet& planet, int count, double frame) {

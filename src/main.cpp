@@ -939,6 +939,15 @@ void selfTest() {
             check(!world.requestUpdate({}, false, oldPoint) && world.chunks.count(keyAt(oldPoint)) != 0 &&
                   world.chunks.count(keyAt(newPoint)) == 0 && world.clipmapWindows()[0].box.contains(oldPoint),
                   "queries and debug windows retain the published world while replacements are built");
+            bool awaitingUpload = false;
+            while (!awaitingUpload) {
+                check(!world.pollUpdate([&] { awaitingUpload = true; return false; }),
+                      "the prepared field is held until its render pages are uploaded");
+                if (!awaitingUpload) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            check(!world.requestUpdate({}, false, oldPoint) && world.chunks.count(keyAt(newPoint)) == 0 &&
+                  world.clipmapWindows()[0].box.contains(oldPoint) && probe(oldPoint).first.state == Hit::State::Contact,
+                  "waiting for uploads retains the old collision field and clipmap windows");
             after = waitForPublication(world);
         } else after = world.update({}, false, newPoint);
         check(after.build.removed > 0 && after.build.built > 0 && world.chunks.count(keyAt(oldPoint)) == 0,

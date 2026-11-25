@@ -7,6 +7,8 @@
 #include <shellapi.h>
 #include <psapi.h>
 #include <windowsx.h>
+#include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 
 #include <fstream>
 #include <iomanip>
@@ -34,7 +36,7 @@ static_assert(terrainLabels.size() == terrainPresets.size());
 
 Key terrainPage(Key chunk) {
     // Group adjacent chunks of the same scale to limit both uploads and draw calls.
-    const int level = chunk.level + 3;
+    const int level = chunk.level + (chunk.level == 0 && chunk.densityShift <= -2 ? 2 : 3);
     const int span = 1 << level;
     const auto align = [span](int coordinate) { return coordinate - (coordinate % span + span) % span; };
     return {align(chunk.x), align(chunk.y), align(chunk.z), level, chunk.densityShift};
@@ -60,6 +62,7 @@ struct Options {
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
     std::filesystem::path captures;
+    std::filesystem::path streamProfile;
 };
 
 Options readOptions() {
@@ -109,6 +112,7 @@ Options readOptions() {
             else throw std::invalid_argument("--tone-map requires aces, reinhard or linear");
         } else if (option == L"--morton") result.morton = true;
         else if (option == L"--capture-dir") result.captures = next();
+        else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
         else if (option == L"--terrain") {
@@ -224,6 +228,7 @@ class App {
 public:
     explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed, opts_.terrain), method_(opts_.method) {}
     ~App() {
+        world_.reset();
         renderer_.reset();
         if (IsWindow(window_)) DestroyWindow(window_);
         if (font_) DeleteObject(font_);
@@ -291,10 +296,19 @@ public:
 
     int run() {
         if (!opts_.captures.empty()) return captureAll();
+        std::ofstream profile;
+        int profileFrame = 0;
+        if (!opts_.streamProfile.empty()) {
+            profile.open(opts_.streamProfile);
+            profile.exceptions(std::ios::badbit | std::ios::failbit);
+            profile << "frame,frame_ms,physics_ms,publication_ms,terrain_ms,status_ms,draw_ms,built_chunks\n";
+            selectCameraTarget(1);
+        }
         MSG message{};
         auto previous = Clock::now();
         double accumulator = 0, statsElapsed = 0, streamElapsed = 0;
         while (!closed_) {
+            const auto frameStart = Clock::now();
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                 if (message.message == WM_QUIT) return int(message.wParam);
                 if (message.message == WM_KEYDOWN && !comboOwnsKeyboard(message.hwnd) &&
@@ -315,7 +329,9 @@ public:
             const auto now = Clock::now();
             const double elapsed = std::clamp(std::chrono::duration<double>(now - previous).count(), 0.0, 0.1);
             previous = now;
-            moveControlled(elapsed);
+            const auto physicsStart = Clock::now();
+            if (profile.is_open()) moveInvoker(1, 0.25, 0.02, true);
+            else moveControlled(elapsed);
             if (!paused_) {
                 accumulator += elapsed;
                 while (accumulator >= dt) {
@@ -324,19 +340,40 @@ public:
                 }
             }
             // The camera keeps moving while simulation is paused.
+            const double physicsMs = milliseconds(physicsStart);
+            const auto publishStart = Clock::now();
+            double uploadMs = 0;
+            const auto published = world_->pollUpdate([&] {
+                const auto start = Clock::now();
+                const bool ready = stagePreparedTerrain(false);
+                uploadMs = milliseconds(start);
+                return ready;
+            });
+            const double publicationMs = milliseconds(publishStart) - uploadMs;
+            const auto terrainStart = Clock::now();
+            if (published) applyTerrain(*published, false);
             streamElapsed += elapsed;
-            if (const auto published = world_->pollUpdate()) applyTerrain(*published, false);
-            if (streamElapsed >= dt && world_->requestUpdate(invokers_, true, camera().eye, true)) {
+            if ((streamElapsed >= dt || profile.is_open()) && world_->requestUpdate(invokers_, true, camera().eye, true)) {
                 streamElapsed = 0;
             }
+            const double terrainMs = milliseconds(terrainStart) + uploadMs;
+            const auto statusStart = Clock::now();
             fps_ = fps_ * 0.94 + 0.06 / std::max(0.001, elapsed);
             statsElapsed += elapsed;
             if (statsElapsed >= 0.25) {
                 updateFooter();
                 statsElapsed = 0;
             }
+            const double statusMs = milliseconds(statusStart);
             buildObjects();
+            const auto drawStart = Clock::now();
             renderer_->draw(camera(), objects_);
+            if (profile.is_open()) {
+                profile << profileFrame << ',' << milliseconds(frameStart) << ',' << physicsMs << ',' << publicationMs << ','
+                        << terrainMs << ',' << statusMs << ',' << milliseconds(drawStart) << ','
+                        << (published ? published->build.built : 0) << '\n';
+                if (++profileFrame == 360) return 0;
+            }
         }
         return 0;
     }
@@ -344,6 +381,12 @@ public:
 private:
     struct VisibleBody { std::size_t index; Shape shape; std::uint32_t material; };
     struct TerrainPage { std::set<Key> chunks; std::size_t triangles{}; };
+    struct PreparedTerrainPage {
+        Key key;
+        TerrainPage page;
+        Box bounds;
+        std::vector<GpuVertex> vertices;
+    };
     struct ToolbarCombo { HWND label{}, field{}; int labelWidth{}, fieldWidth{}; };
 
     HWND combo(int command) const { return combos_[command - Density].field; }
@@ -422,13 +465,20 @@ private:
     }
 
     void rebuild() {
+        world_.reset();
+        preparedTerrain_.clear();
+        terrainPages_.clear();
+        nextTerrainUpload_ = 0;
         simulationTime_ = 0;
         shapes_.clear();
         controlling_ = false;
         returning_.fill(false);
         invokers_ = invokerPositions(planet_, opts_.invokers, 0);
         refreshCameraTargets();
-        world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity);
+        world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity,
+            [this](const Chunks& live, const Chunks& staged, const std::vector<Key>& removed) {
+                prepareTerrainPages(live, staged, removed);
+            });
         world_->setLod0Radius(lod0Radius_);
         updateTerrain(true);
         for (int i = 0; i < opts_.invokers; ++i) spawn(i);
@@ -498,77 +548,120 @@ private:
     }
 
     void updateTerrain(bool force) {
-        applyTerrain(world_->update(invokers_, true, camera().eye), force);
+        fullTerrainBuild_ = force;
+        const auto stats = world_->update(invokers_, true, camera().eye);
+        fullTerrainBuild_ = false;
+        finishTerrainUpdate(stats, force);
+    }
+
+    void finishTerrainUpdate(const WorldStats& stats, bool force) {
+        if (force) renderer_->clearTerrain();
+        stagePreparedTerrain(true);
+        applyTerrain(stats, force);
+    }
+
+    void prepareTerrainPages(const Chunks& live, const Chunks& staged, const std::vector<Key>& removed) {
+        std::map<Key, TerrainPage> dirty;
+        const auto edit = [&](Key key) -> TerrainPage& {
+            const auto page = terrainPage(key);
+            const auto found = terrainPages_.find(page);
+            if (found != terrainPages_.end()) return dirty.try_emplace(page, found->second).first->second;
+            return dirty[page];
+        };
+        if (fullTerrainBuild_) dirty = terrainPages_;
+        for (const auto key : removed) if (!live.at(key)->mesh.empty()) edit(key).chunks.erase(key);
+        for (const auto& [key, chunk] : staged) if (!chunk->mesh.empty()) edit(key).chunks.insert(key);
+        preparedTerrain_.clear();
+        preparedTerrain_.reserve(dirty.size());
+        for (auto& [key, page] : dirty) preparedTerrain_.push_back({key, std::move(page), {}, {}});
+        if (preparedTerrain_.empty()) return;
+        tbb::task_arena arena(6);
+        arena.execute([&] {
+            tbb::parallel_for(std::size_t{0}, preparedTerrain_.size(), [&](std::size_t index) {
+                bakeTerrainPage(preparedTerrain_[index], live, staged);
+            });
+        });
+    }
+
+    void bakeTerrainPage(PreparedTerrainPage& prepared, const Chunks& live, const Chunks& staged) const {
+        const auto chunkAt = [&](Key key) -> const Chunk& {
+            const auto candidate = staged.find(key);
+            return *(candidate != staged.end() ? candidate->second : live.at(key));
+        };
+        auto& page = prepared.page;
+        page.triangles = 0;
+        for (const auto key : page.chunks) page.triangles += chunkAt(key).mesh.size();
+        if (!page.triangles) return;
+        const double infinity = std::numeric_limits<double>::infinity();
+        prepared.bounds = {splat(infinity), splat(-infinity)};
+        prepared.vertices.reserve(page.triangles * 3);
+        const bool classic = planet_.preset() == TerrainPreset::Classic;
+        const double geologyHalfRange = planet_.preset() == TerrainPreset::Mars ? 4700 : 4500;
+        for (const auto key : page.chunks) {
+            const Chunk& chunk = chunkAt(key);
+            const double t = std::clamp((chunk.spacing - 400.0) / 1200.0, 0.0, 1.0);
+            const double reliefDetail = 1 - t * t * (3 - 2 * t);
+            for (const auto& triangle : chunk.mesh) for (const Vec point : triangle.vertices) {
+                prepared.bounds.lo = min(prepared.bounds.lo, point);
+                prepared.bounds.hi = max(prepared.bounds.hi, point);
+                const Vec up = unit(point);
+                Vec normal = up;
+                double elevation = 0, craterMaterial = 0;
+                if (reliefDetail > 0 || !classic) {
+                    const auto sample = planet_.sampleSurface(up, chunk.spacing, reliefDetail > 0);
+                    if (reliefDetail > 0) normal = unit(up + (sample.normal - up) * reliefDetail, up);
+                    elevation = classic ? sample.elevation * reliefDetail : sample.elevation;
+                    craterMaterial = sample.craterMaterial;
+                }
+                const double height = std::clamp(classic ? (elevation + 660) / 850 :
+                    (elevation + geologyHalfRange) / (2 * geologyHalfRange), 0.0, 1.0);
+                const double rock = std::clamp(2.4 * (1 - dot(normal, up)), 0.0, 1.0);
+                prepared.vertices.push_back(packVertex(vertex(point, normal, color({height, rock, craterMaterial}, chunk.lod))));
+            }
+        }
+    }
+
+    bool stagePreparedTerrain(bool immediate) {
+        constexpr std::size_t uploadBytesPerFrame = 8 * 1024 * 1024;
+        const auto start = Clock::now();
+        std::size_t bytes = 0, pages = 0;
+        while (nextTerrainUpload_ < preparedTerrain_.size()) {
+            auto& prepared = preparedTerrain_[nextTerrainUpload_];
+            const auto size = prepared.vertices.size() * sizeof(GpuVertex);
+            if (!immediate && pages && (bytes + size > uploadBytesPerFrame || pages >= 64 || milliseconds(start) >= 1.5))
+                return false;
+            renderer_->stageTerrainPage(prepared.key, prepared.bounds, prepared.vertices);
+            std::vector<GpuVertex>().swap(prepared.vertices);
+            bytes += size;
+            ++pages;
+            ++nextTerrainUpload_;
+        }
+        return immediate || renderer_->terrainUploadsReady();
     }
 
     void applyTerrain(const WorldStats& stats, bool force) {
+        // The same batch becomes visible to rendering and collision before the next frame.
+        renderer_->publishTerrainPages();
+        if (force) {
+            terrainPages_.clear();
+            triangles_ = 0;
+        }
+        for (auto& prepared : preparedTerrain_) {
+            const auto prior = terrainPages_.find(prepared.key);
+            if (prior != terrainPages_.end()) {
+                triangles_ -= prior->second.triangles;
+                terrainPages_.erase(prior);
+            }
+            triangles_ += prepared.page.triangles;
+            if (!prepared.page.chunks.empty()) terrainPages_.emplace(prepared.key, std::move(prepared.page));
+        }
+        preparedTerrain_.clear();
+        nextTerrainUpload_ = 0;
         if (force || stats.windowVisits != 0 || stats.build.built != 0 || stats.build.removed != 0) {
             streamMs_ = stats.updateMs;
             streamBuilt_ = stats.build.built;
         }
         if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
-        std::set<Key> dirtyPages;
-        if (force) {
-            renderer_->clearTerrain();
-            terrainPages_.clear();
-            triangles_ = 0;
-            for (const auto& entry : world_->chunks) if (!entry.second->mesh.empty()) {
-                const auto page = terrainPage(entry.first);
-                terrainPages_[page].chunks.insert(entry.first);
-                dirtyPages.insert(page);
-            }
-        } else {
-            for (Key key : stats.meshChanges) {
-                const Key page = terrainPage(key);
-                const auto chunk = world_->chunks.find(key);
-                auto& keys = terrainPages_[page].chunks;
-                if (chunk != world_->chunks.end() && !chunk->second->mesh.empty()) keys.insert(key);
-                else keys.erase(key);
-                dirtyPages.insert(page);
-            }
-        }
-        std::vector<Vertex> geometry;
-        const bool classic = planet_.preset() == TerrainPreset::Classic;
-        const double geologyHalfRange = planet_.preset() == TerrainPreset::Mars ? 4700 : 4500;
-        for (const Key page : dirtyPages) {
-            auto& data = terrainPages_.at(page);
-            triangles_ -= data.triangles;
-            data.triangles = 0;
-            for (Key key : data.chunks) data.triangles += world_->chunks.at(key)->mesh.size();
-            const double infinity = std::numeric_limits<double>::infinity();
-            Box pageBounds{splat(infinity), splat(-infinity)};
-            geometry.clear();
-            geometry.reserve(data.triangles * 3);
-            for (Key key : data.chunks) {
-                const Chunk& chunk = *world_->chunks.at(key);
-                // Fade relief that this mesh's vertex spacing cannot resolve.
-                const double t = std::clamp((chunk.spacing - 400.0) / 1200.0, 0.0, 1.0);
-                const double reliefDetail = 1 - t * t * (3 - 2 * t);
-                for (const auto& triangle : chunk.mesh) {
-                    for (const Vec point : triangle.vertices) {
-                        pageBounds.lo = min(pageBounds.lo, point);
-                        pageBounds.hi = max(pageBounds.hi, point);
-                        const Vec up = unit(point);
-                        Vec normal = up;
-                        double elevation = 0;
-                        double craterMaterial = 0;
-                        if (reliefDetail > 0 || !classic) {
-                            const auto sample = planet_.sampleSurface(up, chunk.spacing, reliefDetail > 0);
-                            if (reliefDetail > 0) normal = unit(up + (sample.normal - up) * reliefDetail, up);
-                            elevation = classic ? sample.elevation * reliefDetail : sample.elevation;
-                            craterMaterial = sample.craterMaterial;
-                        }
-                        const double height = std::clamp(classic ? (elevation + 660) / 850 :
-                            (elevation + geologyHalfRange) / (2 * geologyHalfRange), 0.0, 1.0);
-                        const double rock = std::clamp(2.4 * (1 - dot(normal, up)), 0.0, 1.0);
-                        geometry.push_back(vertex(point, normal, color({height, rock, craterMaterial}, chunk.lod)));
-                    }
-                }
-            }
-            triangles_ += data.triangles;
-            renderer_->setTerrainPage(page, pageBounds, geometry);
-            if (data.chunks.empty()) terrainPages_.erase(page);
-        }
     }
 
     void refreshRanges() {
@@ -851,7 +944,7 @@ private:
             remote.right = unit(cross(remote.forward, direction));
             remote.up = cross(remote.right, remote.forward);
             remote.nearPlane = 8;
-            applyTerrain(world_->update({target}, true, remote.eye), false);
+            finishTerrainUpdate(world_->update({target}, true, remote.eye), false);
             if (!world_->hasFinestLod(target) ||
                 world_->physics.ray(target + direction * 300, target - direction * 300).state != Hit::State::Contact)
                 throw std::runtime_error("Remote Mars terrain did not publish fine collision coverage");
@@ -1291,6 +1384,9 @@ private:
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
     std::map<Key, TerrainPage> terrainPages_;
+    std::vector<PreparedTerrainPage> preparedTerrain_;
+    std::size_t nextTerrainUpload_{};
+    bool fullTerrainBuild_{};
     std::size_t selected_{}, triangles_{};
     std::wstring status_, processMemory_, terrainMemory_, lodLegend_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};

@@ -36,10 +36,15 @@ Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to);
 
 class Physics {
 public:
+    struct PreparedTerrain;
+    using Terrain = std::shared_ptr<PreparedTerrain>;
+    static Terrain prepareTerrain(const Chunk& chunk, Method method);
+    static std::size_t preparedTerrainBytes(const Terrain& terrain);
     explicit Physics(Method method, const Chunks& chunks);
     ~Physics();
     void addTerrain(const Chunk& chunk);
-    void removeTerrain(Key key);
+    void addTerrain(const Chunk& chunk, Terrain terrain);
+    Terrain removeTerrain(Key key);
     std::size_t addBody(Shape shape, Vec position, Vec velocity = {});
     Vec bodyPosition(std::size_t index) const;
     BodyPose bodyPose(std::size_t index) const;

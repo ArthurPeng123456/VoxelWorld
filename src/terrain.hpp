@@ -181,6 +181,7 @@ struct Chunk {
     std::vector<Triangle> mesh;
     std::optional<Box> surfaceBounds;
     std::vector<CellRow> rows;
+    std::size_t fieldBytes{};
     const CellRow& row(int y, int z) const { return rows[std::size_t(z) * cells + y]; }
     Cell cell(Key index) const;
     Cell cellAt(Vec p) const;

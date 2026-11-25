@@ -33,7 +33,9 @@ public:
     ~Dx12Renderer();
     void setTerrain(const std::vector<Vertex>& terrain);
     void clearTerrain();
-    void setTerrainPage(Key page, Box bounds, const std::vector<Vertex>& vertices);
+    void stageTerrainPage(Key page, Box bounds, const std::vector<GpuVertex>& vertices);
+    bool terrainUploadsReady() const;
+    void publishTerrainPages();
     void setClipmapLines(const std::vector<Vertex>& lines);
     void setShadowResolution(int resolution);
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {}, bool inspectPipeline = false);

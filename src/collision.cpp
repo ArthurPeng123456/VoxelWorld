@@ -8,6 +8,7 @@ static_assert(sizeof(btScalar) == sizeof(double), "Earth-scale physics requires 
 #include <BulletCollision/BroadphaseCollision/btCollisionAlgorithm.h>
 
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -847,13 +848,14 @@ struct MakeFieldAlgorithm final : btCollisionAlgorithmCreateFunc {
 
 }  // namespace
 
+struct Physics::PreparedTerrain {
+    std::unique_ptr<btTriangleMesh> triangles;
+    std::unique_ptr<btCollisionShape> shape;
+    std::unique_ptr<btCollisionObject> object;
+    std::size_t bytes{};
+};
+
 struct Physics::Impl {
-    struct Fixed {
-        std::unique_ptr<btTriangleMesh> triangles;
-        std::unique_ptr<btCollisionShape> shape;
-        std::unique_ptr<btCollisionObject> object;
-        std::size_t bytes{};
-    };
     struct Body {
         std::unique_ptr<btConvexShape> shape;
         std::unique_ptr<btRigidBody> body;
@@ -871,7 +873,7 @@ struct Physics::Impl {
     }
     ~Impl() {
         for (auto& body : bodies) world.removeRigidBody(body.body.get());
-        for (auto& item : fixed) world.removeCollisionObject(item.second.object.get());
+        for (auto& item : fixed) world.removeCollisionObject(item.second->object.get());
     }
 
     void wakeBodies(Box box) {
@@ -889,19 +891,21 @@ struct Physics::Impl {
     btDbvtBroadphase broadphase;
     btSequentialImpulseConstraintSolver solver;
     btDiscreteDynamicsWorld world;
-    std::map<Key, Fixed> fixed;
+    std::map<Key, Terrain> fixed;
+    std::size_t terrainBytes{};
     std::vector<Body> bodies;
 };
 
 Physics::Physics(Method method, const Chunks& chunks) : impl_(std::make_unique<Impl>(method, chunks)) {}
 Physics::~Physics() = default;
 
-void Physics::addTerrain(const Chunk& chunk) {
-    Impl::Fixed fixed;
+Physics::Terrain Physics::prepareTerrain(const Chunk& chunk, Method method) {
+    if (method == Method::Mesh ? chunk.mesh.empty() : !chunk.surfaceBounds) return {};
+    auto terrain = std::make_shared<PreparedTerrain>();
+    auto& fixed = *terrain;
     btTransform transform;
     transform.setIdentity();
-    if (impl_->method == Method::Mesh) {
-        if (chunk.mesh.empty()) return;
+    if (method == Method::Mesh) {
         fixed.triangles = std::make_unique<btTriangleMesh>();
         const Vec origin = chunk.box.center();
         for (const auto& triangle : chunk.mesh) {
@@ -916,7 +920,6 @@ void Physics::addTerrain(const Chunk& chunk) {
         fixed.shape = std::move(bvh);
         transform.setOrigin(bullet(origin));
     } else {
-        if (!chunk.surfaceBounds) return;
         fixed.shape = std::make_unique<FieldShape>(chunk);
         fixed.bytes = sizeof(FieldShape);
     }
@@ -928,17 +931,30 @@ void Physics::addTerrain(const Chunk& chunk) {
     fixed.object->setWorldTransform(transform);
     fixed.object->setFriction(btScalar(0.8));
     fixed.bytes += sizeof(btCollisionObject) + sizeof(btDbvtProxy);
-    impl_->world.addCollisionObject(fixed.object.get(), terrainGroup, bodyGroup);
-    impl_->wakeBodies(chunk.box);
-    impl_->fixed.emplace(chunk.key, std::move(fixed));
+    return terrain;
 }
 
-void Physics::removeTerrain(Key key) {
+std::size_t Physics::preparedTerrainBytes(const Terrain& terrain) { return terrain ? terrain->bytes : 0; }
+
+void Physics::addTerrain(const Chunk& chunk) { addTerrain(chunk, prepareTerrain(chunk, impl_->method)); }
+
+void Physics::addTerrain(const Chunk& chunk, Terrain terrain) {
+    if (!terrain) return;
+    const auto [entry, inserted] = impl_->fixed.try_emplace(chunk.key, std::move(terrain));
+    if (!inserted) throw std::logic_error("Terrain collider already registered for this chunk");
+    impl_->world.addCollisionObject(entry->second->object.get(), terrainGroup, bodyGroup);
+    impl_->wakeBodies(chunk.box);
+    impl_->terrainBytes += entry->second->bytes;
+}
+
+Physics::Terrain Physics::removeTerrain(Key key) {
     auto found = impl_->fixed.find(key);
-    if (found == impl_->fixed.end()) return;
+    if (found == impl_->fixed.end()) return {};
     impl_->wakeBodies(bounds(key));
-    impl_->world.removeCollisionObject(found->second.object.get());
-    impl_->fixed.erase(found);
+    impl_->world.removeCollisionObject(found->second->object.get());
+    impl_->terrainBytes -= found->second->bytes;
+    auto retired = impl_->fixed.extract(found);
+    return std::move(retired.mapped());
 }
 
 std::size_t Physics::addBody(Shape shape, Vec position, Vec velocity) {
@@ -1020,9 +1036,7 @@ Hit Physics::sweep(const Shape& shape, Vec from, Vec to) const {
 }
 
 std::size_t Physics::terrainBytes() const {
-    std::size_t bytes = 0;
-    for (const auto& item : impl_->fixed) bytes += item.second.bytes;
-    return bytes;
+    return impl_->terrainBytes;
 }
 
 }  // namespace voxel

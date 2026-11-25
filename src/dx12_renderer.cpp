@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <type_traits>
 #include <sstream>
 #include <stdexcept>
 
@@ -415,7 +416,8 @@ struct Dx12Renderer::Impl {
         }
     }
 
-    void upload(Upload& result, const std::vector<Vertex>& vertices) {
+    template<class VertexType>
+    void upload(Upload& result, const std::vector<VertexType>& vertices) {
         const UINT64 size = UINT64(vertices.size()) * sizeof(GpuVertex);
         if (size > std::numeric_limits<UINT>::max()) throw std::runtime_error("Vertex buffer is too large");
         result.count = UINT(vertices.size());
@@ -430,15 +432,19 @@ struct Dx12Renderer::Impl {
         void* pointer = nullptr;
         const D3D12_RANGE noReads{0, 0};
         require(result.resource->Map(0, &noReads, &pointer), "Map vertex buffer");
-        auto* packed = static_cast<GpuVertex*>(pointer);
-        for (const auto& vertex : vertices) *packed++ = packVertex(vertex);
+        if constexpr (std::is_same_v<VertexType, GpuVertex>) {
+            std::memcpy(pointer, vertices.data(), SIZE_T(size));
+        } else {
+            auto* packed = static_cast<GpuVertex*>(pointer);
+            for (const auto& vertex : vertices) *packed++ = packVertex(vertex);
+        }
         const D3D12_RANGE written{0, SIZE_T(size)};
         result.resource->Unmap(0, &written);
         result.view = {result.resource->GetGPUVirtualAddress(), UINT(size), UINT(sizeof(GpuVertex))};
     }
 
-    void copyTerrainPages() {
-        for (auto& item : terrainPages) {
+    void copyTerrainPages(std::map<Key, TerrainPage>& pages) {
+        for (auto& item : pages) {
             auto& page = item.second;
             if (!page.dirty) continue;
             if (!page.vertices || page.vertices->GetDesc().Width < page.staging.view.SizeInBytes) {
@@ -588,7 +594,11 @@ struct Dx12Renderer::Impl {
         frameUpload->Unmap(0, nullptr);
         require(allocator->Reset(), "Reset command allocator");
         require(list->Reset(allocator.Get(), nullptr), "Reset command list");
-        copyTerrainPages();
+        if (terrainCopiesPending) {
+            copyTerrainPages(terrainPages);
+            copyTerrainPages(stagedTerrainPages);
+            terrainCopiesPending = false;
+        }
         list->SetGraphicsRootSignature(root.Get());
         ID3D12DescriptorHeap* heaps[]{srv.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootConstantBufferView(0, frameUpload->GetGPUVirtualAddress());
@@ -710,6 +720,8 @@ struct Dx12Renderer::Impl {
     ComPtr<ID3D12Fence> fence;
     Upload terrain, objects, clipmapLines;
     std::map<Key, TerrainPage> terrainPages;
+    std::map<Key, TerrainPage> stagedTerrainPages;
+    bool terrainCopiesPending{};
 };
 
 Dx12Renderer::Dx12Renderer(HWND target, bool forceWarp, bool debug) : impl_(std::make_unique<Impl>(target, forceWarp, debug)) {}
@@ -720,15 +732,24 @@ void Dx12Renderer::setTerrain(const std::vector<Vertex>& terrain) {
 }
 void Dx12Renderer::clearTerrain() {
     impl_->terrainPages.clear();
+    impl_->stagedTerrainPages.clear();
+    impl_->terrainCopiesPending = false;
     impl_->terrain = {};
 }
-void Dx12Renderer::setTerrainPage(Key page, Box bounds, const std::vector<Vertex>& vertices) {
-    if (vertices.empty()) impl_->terrainPages.erase(page);
-    else {
-        auto& entry = impl_->terrainPages[page];
-        impl_->upload(entry.staging, vertices);
-        entry.bounds = bounds;
-        entry.dirty = true;
+void Dx12Renderer::stageTerrainPage(Key page, Box bounds, const std::vector<GpuVertex>& vertices) {
+    auto& entry = impl_->stagedTerrainPages[page];
+    impl_->upload(entry.staging, vertices);
+    entry.bounds = bounds;
+    entry.dirty = !vertices.empty();
+    impl_->terrainCopiesPending |= entry.dirty;
+}
+bool Dx12Renderer::terrainUploadsReady() const { return !impl_->terrainCopiesPending; }
+void Dx12Renderer::publishTerrainPages() {
+    auto& staged = impl_->stagedTerrainPages;
+    while (!staged.empty()) {
+        auto page = staged.extract(staged.begin());
+        impl_->terrainPages.erase(page.key());
+        if (page.mapped().staging.count) impl_->terrainPages.insert(std::move(page));
     }
 }
 void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
