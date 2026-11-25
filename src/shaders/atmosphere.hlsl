@@ -11,6 +11,10 @@ cbuffer Camera : register(b0) {
     float4 renderParams; // width, height, exposure multiplier, tone mapper
     float4 scatteringParams; // Rayleigh strength, Mie strength, Mie anisotropy
     float4 terrainParams; // preset, texture seed, minimum terrain elevation
+    float4 cloudLayer; // inner/outer radius, coverage, extinction per meter
+    float4 cloudShape; // global weather scale, formation scale (meters)
+    float4 cloudRender; // enabled, primary steps, half-resolution width/height
+    float4 cloudWind; // periodic planet-relative noise displacement (meters)
 };
 
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }

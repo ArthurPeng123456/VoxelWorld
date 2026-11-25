@@ -1,6 +1,5 @@
 Texture2D<float4> gAlbedo : register(t0);
 Texture2D<float4> gNormal : register(t1);
-Texture2D<float> gDepth : register(t2);
 Texture2DArray<float> shadowMaps : register(t3);
 Texture2D<float4> hdrScene : register(t4);
 SamplerComparisonState shadowSampler : register(s0);
@@ -74,13 +73,16 @@ float4 deferredPS(Sky input) : SV_Target {
     float2 ndc = input.clip.xy / renderParams.xy * float2(2, -2) + float2(-1, 1);
     float3 ray = cameraForward.xyz + cameraRight.xyz * (ndc.x / projection.x) + cameraUp.xyz * (ndc.y / projection.y);
     float4 normalData = gNormal.Load(int3(pixel, 0));
-    if (depth <= 0 || normalData.w <= 0) return float4(skyRadiance(normalize(ray)), 1);
+    float2 uv = input.clip.xy / renderParams.xy;
+    if (depth <= 0 || normalData.w <= 0)
+        return float4(compositeClouds(skyRadiance(normalize(ray)), uv,
+            depth > 0 ? (projection.z / depth) * length(ray) : projection.w), 1);
     float4 material = gAlbedo.Load(int3(pixel, 0));
     int code = int(round(material.a * 255));
-    if (code == 255) return float4(material.rgb * 4, 1);
     float viewDepth = projection.z / depth;
     float3 relative = ray * viewDepth;
     float distance = length(relative);
+    if (code == 255) return float4(compositeClouds(material.rgb * 4, uv, distance), 1);
     float3 viewDirection = relative / max(distance, 1e-6);
     float airDistance = distance;
     float3 normal = normalize(normalData.xyz);
@@ -111,6 +113,7 @@ float4 deferredPS(Sky input) : SV_Target {
     }
     float diffuse = max(0, dot(normal, sunlight.xyz));
     float shadow = visibility(relative, shadowNormal, viewDepth);
+    if (code < 253) shadow *= cloudGroundShadow(planetEyeHi.xyz + (planetEyeLo.xyz + relative));
     float3 eyeDirection = -viewDirection;
     float3 halfVector = normalize(sunlight.xyz + eyeDirection);
     float specular = pow(saturate(dot(normal, halfVector)), lerp(96, 8, roughness)) * 0.08;
@@ -122,7 +125,7 @@ float4 deferredPS(Sky input) : SV_Target {
     }
     float3 transmittance;
     float3 inscatter = scatter(planetEye(), viewDirection, airDistance, transmittance);
-    return float4(radiance * transmittance + inscatter, 1);
+    return float4(compositeClouds(radiance * transmittance + inscatter, uv, distance), 1);
 }
 float4 linePS(Surface input) : SV_Target { return float4(input.material.rgb * 2, 1); }
 

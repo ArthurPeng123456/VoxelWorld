@@ -1,5 +1,5 @@
 struct TestInput { float4 pHi, pLo, bHi, bLo, ray, params; };
-struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance, tone; };
+struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance, tone, clouds; };
 StructuredBuffer<TestInput> cases : register(t5);
 RWStructuredBuffer<TestOutput> results : register(u0);
 [numthreads(64, 1, 1)]
@@ -24,5 +24,6 @@ void precisionCS(uint id : SV_DispatchThreadID) {
     result.transmittance = float4(transmittance, 0);
     float exposure = exp2(int(id % 5) - 2);
     result.tone = float4(acesToneMap(float3(0.18, 1, 4), exposure), acesToneMap(float3(20, 20, 20), exposure).x);
+    result.clouds = cloudIntervals(p, input.ray.xyz, 5e7);
     results[id] = result;
 }

@@ -17,6 +17,7 @@ struct Camera {
     RenderSettings settings{};
     TerrainPreset terrain{TerrainPreset::Classic};
     std::uint32_t terrainSeed{};
+    double timeSeconds{};
 };
 
 struct RenderDiagnostics {
@@ -25,6 +26,8 @@ struct RenderDiagnostics {
     std::array<std::size_t, 4> shadowPixels{};
     unsigned shadowResolution{};
     bool debugLayer{};
+    std::size_t cloudPixels{};
+    double maxCloudOpacity{};
 };
 
 class Dx12Renderer {

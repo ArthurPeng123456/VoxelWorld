@@ -12,6 +12,9 @@ R"voxelshader(
 @VOXEL_TERRAIN_MATERIAL_SHADER@
 )voxelshader"
 R"voxelshader(
+@VOXEL_CLOUD_SHADER@
+)voxelshader"
+R"voxelshader(
 @VOXEL_DEFERRED_SHADER@
 )voxelshader";
 }

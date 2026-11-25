@@ -27,7 +27,7 @@ ctest --test-dir build-windows-native -C Release --output-on-failure
 .\build-windows-native\Release\VoxelWorldViewer.exe --warp --capture-dir results-earth-warp
 ```
 
-GPU 测试包含 94 组数据，检查 df64 运算、毫米高度、地平线求交、轨道距离、10⁹/10¹² 米绝对坐标的相对消减，以及大气输出有限性和透射率范围。CPU 测试包含正负百万米坐标的射线、形状扫掠和刚体静止接触。截图验证覆盖四种后端的轨道、地表、高空地平线、线框与 LOD 窗口，另生成公共平移 `(10¹², -10¹², 10¹²)` 米前后的两张对照图。用 `python scripts/validate-render-captures.py results-earth-captures` 检查对照图。另有全局体积覆盖、32 个方向的远处地形查询、2:1 平衡、粗细块字段连续性，以及摄像机跨半球时的后台替换验证。单次散射与固定样本数是实时近似，远处地形按粗层采样，不保留细小起伏；大气没有多次散射和云层。
+GPU 测试包含 139 组数据，检查 df64 运算、毫米高度、地平线和云层球壳求交、轨道距离、10⁹/10¹² 米绝对坐标的相对消减，以及大气输出有限性和透射率范围。CPU 测试包含正负百万米坐标的射线、形状扫掠和刚体静止接触。截图验证覆盖四种后端的轨道、地表、高空地平线、线框与 LOD 窗口，另生成公共平移 `(10¹², -10¹², 10¹²)` 米前后的两张对照图。用 `python scripts/validate-render-captures.py results-earth-captures` 检查对照图。另有全局体积覆盖、32 个方向的远处地形查询、2:1 平衡、粗细块字段连续性，以及摄像机跨半球时的后台替换验证。单次散射与固定样本数是实时近似，远处地形按粗层采样，不保留细小起伏；大气没有多次散射，体积云另有下述原型与专项验证。
 
 | 方案 | 命令参数 | 渲染几何 | 地形碰撞 |
 | --- | --- | --- | --- |
@@ -61,6 +61,26 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 
 `--capture-dir` 在可用时启用 D3D12 调试层，并采集阴影开关、三档分辨率、曝光 +1 EV、色调映射、大气调整与窗口缩放的固定场景。`.pipeline.txt` 记录 G-buffer 有效像素数、HDR 浮点最大值、阴影贴图实际分辨率和四个级联的深度像素数。`python scripts/validate-render-captures.py DIRECTORY` 检查画面对照和缓冲报告。GPU 数值测试还对照 CPU 检查曝光与色调映射结果。
 
+### 行星体积云原型
+
+默认开启球面体积云，工具栏 `Clouds [V]` 或 `V` 切换。自由摄像机可以从轨道连续飞到云下、云上和云内。`Render settings...` 中可调整云底高度、厚度、天气覆盖、消光强度、天气区尺度、云团尺度、风速及 32 / 64 / 96 步质量。
+
+云场采用分层尺度：默认 1,400 公里级的连续球面天气分布决定大片云区与晴空，45 公里级的三维场塑造其中的云团，更细的 Worley 侵蚀只在近处可分辨时参与。天气分布随星球方向采样，云形使用行星相对坐标，不随摄像机重新生成。每个采样点根据像素足迹和积分步长选择三维噪声 mip，并渐隐无法分辨的小云团与侵蚀，保留全球天气形态，减少轨道远景中密集平铺细节的观感。近处采用更密的非均匀步进。
+
+GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交段，支持云层内外摄像机与公共大坐标平移。云先按两个方向各一半的分辨率积分，计算 Beer–Lambert 消光、四次光照路径采样的自遮挡、前后向散射和经验多次散射补光，再按场景深度上采样合成到线性 HDR。地形接收低频天气阴影；前景不透明物体遮挡云。大气以云的贡献加权平均深度近似处理前方空气透视。64³ RGBA 噪声含完整 mip，约 1.14 MiB；云渲染目标额外占用约每个全分辨率像素 4 字节。
+
+这是一版针对当前项目的原型，并非复现 StarEngine 的内部实现。公开参考：[CIG 对轨道云细节重复问题的说明](https://robertsspaceindustries.com/en/comm-link/transmission/18251-Star-Citizen-Monthly-Report-July-2021)、[逐采样点纹理 LOD、散射与阴影](https://robertsspaceindustries.com/en/comm-link/transmission/18025-Squadron-42-Monthly-Report-February-2021)、[Guerrilla 的天气与噪声建模](https://www.guerrilla-games.com/read/nubis-authoring-real-time-volumetric-cloudscapes-with-the-decima-engine)。当前没有天气物理模拟、历史帧重投影或云体编辑；全局天气静态，风驱动局部云形。低分辨率深度过滤和有限步数在复杂遮挡与掠射角仍有误差，多次散射、地面云影及大气耦合均为近似。
+
+命令行支持 `--clouds` / `--no-clouds`、`--cloud-base-km`、`--cloud-thickness-km`、`--cloud-coverage`、`--cloud-density`、`--cloud-weather-km`、`--cloud-formation-km`、`--cloud-wind-speed`、`--cloud-steps 32|64|96`。例如：
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --terrain mars --exposure -1 --cloud-coverage 0.5 --cloud-weather-km 1400
+.\build-windows-native\dist\VoxelWorldViewer.exe --capture-clouds results-clouds
+python scripts/validate-cloud-captures.py results-clouds
+```
+
+`--capture-clouds` 生成轨道开关、零覆盖、零消光、两档采样质量、云下、地平线、云内、风、10¹² 米公共平移和前景遮挡共 14 个视图，以及云的不透明度图和 GPU 缓冲检查报告。GPU 数值测试增加球壳求交与云内视角，总计 139 组用例，同时检查噪声 mip 保持均值并降低方差。已有 `--capture-dir` 保持关闭云的地形与大气参考画面。
+
 ### 渲染设置
 
 工具栏 **`Render settings...`** 打开设置窗口。点击 `Apply` 即可应用到当前场景，`Defaults` 恢复初始参数。`J`、`H` 和 `[` / `]` 继续快速切换阴影、大气和曝光。
@@ -69,6 +89,7 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 | --- | --- |
 | CSM | 开关、每级 Shadow Map 分辨率（1024² / 2048² / 4096²）、距离上限、对数分割权重、法线和深度偏移倍率 |
 | 大气 | 开关、厚度、Rayleigh / Mie 各自的尺度高度与散射强度、Mie 各向异性 |
+| 体积云 | 开关、云底、厚度、覆盖、消光、天气与云团尺度、风速、采样质量 |
 | HDR | 曝光（−10 到 +10 EV）和色调映射（ACES、Reinhard、线性裁剪） |
 
 `Thickness (km)` 同时调整大气外边界和密度曲线的垂直尺度。Rayleigh 与 Mie 的尺度高度按 100 公里厚度填写，运行时随厚度等比缩放。例如默认 Rayleigh 尺度高度为 8 公里，厚度调到 200 公里时对应的实际尺度高度为 16 公里。轨道截图验证固定机位，只切换 100 公里与 300 公里厚度，检查外缘光晕的变化。
@@ -101,6 +122,7 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 | 设置 LOD0 半径并预览各级距离 | 工具栏 `LOD ranges...` |
 | 切换地形和刚体的三角形线框渲染 | `F2` 或 `Wireframe [F2]` |
 | 开关大气散射和地形空气透视（默认开启） | `H` 或 `Atmosphere [H]` |
+| 开关行星体积云（默认开启） | `V` 或 `Clouds [V]` |
 | 开关 CSM 阴影（默认开启） | `J` 或 `Shadows [J]` |
 | 调整 CSM、大气和 HDR | 工具栏 `Render settings...` |
 | 选择星球地形和材质 | 工具栏 `Terrain` |
@@ -109,6 +131,8 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 | 暂停或重置模拟 | `Space`、`R` |
 
 自由摄像机以 double 保存位置，W/S 沿视线前后移动，A/D 左右平移，Q/E 沿相机上方向升降。初始速度随进入时的高度调整，状态栏显示基础速度；滚轮向上加速、向下减速，Shift 临时加速 5 倍。松开移动键或切换到其他应用时停止移动，暂停模拟仍可飞行并更新地形 LOD。该模式不做地形碰撞约束。再次按 C 返回先前的轨道／地表模式，F 切换至锚定视角，Reset 退出自由模式。工具栏会随窗口宽度自动换行。
+
+右下角的 `Camera world (m)` 面板显示当前渲染摄像机的世界坐标 X / Y / Z、相机模式和 `Alt (sphere)` 高度。数值单位为米，保留三位小数；高度相对半径 6,371,000 米的参考球面计算。面板随每帧摄像机位置刷新，暂停模拟时仍会更新自由摄像机信息。
 
 `Invokers` 的数量仅指移动 Invoker，摄像机另外参与数据 LOD。调整数量保留现有刚体和剩余 Invoker 的位置。接管时使用第三人称相机，WASD 按镜头方向沿程序化地表移动，默认速度为 240 米/秒。拖动旋转镜头，滚轮调整跟随距离。换目标或脱离后，原 Invoker 从当前位置平滑回到当前巡航轨迹。暂停时仍可手动移动，巡航和回归在恢复模拟后继续。Invoker 标记使用分面法线、高光和边缘补光，当前相机目标为青色，其他标记为橙色。
 

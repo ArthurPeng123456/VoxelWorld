@@ -7,7 +7,8 @@ namespace {
 
 enum Field {
     ShadowEnabled = 1200, Resolution, ShadowMemory, AtmosphereEnabled, ToneMapper, Status, Defaults,
-    ShadowFirst = 1220, AtmosphereFirst = 1230, HdrFirst = 1240
+    ShadowFirst = 1220, AtmosphereFirst = 1230, HdrFirst = 1240,
+    CloudEnabled = 1245, CloudQuality, CloudFirst = 1250
 };
 
 void addControl(HWND dialog, const wchar_t* type, const wchar_t* text, DWORD style,
@@ -71,11 +72,15 @@ void updateMemory(HWND dialog) {
 void writeSettings(HWND dialog, const RenderSettings& settings) {
     CheckDlgButton(dialog, ShadowEnabled, settings.shadowsEnabled ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dialog, AtmosphereEnabled, settings.atmosphereEnabled ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dialog, CloudEnabled, settings.cloudsEnabled ? BST_CHECKED : BST_UNCHECKED);
+    for (std::size_t i = 0; i < cloudStepCounts.size(); ++i) if (settings.cloudSteps == cloudStepCounts[i])
+        SendDlgItemMessageW(dialog, CloudQuality, CB_SETCURSEL, WPARAM(i), 0);
     for (std::size_t i = 0; i < shadowResolutions.size(); ++i) if (shadowResolutions[i] == settings.shadowResolution)
         SendDlgItemMessageW(dialog, Resolution, CB_SETCURSEL, WPARAM(i), 0);
     SendDlgItemMessageW(dialog, ToneMapper, CB_SETCURSEL, WPARAM(settings.toneMapping), 0);
     writeFields(dialog, shadowParameters, ShadowFirst, settings);
     writeFields(dialog, atmosphereParameters, AtmosphereFirst, settings);
+    writeFields(dialog, cloudParameters, CloudFirst, settings);
     writeFields(dialog, hdrParameters, HdrFirst, settings);
     SetDlgItemTextW(dialog, Status, L"");
     updateMemory(dialog);
@@ -101,17 +106,27 @@ INT_PTR CALLBACK renderDialog(HWND dialog, UINT message, WPARAM w, LPARAM l) {
         addControl(dialog, L"BUTTON", L"Enable atmosphere", WS_TABSTOP | BS_AUTOCHECKBOX, AtmosphereEnabled, 210, 18, 163, 12);
         addFields(dialog, atmosphereParameters, AtmosphereFirst, 210, 34);
 
-        addControl(dialog, L"BUTTON", L"HDR", BS_GROUPBOX, -1, 8, 141, 378, 34);
-        addFields(dialog, hdrParameters, HdrFirst, 18, 154);
-        addControl(dialog, L"STATIC", L"Tone mapping", 0, -1, 210, 156, 65, 11);
-        addControl(dialog, L"COMBOBOX", L"", dropdown, ToneMapper, 279, 153, 97, 63);
+        addControl(dialog, L"BUTTON", L"Planetary volumetric clouds", BS_GROUPBOX, -1, 8, 141, 378, 150);
+        addControl(dialog, L"BUTTON", L"Enable clouds [V]", WS_TABSTOP | BS_AUTOCHECKBOX, CloudEnabled, 18, 154, 163, 12);
+        addFields(dialog, cloudParameters, CloudFirst, 18, 172);
+        addControl(dialog, L"STATIC", L"Raymarch quality", 0, -1, 210, 174, 97, 11);
+        addControl(dialog, L"COMBOBOX", L"", dropdown, CloudQuality, 210, 188, 163, 63);
+        for (const auto* label : {L"Low (32 samples)", L"Medium (64 samples)", L"High (96 samples)"})
+            SendDlgItemMessageW(dialog, CloudQuality, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        addControl(dialog, L"STATIC", L"Weather scale sets the size of cloud regions and clear skies.\n\nFormation scale controls billows inside those regions.\n\nSmall details fade with distance.",
+                   0, -1, 210, 209, 163, 72);
+
+        addControl(dialog, L"BUTTON", L"HDR", BS_GROUPBOX, -1, 8, 297, 378, 34);
+        addFields(dialog, hdrParameters, HdrFirst, 18, 310);
+        addControl(dialog, L"STATIC", L"Tone mapping", 0, -1, 210, 312, 65, 11);
+        addControl(dialog, L"COMBOBOX", L"", dropdown, ToneMapper, 279, 309, 97, 63);
         for (const auto* label : {L"ACES (filmic)", L"Reinhard", L"Linear (clamp)"})
             SendDlgItemMessageW(dialog, ToneMapper, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
 
-        addControl(dialog, L"STATIC", L"", 0, Status, 10, 181, 375, 11);
-        addControl(dialog, L"BUTTON", L"Defaults", WS_TABSTOP | BS_PUSHBUTTON, Defaults, 10, 197, 58, 15);
-        addControl(dialog, L"BUTTON", L"Apply", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 264, 197, 58, 15);
-        addControl(dialog, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL, 328, 197, 58, 15);
+        addControl(dialog, L"STATIC", L"", 0, Status, 10, 337, 375, 11);
+        addControl(dialog, L"BUTTON", L"Defaults", WS_TABSTOP | BS_PUSHBUTTON, Defaults, 10, 353, 58, 15);
+        addControl(dialog, L"BUTTON", L"Apply", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 264, 353, 58, 15);
+        addControl(dialog, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL, 328, 353, 58, 15);
         SendMessageW(dialog, DM_SETDEFID, IDOK, 0);
         writeSettings(dialog, *reinterpret_cast<RenderSettings*>(l));
         return TRUE;
@@ -125,6 +140,10 @@ INT_PTR CALLBACK renderDialog(HWND dialog, UINT message, WPARAM w, LPARAM l) {
     RenderSettings next;
     next.shadowsEnabled = IsDlgButtonChecked(dialog, ShadowEnabled) == BST_CHECKED;
     next.atmosphereEnabled = IsDlgButtonChecked(dialog, AtmosphereEnabled) == BST_CHECKED;
+    next.cloudsEnabled = IsDlgButtonChecked(dialog, CloudEnabled) == BST_CHECKED;
+    const auto quality = SendDlgItemMessageW(dialog, CloudQuality, CB_GETCURSEL, 0, 0);
+    if (quality < 0 || quality >= LRESULT(cloudStepCounts.size())) return TRUE;
+    next.cloudSteps = cloudStepCounts[std::size_t(quality)];
     const auto resolution = SendDlgItemMessageW(dialog, Resolution, CB_GETCURSEL, 0, 0);
     const auto tone = SendDlgItemMessageW(dialog, ToneMapper, CB_GETCURSEL, 0, 0);
     if (resolution < 0 || resolution >= LRESULT(shadowResolutions.size()) || tone < 0 || tone > int(ToneMapping::Linear))
@@ -132,7 +151,8 @@ INT_PTR CALLBACK renderDialog(HWND dialog, UINT message, WPARAM w, LPARAM l) {
     next.shadowResolution = shadowResolutions[std::size_t(resolution)];
     next.toneMapping = ToneMapping(tone);
     if (!readFields(dialog, shadowParameters, ShadowFirst, next) ||
-        !readFields(dialog, atmosphereParameters, AtmosphereFirst, next) || !readFields(dialog, hdrParameters, HdrFirst, next))
+        !readFields(dialog, atmosphereParameters, AtmosphereFirst, next) ||
+        !readFields(dialog, cloudParameters, CloudFirst, next) || !readFields(dialog, hdrParameters, HdrFirst, next))
         return TRUE;
     *reinterpret_cast<RenderSettings*>(GetWindowLongPtrW(dialog, DWLP_USER)) = next;
     EndDialog(dialog, IDOK);
@@ -146,7 +166,7 @@ bool editRenderSettings(HWND owner, RenderSettings& settings) {
         DLGTEMPLATE dialog;
         WORD menu, windowClass, title;
     } definition{{WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER,
-                   0, 0, 0, 0, 394, 223}, 0, 0, 0};
+                   0, 0, 0, 0, 394, 379}, 0, 0, 0};
     const auto result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &definition.dialog, owner,
                                                 renderDialog, reinterpret_cast<LPARAM>(&settings));
     if (result == -1) throw std::runtime_error("Create render settings dialog failed");

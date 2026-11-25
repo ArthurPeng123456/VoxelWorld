@@ -24,7 +24,9 @@ namespace {
 
 constexpr wchar_t windowClass[] = L"VoxelWorldWindow";
 constexpr wchar_t viewportClass[] = L"VoxelWorldViewport";
-constexpr int footerHeight = 102;
+constexpr int footerHeight = 128;
+constexpr int cameraPanelWidth = 340;
+constexpr int cameraPanelHeight = 90;
 constexpr double pi = 3.14159265358979323846;
 constexpr double dt = 1.0 / 60.0;
 constexpr int maxInvokers = 16;
@@ -43,7 +45,7 @@ Key terrainPage(Key chunk) {
     return {align(chunk.x), align(chunk.y), align(chunk.z), level, chunk.densityShift};
 }
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows,
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows, Clouds,
                RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget, TerrainStyle };
 
 struct ToolbarButton { const wchar_t* label; int width; };
@@ -51,6 +53,7 @@ constexpr std::array<ToolbarButton, GraphicsSettings> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
     {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108},
+    {L"Clouds [V]", 100},
     {L"LOD ranges...", 112}, {L"Render settings...", 136}
 }};
 
@@ -58,7 +61,7 @@ struct Options {
     int method{1};
     std::uint64_t seed{42};
     int invokers{2};
-    bool warp{}, morton{};
+    bool warp{}, morton{}, cloudCaptures{};
     double voxelDensity{1};
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
@@ -100,6 +103,14 @@ Options readOptions() {
         if (option == L"--warp") result.warp = true;
         else if (option == L"--no-shadows") result.render.shadowsEnabled = false;
         else if (option == L"--no-atmosphere") result.render.atmosphereEnabled = false;
+        else if (option == L"--clouds") result.render.cloudsEnabled = true;
+        else if (option == L"--no-clouds") result.render.cloudsEnabled = false;
+        else if (option == L"--cloud-steps") {
+            const auto steps = integer();
+            if (std::find(cloudStepCounts.begin(), cloudStepCounts.end(), steps) == cloudStepCounts.end())
+                throw std::invalid_argument("--cloud-steps requires 32, 64 or 96");
+            result.render.cloudSteps = int(steps);
+        }
         else if (option == L"--shadow-resolution") {
             const auto resolution = integer();
             if (resolution > shadowResolutions.back() || !validShadowResolution(int(resolution)))
@@ -113,6 +124,7 @@ Options readOptions() {
             else throw std::invalid_argument("--tone-map requires aces, reinhard or linear");
         } else if (option == L"--morton") result.morton = true;
         else if (option == L"--capture-dir") result.captures = next();
+        else if (option == L"--capture-clouds") { result.captures = next(); result.cloudCaptures = true; }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
@@ -135,7 +147,8 @@ Options readOptions() {
             else if (value == L"dag" || value == L"3") result.method = 2;
             else if (value == L"vdb" || value == L"4") result.method = 3;
             else throw std::invalid_argument("Choose mesh, grid, dag or vdb");
-        } else if (!renderOption(shadowParameters) && !renderOption(atmosphereParameters) && !renderOption(hdrParameters))
+        } else if (!renderOption(shadowParameters) && !renderOption(atmosphereParameters) &&
+                   !renderOption(cloudParameters) && !renderOption(hdrParameters))
             throw std::invalid_argument("Unknown viewer option");
     }
     return result;
@@ -296,6 +309,7 @@ public:
     }
 
     int run() {
+        if (opts_.cloudCaptures) return captureClouds();
         if (!opts_.captures.empty()) return captureAll();
         std::ofstream profile;
         int profileFrame = 0;
@@ -372,6 +386,7 @@ public:
                 statsElapsed = 0;
             }
             const double statusMs = milliseconds(statusStart);
+            updateCameraInfo(frameCamera);
             buildObjects();
             const auto drawStart = Clock::now();
             renderer_->draw(frameCamera, objects_);
@@ -769,7 +784,7 @@ private:
         const auto textureSeed = std::uint32_t((opts_.seed ^ (opts_.seed >> 32)) % 1021);
         if (freeView_) {
             return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
-                    lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed};
+                    lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
         }
         const Vec target = invokers_[selected_];
         const Vec radial = unit(target);
@@ -796,10 +811,88 @@ private:
         }
         const Vec forward = unit(center - eye), right = unit(cross(forward, nominalUp), basis[0]);
         return {eye, right, unit(cross(right, forward)), forward, nearPlane, 20 * planetRadius,
-                lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed};
+                lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
+    }
+
+    int captureClouds() {
+        std::filesystem::create_directories(opts_.captures);
+        const bool previousClouds = opts_.render.cloudsEnabled;
+        key('V', true);
+        if (opts_.render.cloudsEnabled == previousClouds) throw std::runtime_error("V did not toggle planetary clouds");
+        key('V', true);
+        SetWindowPos(window_, nullptr, 0, 0, opts_.warp ? 960 : 1280, opts_.warp ? 720 : 900, SWP_NOMOVE | SWP_NOZORDER);
+        renderer_->setClipmapLines({});
+        Camera orbit = camera();
+        orbit.eye = Vec{0, -0.3, 2.5} * planetRadius;
+        orbit.forward = unit(orbit.eye * -1);
+        orbit.right = unit(cross(orbit.forward, {0, 1, 0}));
+        orbit.up = cross(orbit.right, orbit.forward);
+        orbit.nearPlane = 10;
+        orbit.settings.cloudsEnabled = true;
+        orbit.timeSeconds = 0;
+        const auto capture = [&](const char* name, const Camera& view) {
+            renderer_->draw(view, {}, opts_.captures / (std::string(name) + ".bmp"), true);
+        };
+        capture("cloud-orbit", orbit);
+        const auto orbitClouds = renderer_->diagnostics().cloudPixels;
+        if (orbitClouds < 500) throw std::runtime_error("Planetary cloud capture produced no significant cloud coverage");
+        Camera clear = orbit; clear.settings.cloudsEnabled = false;
+        capture("cloud-orbit-off", clear);
+        clear = orbit; clear.settings.cloudCoverage = 0;
+        capture("cloud-zero-coverage", clear);
+        clear = orbit; clear.settings.cloudDensity = 0;
+        capture("cloud-zero-density", clear);
+        Camera quality = orbit; quality.settings.cloudSteps = 32;
+        capture("cloud-orbit-low", quality);
+        quality.settings.cloudSteps = 96;
+        capture("cloud-orbit-high", quality);
+        Camera local = orbit;
+        local.eye = {0, 0, planetRadius + 2000};
+        local.forward = unit(Vec{1, 0, 0.18});
+        local.right = {0, -1, 0}; local.up = cross(local.right, local.forward);
+        capture("cloud-below", local);
+        local.eye.z = planetRadius + 60000;
+        local.forward = unit(Vec{1, 0, -0.22}); local.up = cross(local.right, local.forward);
+        capture("cloud-horizon", local);
+        local.eye.z = planetRadius + 9000;
+        local.forward = {1, 0, 0}; local.up = {0, 0, 1};
+        local.settings.cloudCoverage = 1;
+        capture("cloud-inside", local);
+        local.timeSeconds = 600;
+        capture("cloud-wind", local);
+        local.timeSeconds = 0;
+        // Cloud-only captures isolate the actual large-coordinate upload path.
+        renderer_->setTerrain({});
+        capture("cloud-precision-base", local);
+        const Vec translation{1e12, -1e12, 1e12};
+        local.eye = local.eye + translation; local.planetCenter = translation;
+        capture("cloud-precision-translated", local);
+        local.planetCenter = {};
+        local.eye = {0, 0, planetRadius + 2000};
+        local.forward = {0, 0, 1}; local.right = {1, 0, 0}; local.up = {0, 1, 0};
+        Shape blocker = sampleShape(3, {0, 0, 1}); blocker.size = {20000, 20000, 5};
+        std::vector<Vertex> occluder;
+        appendBox(occluder, blocker, local.eye + Vec{0, 0, 500}, color({0.6, 0.12, 0.08}, 254));
+        renderer_->setTerrain(occluder);
+        capture("cloud-occluded-on", local);
+        local.settings.cloudsEnabled = false;
+        capture("cloud-occluded-off", local);
+        std::ofstream report(opts_.captures / "cloud-validation.txt");
+        report << "renderer=" << (renderer_->isWarp() ? "WARP" : "hardware")
+               << "\norbit_cloud_pixels=" << orbitClouds
+               << "\nprecision_translation=1000000000000\nscenarios=14\n";
+        return 0;
     }
 
     int captureAll() {
+        // Keep the existing atmosphere/terrain reference suite independent of
+        // the new cloud art direction. --capture-clouds validates clouds.
+        opts_.render.cloudsEnabled = false;
+        const auto referenceSettings = [] {
+            RenderSettings settings;
+            settings.cloudsEnabled = false;
+            return settings;
+        };
         std::filesystem::create_directories(opts_.captures);
         std::ofstream report(opts_.captures / "validation.txt");
         report.exceptions(std::ios::badbit | std::ios::failbit);
@@ -823,7 +916,7 @@ private:
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-orbit.bmp"));
             if (methods[i] == Method::Grid) {
                 Camera orbitClear = camera();
-                orbitClear.settings = {};
+                orbitClear.settings = referenceSettings();
                 orbitClear.settings.atmosphereEnabled = false;
                 orbitClear.settings.shadowsEnabled = false;
                 renderer_->draw(orbitClear, objects_, opts_.captures / (prefix + "-orbit-no-effects.bmp"));
@@ -941,6 +1034,7 @@ private:
         Shape cube = floor; cube.size = {18,18,45};
         appendBox(caster, cube, origin + Vec{0,0,45}, color({0.75,0.3,0.1}, 254));
         Camera validation{};
+        validation.settings = referenceSettings();
         validation.eye = origin + Vec{0,-180,145};
         validation.forward = unit(origin + Vec{0,0,20} - validation.eye);
         validation.right = unit(cross(validation.forward, {0,0,1}));
@@ -965,19 +1059,19 @@ private:
         report << "pipeline=deferred HDR_RGBA16F CSM4\nhdr_max_component=" << diagnostic.maxHdrComponent
                << "\nshadow_depth_pixels=" << shadowPixels << "\nd3d12_debug_layer=" << diagnostic.debugLayer << '\n';
 
-        validation.settings = {};
+        validation.settings = referenceSettings();
         for (int edge : shadowResolutions) {
             if (edge == RenderSettings{}.shadowResolution) continue;
             validation.settings.shadowResolution = edge;
             const auto name = "pipeline-shadow-" + std::to_string(edge) + ".bmp";
             renderer_->draw(validation, caster, opts_.captures / name, true);
         }
-        validation.settings = {};
+        validation.settings = referenceSettings();
         validation.settings.toneMapping = ToneMapping::Reinhard;
         renderer_->draw(validation, caster, opts_.captures / "pipeline-tone-reinhard.bmp");
         validation.settings.toneMapping = ToneMapping::Linear;
         renderer_->draw(validation, caster, opts_.captures / "pipeline-tone-linear.bmp");
-        validation.settings = {};
+        validation.settings = referenceSettings();
         validation.settings.atmosphereHeightKm = 18;
         validation.settings.rayleighHeightKm = 4;
         validation.settings.mieHeightKm = 0.6;
@@ -1133,6 +1227,7 @@ private:
         } else if (command == Tint) lodTint_ = !lodTint_;
         else if (command == Wireframe) wireframe_ = !wireframe_;
         else if (command == Atmosphere) opts_.render.atmosphereEnabled = !opts_.render.atmosphereEnabled;
+        else if (command == Clouds) opts_.render.cloudsEnabled = !opts_.render.cloudsEnabled;
         else if (command == Shadows) opts_.render.shadowsEnabled = !opts_.render.shadowsEnabled;
         else if (command == Ranges) {
             showRanges_ = !showRanges_;
@@ -1179,6 +1274,7 @@ private:
         else if (code == 'K') action(Ranges);
         else if (code == VK_F2) action(Wireframe);
         else if (code == 'H') action(Atmosphere);
+        else if (code == 'V') action(Clouds);
         else if (code == 'J') action(Shadows);
         else if (code == VK_OEM_4 || code == VK_OEM_6) {
             opts_.render.exposureEV = std::clamp(opts_.render.exposureEV + (code == VK_OEM_6 ? 0.5 : -0.5),
@@ -1228,6 +1324,7 @@ private:
     }
 
     void updateFooter() {
+        updateCameraInfo(camera());
         const auto counts = world_->lodCounts();
         int coarse = 0;
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
@@ -1291,6 +1388,32 @@ private:
         InvalidateRect(window_, &footer, FALSE);
     }
 
+    RECT cameraPanelRect() const {
+        RECT client{};
+        GetClientRect(window_, &client);
+        return {std::max(13L, client.right - cameraPanelWidth), client.bottom - cameraPanelHeight - 6,
+                client.right - 12, client.bottom - 6};
+    }
+
+    void updateCameraInfo(const Camera& view) {
+        const auto mode = freeView_ ? std::wstring(L"Free") : controlling_
+            ? L"Invoker " + std::to_wstring(selected_ + 1) : surface_ ? std::wstring(L"Surface") : std::wstring(L"Orbit");
+        const auto title = L"Camera world (m) | " + mode;
+        const std::array<double, 4> values{view.eye.x, view.eye.y, view.eye.z,
+            length(view.eye - view.planetCenter) - planetRadius};
+        std::array<std::wstring, 4> text;
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            std::wostringstream value;
+            value << std::fixed << std::setprecision(3) << values[i];
+            text[i] = value.str();
+        }
+        if (cameraTitle_ == title && cameraValues_ == text) return;
+        cameraTitle_ = title;
+        cameraValues_ = std::move(text);
+        const auto panel = cameraPanelRect();
+        InvalidateRect(window_, &panel, FALSE);
+    }
+
     void paint() const {
         PAINTSTRUCT paintInfo{};
         HDC dc = BeginPaint(window_, &paintInfo);
@@ -1300,8 +1423,10 @@ private:
         SelectObject(dc, font_);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(220, 231, 243));
+        const auto panel = cameraPanelRect();
         RECT row{13, client.bottom - footerHeight + 9, client.right - 10, client.bottom - footerHeight + 30};
         DrawTextW(dc, status_.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        row.right = panel.left - 16;
         row.top += 22;
         row.bottom += 22;
         DrawTextW(dc, processMemory_.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1318,7 +1443,21 @@ private:
             : lodTint_ || showRanges_
             ? lodLegend_.c_str()
             : L"Drag to orbit / Wheel zoom / Tab Invoker / Space pause / B drop / J shadows / [ ] exposure -/+0.5 EV";
-        DrawTextW(dc, controls, -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        row.bottom = client.bottom - 6;
+        DrawTextW(dc, controls, -1, &row, DT_WORDBREAK | DT_NOPREFIX);
+        RECT cameraRow{panel.left, panel.top, panel.right, panel.top + 18};
+        SetTextColor(dc, RGB(117, 211, 231));
+        DrawTextW(dc, cameraTitle_.c_str(), -1, &cameraRow, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        constexpr const wchar_t* labels[]{L"X", L"Y", L"Z", L"Alt (sphere)"};
+        for (std::size_t i = 0; i < cameraValues_.size(); ++i) {
+            cameraRow.top += 18; cameraRow.bottom += 18;
+            SetTextColor(dc, RGB(152, 170, 193));
+            DrawTextW(dc, labels[i], -1, &cameraRow, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            RECT valueRow = cameraRow;
+            valueRow.left += 98;
+            SetTextColor(dc, RGB(220, 231, 243));
+            DrawTextW(dc, cameraValues_[i].c_str(), -1, &valueRow, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        }
         EndPaint(window_, &paintInfo);
     }
 
@@ -1328,7 +1467,7 @@ private:
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
                             (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
                             (button == Atmosphere && opts_.render.atmosphereEnabled) || (button == FreeView && freeView_) ||
-                            (button == Shadows && opts_.render.shadowsEnabled);
+                            (button == Shadows && opts_.render.shadowsEnabled) || (button == Clouds && opts_.render.cloudsEnabled);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -1460,6 +1599,8 @@ private:
     bool fullTerrainBuild_{};
     std::size_t selected_{}, triangles_{};
     std::wstring status_, processMemory_, terrainMemory_, lodLegend_;
+    std::wstring cameraTitle_;
+    std::array<std::wstring, 4> cameraValues_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
     bool freeView_{}, controlling_{};
     FreeCamera flight_;

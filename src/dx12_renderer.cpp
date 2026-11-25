@@ -1,6 +1,7 @@
 #include "dx12_renderer.hpp"
 #include "shaders.hpp"
 #include "shadow_cascades.hpp"
+#include "cloud_noise.hpp"
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -28,8 +29,9 @@ struct FrameConstants {
     float camera[40]{};
     float shadowRows[4][3][4]{};
     float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{}, scattering[4]{}, terrain[4]{};
+    float cloudLayer[4]{}, cloudShape[4]{}, cloudRender[4]{}, cloudWind[4]{};
 };
-static_assert(sizeof(FrameConstants) == 116 * sizeof(float));
+static_assert(sizeof(FrameConstants) == 132 * sizeof(float));
 
 struct RelativeBounds {
     Vec center, extent;
@@ -186,7 +188,7 @@ struct Dx12Renderer::Impl {
 
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        desc.NumDescriptors = buffers + 3;
+        desc.NumDescriptors = buffers + 5;
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(rtv.GetAddressOf())), "Create render target descriptor heap");
         rtvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -194,7 +196,7 @@ struct Dx12Renderer::Impl {
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(dsv.GetAddressOf())), "Create depth descriptor heap");
         dsvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        desc.NumDescriptors = 5;
+        desc.NumDescriptors = 9;
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(srv.GetAddressOf())), "Create shader resource heap");
         srvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
@@ -206,6 +208,7 @@ struct Dx12Renderer::Impl {
         require(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())), "Create frame fence");
         completed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!completed) throw std::runtime_error("Create frame event failed");
+        createCloudNoise();
     }
 
     ~Impl() {
@@ -269,6 +272,67 @@ struct Dx12Renderer::Impl {
         device->CreateShaderResourceView(hdr.Get(), &shader, shaderView(4));
         shader.Format = DXGI_FORMAT_R32_FLOAT;
         device->CreateShaderResourceView(depth.Get(), &shader, shaderView(2));
+        texture(cloudLight, (width + 1) / 2, (height + 1) / 2, 1, hdrFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_CLEAR_VALUE{hdrFormat, {0, 0, 0, 1}});
+        device->CreateRenderTargetView(cloudLight.Get(), nullptr, target(buffers + 3));
+        D3D12_CLEAR_VALUE cloudClear{}; cloudClear.Format = DXGI_FORMAT_R32G32_FLOAT;
+        texture(cloudDepth, (width + 1) / 2, (height + 1) / 2, 1, DXGI_FORMAT_R32G32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, cloudClear);
+        device->CreateRenderTargetView(cloudDepth.Get(), nullptr, target(buffers + 4));
+        shader.Format = hdrFormat;
+        device->CreateShaderResourceView(cloudLight.Get(), &shader, shaderView(7));
+        shader.Format = DXGI_FORMAT_R32G32_FLOAT;
+        device->CreateShaderResourceView(cloudDepth.Get(), &shader, shaderView(8));
+        shader.Format = pixelFormat;
+        device->CreateShaderResourceView(nullptr, &shader, shaderView(5)); // Reserved by D3D11 precision tests.
+    }
+
+    void createCloudNoise() {
+        const auto mips = makeCloudNoise();
+        auto desc = buffer(mips.front().edge);
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        desc.Height = mips.front().edge; desc.DepthOrArraySize = UINT16(mips.front().edge);
+        desc.MipLevels = UINT16(mips.size()); desc.Format = pixelFormat;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        const auto properties = heap(D3D12_HEAP_TYPE_DEFAULT);
+        require(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&cloudNoise)), "Create cloud noise volume");
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(mips.size());
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&desc, 0, UINT(mips.size()), 0, layouts.data(), nullptr, nullptr, &bytes);
+        ComPtr<ID3D12Resource> staging;
+        const auto uploadHeap = heap(D3D12_HEAP_TYPE_UPLOAD);
+        const auto uploadDesc = buffer(bytes);
+        require(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)), "Create cloud noise upload");
+        void* data = nullptr; const D3D12_RANGE noReads{0, 0};
+        require(staging->Map(0, &noReads, &data), "Map cloud noise upload");
+        for (std::size_t i = 0; i < mips.size(); ++i) {
+            const auto& mip = mips[i]; const auto& layout = layouts[i];
+            for (unsigned z = 0; z < mip.edge; ++z) for (unsigned y = 0; y < mip.edge; ++y)
+                std::memcpy(static_cast<std::uint8_t*>(data) + layout.Offset +
+                    (SIZE_T(z) * mip.edge + y) * layout.Footprint.RowPitch,
+                    mip.rgba.data() + (SIZE_T(z) * mip.edge + y) * mip.edge * 4, mip.edge * 4);
+        }
+        staging->Unmap(0, nullptr);
+        require(allocator->Reset(), "Reset cloud upload allocator");
+        require(list->Reset(allocator.Get(), nullptr), "Reset cloud upload commands");
+        for (UINT i = 0; i < UINT(mips.size()); ++i) {
+            D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+            from.pResource = staging.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = layouts[i];
+            to.pResource = cloudNoise.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; to.SubresourceIndex = i;
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        }
+        transition(*list.Get(), cloudNoise.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        require(list->Close(), "Close cloud upload commands");
+        ID3D12CommandList* commands[]{list.Get()}; queue->ExecuteCommandLists(1, commands); submitted = true;
+        wait();
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = pixelFormat; view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture3D.MipLevels = UINT(mips.size());
+        device->CreateShaderResourceView(cloudNoise.Get(), &view, shaderView(6));
     }
 
     void setShadowResolution(int resolution) {
@@ -302,7 +366,7 @@ struct Dx12Renderer::Impl {
 
     void createPipelines() {
         D3D12_DESCRIPTOR_RANGE range{};
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 5;
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 9;
         D3D12_ROOT_PARAMETER parameters[3]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[0].Descriptor.ShaderRegister = 0;
@@ -319,7 +383,12 @@ struct Dx12Renderer::Impl {
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC desc{};
         desc.NumParameters = UINT(std::size(parameters)); desc.pParameters = parameters;
-        desc.NumStaticSamplers = 1; desc.pStaticSamplers = &sampler;
+        D3D12_STATIC_SAMPLER_DESC samplers[]{sampler, sampler};
+        samplers[1].ShaderRegister = 1;
+        samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        desc.NumStaticSamplers = UINT(std::size(samplers)); desc.pStaticSamplers = samplers;
         desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ComPtr<ID3DBlob> data;
         require(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &data, nullptr), "Serialize root signature");
@@ -388,6 +457,11 @@ struct Dx12Renderer::Impl {
         overlay.VS = {screenVS->GetBufferPointer(), screenVS->GetBufferSize()};
         overlay.PS = {lightingPS->GetBufferPointer(), lightingPS->GetBufferSize()};
         create(overlay, lightingPipeline, "Create deferred HDR lighting pipeline");
+        auto clouds = overlay;
+        const auto cloudPS = compile("cloudPS", "ps_5_0");
+        clouds.PS = {cloudPS->GetBufferPointer(), cloudPS->GetBufferSize()};
+        clouds.NumRenderTargets = 2; clouds.RTVFormats[1] = DXGI_FORMAT_R32G32_FLOAT;
+        create(clouds, cloudPipeline, "Create half-resolution planetary cloud pipeline");
         const auto postPS = compile("toneMapPS", "ps_5_0");
         overlay.PS = {postPS->GetBufferPointer(), postPS->GetBufferSize()};
         overlay.RTVFormats[0] = pixelFormat;
@@ -492,7 +566,7 @@ struct Dx12Renderer::Impl {
     }
 
     void inspect(const Readback& color, const Readback& sceneDepth, const Readback& normals,
-                 const std::array<Readback, 4>& maps, const std::filesystem::path& capture) {
+                 const std::array<Readback, 4>& maps, const Readback& clouds, const std::filesystem::path& capture) {
         lastDiagnostics = {}; lastDiagnostics.debugLayer = debugLayer;
         lastDiagnostics.shadowResolution = maps.front().footprint.Footprint.Width;
         readRows(color, [&](UINT, const std::uint8_t* row) {
@@ -524,13 +598,36 @@ struct Dx12Renderer::Impl {
                 }
             });
         }
+        if (clouds.resource) {
+            const auto w = clouds.footprint.Footprint.Width, h = clouds.footprint.Footprint.Height;
+            std::vector<std::uint8_t> opacity(SIZE_T(w) * h * 4);
+            readRows(clouds, [&](UINT y, const std::uint8_t* row) {
+                const auto* values = reinterpret_cast<const std::uint16_t*>(row);
+                for (UINT x = 0; x < w; ++x) {
+                    for (int c = 0; c < 4; ++c) if (!std::isfinite(halfValue(values[x * 4 + c])))
+                        ++lastDiagnostics.invalidValues;
+                    const double t = halfValue(values[x * 4 + 3]);
+                    if (t < 0 || t > 1) ++lastDiagnostics.invalidValues;
+                    const double alpha = std::clamp(1 - t, 0.0, 1.0);
+                    lastDiagnostics.cloudPixels += alpha > 0.02;
+                    lastDiagnostics.maxCloudOpacity = std::max(lastDiagnostics.maxCloudOpacity, alpha);
+                    const auto byte = std::uint8_t(std::lround(alpha * 255));
+                    const auto i = (SIZE_T(y) * w + x) * 4;
+                    opacity[i] = opacity[i + 1] = opacity[i + 2] = byte; opacity[i + 3] = 255;
+                }
+            });
+            auto path = capture; path.replace_extension(".cloud-opacity.bmp");
+            writeBitmap(path, opacity.data(), w * 4, w, h);
+        }
         auto path = capture; path.replace_extension(".pipeline.txt");
         std::ofstream report(path);
         report << "gbuffer_geometry_pixels=" << lastDiagnostics.geometryPixels
                << "\nhdr_max_component=" << lastDiagnostics.maxHdrComponent
                << "\ninvalid_gpu_values=" << lastDiagnostics.invalidValues
                << "\nshadow_resolution=" << lastDiagnostics.shadowResolution
-               << "\nd3d12_debug_layer=" << debugLayer << '\n';
+               << "\nd3d12_debug_layer=" << debugLayer
+               << "\ncloud_pixels=" << lastDiagnostics.cloudPixels
+               << "\ncloud_max_opacity=" << lastDiagnostics.maxCloudOpacity << '\n';
         for (int i = 0; i < shadowCascadeCount; ++i) report << "cascade_" << i << "_depth_pixels=" << lastDiagnostics.shadowPixels[i] << '\n';
         if (lastDiagnostics.invalidValues) throw std::runtime_error("Pipeline validation found invalid GPU values");
     }
@@ -589,6 +686,18 @@ struct Dx12Renderer::Impl {
         frame.terrain[0] = float(camera.terrain);
         frame.terrain[1] = float(camera.terrainSeed);
         frame.terrain[2] = float(elevationRange(camera.terrain).lower);
+        frame.cloudLayer[0] = float(planetRadius + 1000 * settings.cloudBaseKm);
+        frame.cloudLayer[1] = float(planetRadius + 1000 * (settings.cloudBaseKm + settings.cloudThicknessKm));
+        frame.cloudLayer[2] = float(settings.cloudCoverage);
+        frame.cloudLayer[3] = float(settings.cloudDensity * 0.00035);
+        frame.cloudShape[0] = float(settings.cloudWeatherKm * 1000);
+        frame.cloudShape[1] = float(settings.cloudFormationKm * 1000);
+        frame.cloudRender[0] = settings.cloudsEnabled ? 1.0f : 0.0f;
+        frame.cloudRender[1] = float(settings.cloudSteps);
+        frame.cloudRender[2] = float((width + 1) / 2); frame.cloudRender[3] = float((height + 1) / 2);
+        constexpr double windAxes[]{1, 0.37, 0.13};
+        for (int i = 0; i < 3; ++i) frame.cloudWind[i] = float(std::fmod(
+            camera.timeSeconds * settings.cloudWindSpeed * windAxes[i], settings.cloudFormationKm * 8000));
         void* mapped = nullptr; const D3D12_RANGE noReads{0,0};
         require(frameUpload->Map(0, &noReads, &mapped), "Map frame constants");
         std::memcpy(mapped, &frame, sizeof(frame));
@@ -661,6 +770,19 @@ struct Dx12Renderer::Impl {
         transition(*list.Get(), albedo.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), normal.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (settings.cloudsEnabled) {
+            transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(*list.Get(), cloudDepth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const D3D12_VIEWPORT cloudViewport{0, 0, frame.cloudRender[2], frame.cloudRender[3], 0, 1};
+            const D3D12_RECT cloudScissor{0, 0, LONG(frame.cloudRender[2]), LONG(frame.cloudRender[3])};
+            list->RSSetViewports(1, &cloudViewport); list->RSSetScissorRects(1, &cloudScissor);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cloudTargets[]{target(buffers + 3), target(buffers + 4)};
+            list->OMSetRenderTargets(2, cloudTargets, FALSE, nullptr);
+            list->SetPipelineState(cloudPipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
+            transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            transition(*list.Get(), cloudDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
+        }
         // Linear HDR lighting, sky and aerial perspective share one HDR target.
         transition(*list.Get(), hdr.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const auto hdrTarget = target(buffers + 2);
@@ -678,13 +800,14 @@ struct Dx12Renderer::Impl {
         transition(*list.Get(), back[index].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->OMSetRenderTargets(1, &backTarget, FALSE, nullptr);
         list->SetPipelineState(tonePipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
-        Readback screenshot, hdrRead, depthRead, normalRead;
+        Readback screenshot, hdrRead, depthRead, normalRead, cloudRead;
         std::array<Readback, 4> shadowRead;
         if (!capture.empty()) screenshot = copyReadback(back[index].Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (inspectPipeline) {
             hdrRead = copyReadback(hdr.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             depthRead = copyReadback(depth.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             normalRead = copyReadback(normal.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (settings.cloudsEnabled) cloudRead = copyReadback(cloudLight.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             for (UINT i = 0; i < shadowCascadeCount; ++i)
                 shadowRead[i] = copyReadback(shadows.Get(), i, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
@@ -698,7 +821,7 @@ struct Dx12Renderer::Impl {
                         screenshot.footprint.Footprint.RowPitch, width, height);
             const D3D12_RANGE noWrites{0,0}; screenshot.resource->Unmap(0, &noWrites);
         }
-        if (inspectPipeline) inspect(hdrRead, depthRead, normalRead, shadowRead, capture);
+        if (inspectPipeline) inspect(hdrRead, depthRead, normalRead, shadowRead, cloudRead, capture);
     }
 
     HWND window;
@@ -713,9 +836,9 @@ struct Dx12Renderer::Impl {
     ComPtr<ID3D12DescriptorHeap> rtv, dsv, srv;
     ComPtr<ID3D12InfoQueue> infoQueue;
     std::array<ComPtr<ID3D12Resource>, buffers> back;
-    ComPtr<ID3D12Resource> depth, albedo, normal, hdr, shadows, frameUpload;
+    ComPtr<ID3D12Resource> depth, albedo, normal, hdr, shadows, frameUpload, cloudLight, cloudDepth, cloudNoise;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> lightingPipeline, tonePipeline, surfacePipeline, depthPipeline, shadowPipeline, wireframePipeline, linePipeline;
+    ComPtr<ID3D12PipelineState> lightingPipeline, tonePipeline, surfacePipeline, depthPipeline, shadowPipeline, wireframePipeline, linePipeline, cloudPipeline;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;

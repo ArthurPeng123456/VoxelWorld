@@ -10,6 +10,7 @@ namespace voxel {
 
 inline constexpr std::array<int, 3> shadowResolutions{1024, 2048, 4096};
 inline constexpr double referenceAtmosphereHeightKm = 100;
+inline constexpr std::array<int, 3> cloudStepCounts{32, 64, 96};
 constexpr bool validShadowResolution(int resolution) {
     for (int supported : shadowResolutions) if (resolution == supported) return true;
     return false;
@@ -25,6 +26,10 @@ struct RenderSettings {
     bool atmosphereEnabled{true};
     double atmosphereHeightKm{referenceAtmosphereHeightKm}, rayleighHeightKm{8}, mieHeightKm{1.2};
     double rayleighStrength{1}, mieStrength{1}, mieAnisotropy{0.76};
+    bool cloudsEnabled{true};
+    int cloudSteps{64};
+    double cloudBaseKm{6}, cloudThicknessKm{8}, cloudCoverage{0.5}, cloudDensity{1};
+    double cloudWeatherKm{1400}, cloudFormationKm{45}, cloudWindSpeed{25};
     double exposureEV{};
     ToneMapping toneMapping{ToneMapping::Aces};
 };
@@ -61,6 +66,15 @@ inline constexpr std::array atmosphereParameters{
 };
 inline constexpr std::array hdrParameters{
     RenderParameter{L"--exposure", L"Exposure (EV)", &RenderSettings::exposureEV, -10, 10}
+};
+inline constexpr std::array cloudParameters{
+    RenderParameter{L"--cloud-base-km", L"Base altitude (km)", &RenderSettings::cloudBaseKm, 0.1, 200},
+    RenderParameter{L"--cloud-thickness-km", L"Thickness (km)", &RenderSettings::cloudThicknessKm, 0.2, 100},
+    RenderParameter{L"--cloud-coverage", L"Weather coverage", &RenderSettings::cloudCoverage, 0, 1},
+    RenderParameter{L"--cloud-density", L"Extinction multiplier", &RenderSettings::cloudDensity, 0, 4},
+    RenderParameter{L"--cloud-weather-km", L"Weather scale (km)", &RenderSettings::cloudWeatherKm, 300, 4000},
+    RenderParameter{L"--cloud-formation-km", L"Formation scale (km)", &RenderSettings::cloudFormationKm, 5, 150},
+    RenderParameter{L"--cloud-wind-speed", L"Wind speed (m/s)", &RenderSettings::cloudWindSpeed, 0, 300}
 };
 
 inline std::optional<double> readRenderParameter(const std::wstring& text, const RenderParameter& parameter) {
