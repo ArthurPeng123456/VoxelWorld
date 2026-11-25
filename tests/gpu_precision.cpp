@@ -28,7 +28,7 @@ ComPtr<ID3DBlob> compile(const std::string& source, const char* entry, const cha
     return code;
 }
 struct Input { float pHi[4]{}, pLo[4]{}, bHi[4]{}, bLo[4]{}, ray[4]{}, params[4]{}; };
-struct Output { float relative[4], geometry[4], arithmetic0[4], arithmetic1[4], scattering[4], transmittance[4], tone[4], clouds[4]; };
+struct Output { float relative[4], geometry[4], arithmetic0[4], arithmetic1[4], scattering[4], transmittance[4], tone[4], clouds[4], solar[4], wind[4], density[4]; };
 void pack(Vec value, float* hi, float* lo) {
     for (int i = 0; i < 3; ++i) { const auto p = splitDouble(value[i]); hi[i] = p.hi; lo[i] = p.lo; }
 }
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
         for (double h : {0.001, 0.1, 1.0, 1200.0, 8000.0, 13000.0, 18000.0, 100000.0, 10000000.0}) {
             for (Vec axis : {Vec{1,0,0}, Vec{0.3,0.4,0.8660254037844386}, Vec{-0.6,0.8,0}}) {
                 const Vec up = unit(axis), tangent = unit(cross(up, Vec{0,0,1}), {0,1,0});
-                for (double angle : {-1.0, -0.01, 0.0, 0.01, 1.0}) {
+                for (double angle : {-1.0, -0.04, -0.01, 0.0, 0.01, 1.0}) {
                     Input input;
                     pack(up * (planetRadius + h), input.pHi, input.pLo);
                     pack(up * planetRadius, input.bHi, input.bLo);
@@ -138,6 +138,12 @@ int main(int argc, char** argv) {
         camera[110] = float(defaults.mieAnisotropy);
         camera[116] = float(planetRadius + defaults.cloudBaseKm * 1000);
         camera[117] = float(planetRadius + (defaults.cloudBaseKm + defaults.cloudThicknessKm) * 1000);
+        camera[118] = 0.7f;
+        camera[120] = float(defaults.cloudWeatherKm * 1000);
+        camera[121] = float(defaults.cloudFormationKm * 1000);
+        camera[122] = 1;
+        camera[128] = -0.0699428473f;
+        camera[129] = 0.00244899975f;
         D3D11_BUFFER_DESC cbDesc{};
         cbDesc.ByteWidth = sizeof(camera); cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
         cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -146,9 +152,25 @@ int main(int argc, char** argv) {
         require(device->CreateBuffer(&cbDesc, &cbData, &constants), "Create atmosphere constants");
         ID3D11Buffer* cbs[]{constants.Get()};
         context->CSSetConstantBuffers(0, 1, cbs);
-        ID3D11ShaderResourceView* srvs[]{srv.Get()};
+        D3D11_TEXTURE3D_DESC noiseDesc{64, 64, 64, UINT(noise.size()), DXGI_FORMAT_R8G8B8A8_UNORM,
+                                      D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        std::vector<D3D11_SUBRESOURCE_DATA> noiseData;
+        for (const auto& mip : noise) noiseData.push_back({mip.rgba.data(), mip.edge * 4, mip.edge * mip.edge * 4});
+        ComPtr<ID3D11Texture3D> noiseTexture;
+        ComPtr<ID3D11ShaderResourceView> noiseView;
+        require(device->CreateTexture3D(&noiseDesc, noiseData.data(), &noiseTexture), "Create cloud test volume");
+        require(device->CreateShaderResourceView(noiseTexture.Get(), nullptr, &noiseView), "Create cloud test SRV");
+        D3D11_SAMPLER_DESC wrap{};
+        wrap.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        wrap.AddressU = wrap.AddressV = wrap.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        wrap.MaxAnisotropy = 1; wrap.ComparisonFunc = D3D11_COMPARISON_NEVER; wrap.MaxLOD = D3D11_FLOAT32_MAX;
+        ComPtr<ID3D11SamplerState> noiseSampler;
+        require(device->CreateSamplerState(&wrap, &noiseSampler), "Create cloud test sampler");
+        ID3D11SamplerState* samplers[]{noiseSampler.Get()};
+        context->CSSetSamplers(1, 1, samplers);
+        ID3D11ShaderResourceView* srvs[]{srv.Get(), noiseView.Get()};
         ID3D11UnorderedAccessView* uavs[]{uav.Get()};
-        context->CSSetShaderResources(5, 1, srvs);
+        context->CSSetShaderResources(5, 2, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->Dispatch(UINT((inputs.size() + 63) / 64), 1, 1);
         context->CopyResource(staging.Get(), outputBuffer.Get());
@@ -158,6 +180,7 @@ int main(int argc, char** argv) {
         std::memcpy(outputs.data(), mapped.pData, outputs.size() * sizeof(Output));
         context->Unmap(staging.Get(), 0);
         double worstAltitude = 0, worstRoot = 0, worstRelative = 0, worstNearRelative = 0;
+        unsigned nonemptyCloudSamples = 0;
         for (std::size_t i = 0; i < inputs.size(); ++i) {
             const auto& in = inputs[i]; const auto& out = outputs[i];
             const Vec p = unpack(in.pHi, in.pLo), b = unpack(in.bHi, in.bLo);
@@ -213,6 +236,17 @@ int main(int argc, char** argv) {
                 }
                 for (unsigned c = 0; c < 4; ++c)
                     close(out.clouds[c], expected[c], 0.05 + std::abs(expected[c]) * 2e-7, label + " cloud shell interval");
+                if (length(p) > camera[116] && length(p) < camera[117] && (bb >= 0 || disc < 0)) {
+                    for (unsigned c = 0; c < 4; ++c)
+                        close(out.solar[c], expected[c], 0.2 + std::abs(expected[c]) * 1.5e-6,
+                              label + " solar shell interval");
+                }
+                const Vec axis{0, 0.6, 0.8};
+                const Vec wind = cross(axis, p) * std::sin(-0.07) + (axis * dot(axis, p) - p) * (1 - std::cos(0.07));
+                for (int c = 0; c < 3; ++c) close(out.wind[c], wind[c], 0.2, label + " spherical wind offset");
+                close(out.wind[3], 0, 0.12, label + " spherical wind round trip");
+                close(out.density[0], out.density[1], 1e-5, label + " same cloud seen from two cameras");
+                nonemptyCloudSamples += out.density[0] > 0.001f;
             }
             const auto pair = [](const float* v) { return double(v[0]) + v[1]; };
             for (const auto& op : {std::pair{pair(out.arithmetic0), p.x + b.x},
@@ -221,6 +255,7 @@ int main(int argc, char** argv) {
                                   {pair(out.arithmetic1 + 2), std::sqrt(std::abs(p.x))}})
                 close(op.first, op.second, 2e-6 + std::abs(op.second) * 8e-14, label + " arithmetic");
         }
+        if (!nonemptyCloudSamples) throw std::runtime_error("Spherical wind cross-camera test sampled only clear air");
         std::cout << (hardware ? "Hardware" : "WARP") << ": " << inputs.size() << " GPU cases passed; max altitude error="
                   << worstAltitude << "m, root error=" << worstRoot << "m, relative error=" << worstRelative
                   << "m, near relative error=" << worstNearRelative << "m\n";

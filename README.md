@@ -27,7 +27,7 @@ ctest --test-dir build-windows-native -C Release --output-on-failure
 .\build-windows-native\Release\VoxelWorldViewer.exe --warp --capture-dir results-earth-warp
 ```
 
-GPU 测试包含 139 组数据，检查 df64 运算、毫米高度、地平线和云层球壳求交、轨道距离、10⁹/10¹² 米绝对坐标的相对消减，以及大气输出有限性和透射率范围。CPU 测试包含正负百万米坐标的射线、形状扫掠和刚体静止接触。截图验证覆盖四种后端的轨道、地表、高空地平线、线框与 LOD 窗口，另生成公共平移 `(10¹², -10¹², 10¹²)` 米前后的两张对照图。用 `python scripts/validate-render-captures.py results-earth-captures` 检查对照图。另有全局体积覆盖、32 个方向的远处地形查询、2:1 平衡、粗细块字段连续性，以及摄像机跨半球时的后台替换验证。单次散射与固定样本数是实时近似，远处地形按粗层采样，不保留细小起伏；大气没有多次散射，体积云另有下述原型与专项验证。
+GPU 测试包含 166 组数据，覆盖 df64 运算、毫米高度、地平线和云层球壳求交、球面风往返、跨相机云密度采样、轨道距离、10⁹/10¹² 米绝对坐标的相对消减，以及大气输出有限性和透射率范围。CPU 测试包含正负百万米坐标的射线、形状扫掠和刚体静止接触。截图验证覆盖四种后端的轨道、地表、高空地平线、线框与 LOD 窗口，另生成公共平移 `(10¹², -10¹², 10¹²)` 米前后的两张对照图。用 `python scripts/validate-render-captures.py results-earth-captures` 检查对照图。另有全局体积覆盖、32 个方向的远处地形查询、2:1 平衡、粗细块字段连续性，以及摄像机跨半球时的后台替换验证。大气采用单次散射，远处地形按粗层采样。
 
 | 方案 | 命令参数 | 渲染几何 | 地形碰撞 |
 | --- | --- | --- | --- |
@@ -65,11 +65,11 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 
 默认开启球面体积云，工具栏 `Clouds [V]` 或 `V` 切换。自由摄像机可以从轨道连续飞到云下、云上和云内。`Render settings...` 中可调整云底高度、厚度、天气覆盖、消光强度、天气区尺度、云团尺度、风速及 32 / 64 / 96 步质量。
 
-云场采用分层尺度：默认 1,400 公里级的连续球面天气分布决定大片云区与晴空，45 公里级的三维场塑造其中的云团，更细的 Worley 侵蚀只在近处可分辨时参与。天气分布随星球方向采样，云形使用行星相对坐标，不随摄像机重新生成。每个采样点根据像素足迹和积分步长选择三维噪声 mip，并渐隐无法分辨的小云团与侵蚀，保留全球天气形态，减少轨道远景中密集平铺细节的观感。近处采用更密的非均匀步进。
+云场采用分层尺度。默认 1,400 公里级的连续球面天气分布决定云区与晴空，45 公里级的三维场塑造云团。约 1.4 km、370 m、155 m 的 Worley 频带只修改边缘的部分密度，扣除噪声均值后逐级衰减。每点按半分辨率像素的投影宽度和射线步长选择连续 mip，近处缩小采样点抖动幅度。天气、主体和细节使用统一的行星空间球面切向风，云历史按同一旋转回溯到前帧。
 
-GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交段，支持云层内外摄像机与公共大坐标平移。云先按两个方向各一半的分辨率积分，计算 Beer–Lambert 消光、四次光照路径采样的自遮挡、前后向散射和经验多次散射补光，经过独立的时域重建后，再按场景深度上采样合成到线性 HDR。地形接收低频天气阴影；前景不透明物体遮挡云。大气以云的贡献加权平均深度近似处理前方空气透视。64³ RGBA 噪声含完整 mip，约 1.14 MiB；原始云颜色与深度元数据目标约为每个全分辨率像素 6 字节，时域历史另计。
+GPU 使用 df64 求视线球壳区间及积分锚点，保留空心云层的两个交段。太阳光也按壳内有效区间累积消光，逐点查询天气和云密度。每个连续路径在着色点附近密集采样，随后沿阳光方向扩大步长和过滤足迹，并在光学深度足够大时提前结束。云先以半分辨率计算 Beer–Lambert 消光、前后向散射和经验多次散射补光，再经独立时域重建和深度感知上采样合成到线性 HDR。地形接收低频天气阴影，前景不透明物体遮挡云。64³ RGBA 噪声含完整 mip，约 1.14 MiB。
 
-这是一版针对当前项目的原型，并非复现 StarEngine 的内部实现。公开参考：[CIG 对轨道云细节重复问题的说明](https://robertsspaceindustries.com/en/comm-link/transmission/18251-Star-Citizen-Monthly-Report-July-2021)、[逐采样点纹理 LOD、散射与阴影](https://robertsspaceindustries.com/en/comm-link/transmission/18025-Squadron-42-Monthly-Report-February-2021)、[Guerrilla 的天气与噪声建模](https://www.guerrilla-games.com/read/nubis-authoring-real-time-volumetric-cloudscapes-with-the-decima-engine)。当前没有天气物理模拟或云体编辑；全局天气静态，风驱动局部云形。低分辨率深度过滤和有限步数在复杂遮挡与掠射角仍有误差，多次散射、地面云影及大气耦合均为近似。
+低分辨率深度过滤和有限步数在复杂遮挡与掠射角仍有误差。多次散射、地面云影和大气耦合采用实时近似。[CIG 的轨道云报告](https://robertsspaceindustries.com/en/comm-link/transmission/18251-Star-Citizen-Monthly-Report-July-2021) · [Guerrilla 的天气与噪声建模](https://www.guerrilla-games.com/read/nubis-authoring-real-time-volumetric-cloudscapes-with-the-decima-engine)
 
 命令行支持 `--clouds` / `--no-clouds`、`--cloud-base-km`、`--cloud-thickness-km`、`--cloud-coverage`、`--cloud-density`、`--cloud-weather-km`、`--cloud-formation-km`、`--cloud-wind-speed`、`--cloud-steps 32|64|96`。例如：
 
@@ -79,7 +79,17 @@ GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交�
 python scripts/validate-cloud-captures.py results-clouds
 ```
 
-`--capture-clouds` 生成轨道开关、零覆盖、零消光、两档采样质量、云下、地平线、云内、风、10¹² 米公共平移和前景遮挡共 14 个视图，以及云的不透明度图和 GPU 缓冲检查报告。GPU 数值测试增加球壳求交与云内视角，总计 139 组用例，同时检查噪声 mip 保持均值并降低方差。已有 `--capture-dir` 保持关闭云的地形与大气参考画面；这两个参考截图模式均关闭 TAA，时域功能使用下述专项场景验证。
+`--capture-clouds` 生成轨道开关、零覆盖、零消光、两档采样质量、云下、地平线、云内、风、10¹² 米公共平移和前景遮挡共 14 个视图，以及云的不透明度图和 GPU 缓冲检查报告。`--capture-dir` 与 `--capture-clouds` 均关闭 TAA。
+
+`Render settings... → Clouds` 中的 `Fine detail strength` 和 `Self-shadow strength` 默认均为 1，可设为 0 做对照。命令行分别是 `--cloud-detail` 和 `--cloud-self-shadow`。以下命令播放约 16 秒轨道往返航线，或者冻结风和曝光生成逐帧对照及 D3D12 GPU 时间戳。验证脚本依赖 NumPy。
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --terrain mars --exposure -1 --replay-cloud-flight
+.\build-windows-native\dist\VoxelWorldViewer.exe --terrain mars --exposure -1 --capture-cloud-flight results-cloud-flight
+python scripts/validate-cloud-flight.py results-cloud-flight
+```
+
+回放记录五种配置各 209 帧。GPU 时间分为云积分和云重建，后者包含无效历史触发的补采样。对照固定轨道和云内镜头，以及同路线的全采样结果检测时序噪点。两组太阳方向截图验证自阴影改变光照且保持不透明度。原始数据保存在输出目录的 `cloud-flight.csv`，指标汇总在 `cloud-flight-metrics.json`。
 
 ### TAA 与体积云时域重建
 
@@ -128,7 +138,7 @@ python scripts/validate-temporal-stability.py results-stability --baseline resul
 | --- | --- |
 | CSM | 开关、每级 Shadow Map 分辨率（1024² / 2048² / 4096²）、距离上限、对数分割权重、法线和深度偏移倍率 |
 | 大气 | 开关、厚度、Rayleigh / Mie 各自的尺度高度与散射强度、Mie 各向异性 |
-| 体积云 | 开关、云底、厚度、覆盖、消光、天气与云团尺度、风速、采样质量；时域重建开关、全／二相／四相采样、历史权重、深度拒绝、射线抖动 |
+| 体积云 | 开关、云底、厚度、覆盖、消光、天气与云团尺度、风速、细节与自阴影强度、采样质量、时域重建开关、全／二相／四相采样、历史权重、深度拒绝、射线抖动 |
 | TAA | 开关、8 / 16 / 32 帧抖动周期、历史权重、抖动范围、方差裁剪 gamma、深度拒绝、运动响应、输出锐化、相机切换的距离与角度阈值 |
 | HDR | 曝光（−10 到 +10 EV）和色调映射（ACES、Reinhard、线性裁剪） |
 

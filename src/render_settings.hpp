@@ -31,6 +31,7 @@ struct RenderSettings {
     int cloudSteps{64};
     double cloudBaseKm{6}, cloudThicknessKm{8}, cloudCoverage{0.5}, cloudDensity{1};
     double cloudWeatherKm{1400}, cloudFormationKm{45}, cloudWindSpeed{25};
+    double cloudDetailStrength{1}, cloudSelfShadowStrength{1};
     bool taaEnabled{true}, cloudTemporalEnabled{true};
     int taaSamples{16}, cloudSampling{1}; // Full / two-phase checkerboard / four-phase 2x2.
     double taaHistoryWeight{0.9}, taaJitter{1}, taaVarianceGamma{1.25}, taaDepthThreshold{0.01};
@@ -80,7 +81,9 @@ inline constexpr std::array cloudParameters{
     RenderParameter{L"--cloud-density", L"Extinction multiplier", &RenderSettings::cloudDensity, 0, 4},
     RenderParameter{L"--cloud-weather-km", L"Weather scale (km)", &RenderSettings::cloudWeatherKm, 300, 4000},
     RenderParameter{L"--cloud-formation-km", L"Formation scale (km)", &RenderSettings::cloudFormationKm, 5, 150},
-    RenderParameter{L"--cloud-wind-speed", L"Wind speed (m/s)", &RenderSettings::cloudWindSpeed, 0, 300}
+    RenderParameter{L"--cloud-wind-speed", L"Wind speed (m/s)", &RenderSettings::cloudWindSpeed, 0, 300},
+    RenderParameter{L"--cloud-detail", L"Fine detail strength", &RenderSettings::cloudDetailStrength, 0, 2},
+    RenderParameter{L"--cloud-self-shadow", L"Self-shadow strength", &RenderSettings::cloudSelfShadowStrength, 0, 2}
 };
 inline constexpr std::array taaParameters{
     RenderParameter{L"--taa-history", L"History weight", &RenderSettings::taaHistoryWeight, 0, 0.98},

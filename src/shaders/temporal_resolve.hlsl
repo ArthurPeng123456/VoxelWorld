@@ -1,9 +1,13 @@
 float3 cloudPreviousPosition(float3 relative) {
     float3 p = planetEyeHi.xyz + (planetEyeLo.xyz + relative);
-    float3 normal = p / max(1, length(p));
-    float stretch = clamp(cloudShape.y / ((cloudLayer.y - cloudLayer.x) * 0.6), 1, 24);
-    float3 displacement = cloudWindDelta.xyz - normal * dot(cloudWindDelta.xyz, normal) * (1 - 1 / stretch);
-    return previousRelative(relative + displacement);
+    return previousRelative(relative + cloudRotationOffset(p, cloudWindDelta.xy));
+}
+
+float3 cloudCurrentPosition(float3 oldRelative) {
+    DF3 shifted = df3Add(df3(oldRelative, 0), df3(-eyeDeltaHi.xyz, -eyeDeltaLo.xyz));
+    float3 relative = shifted.hi + shifted.lo;
+    float3 p = planetEyeHi.xyz + (planetEyeLo.xyz + relative);
+    return relative + cloudRotationOffset(p, float2(-cloudWindDelta.x, cloudWindDelta.y));
 }
 
 struct CloudResolvedOutput { float4 light : SV_Target0; float4 metadata : SV_Target1; };
@@ -15,7 +19,7 @@ CloudResolvedOutput cloudResolvePS(Sky input) {
     float3 ray = normalize(cameraRay(uv));
     float distance = data.x;
     float4 oldColor = float4(0, 0, 0, 1), oldData = 0;
-    float feedback = 0, fallbackSteps = 0;
+    float feedback = 0, fallbackSteps = 0, footprintChange = 0;
     bool accepted = cloudTemporal.x > 0.5 && cloudTemporal.y > 0.5 && distance > 0;
     float2 oldUv = uv;
     [branch] if (accepted) {
@@ -29,14 +33,16 @@ CloudResolvedOutput cloudResolvePS(Sky input) {
             if (oldData.z <= 0 || oldData.x <= 0) { accepted = false; break; }
             if (missing && iteration == 0) {
                 float3 previous = previousRay(oldUv) * oldData.x;
-                float3 offset = cloudPreviousPosition(0);
-                distance = max(0, dot(previous - offset, ray));
+                distance = max(0, dot(cloudCurrentPosition(previous), ray));
             }
         }
         if (accepted) {
             float3 oldPosition = cloudPreviousPosition(ray * distance);
             float error = abs(length(oldPosition) - oldData.x) / max(1, oldData.x);
+            float footprintRatio = (max(1, distance) * previousUp.w) / (max(1, oldData.x) * projection.y);
+            footprintChange = abs(log2(max(0.01, footprintRatio)));
             accepted = error <= cloudTemporalFilter.x && distance < data.y + max(50, data.y * 0.01);
+            accepted = accepted && (!missing || footprintChange < 0.32);
             // A history sample hidden behind the old foreground must not leak
             // into newly visible pixels. Such pixels are raymarched below.
             accepted = accepted && oldData.x <= oldData.y + max(50, oldData.y * 0.01);
@@ -84,7 +90,8 @@ CloudResolvedOutput cloudResolvePS(Sky input) {
         }
         if (accepted) {
             float motion = length((oldUv - uv) * cloudRender.zw);
-            feedback = min(cloudTemporal.z, oldData.z / (oldData.z + 1)) / (1 + motion * 0.015);
+            feedback = min(cloudTemporal.z, oldData.z / (oldData.z + 1)) /
+                       (1 + motion * 0.015 + footprintChange * 3);
             age = min(64, oldData.z + (missing ? 0 : 1));
         }
     }

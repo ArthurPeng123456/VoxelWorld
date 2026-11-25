@@ -1,5 +1,5 @@
 struct TestInput { float4 pHi, pLo, bHi, bLo, ray, params; };
-struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance, tone, clouds; };
+struct TestOutput { float4 relative, geometry, arithmetic0, arithmetic1, scattering, transmittance, tone, clouds, solar, wind, density; };
 StructuredBuffer<TestInput> cases : register(t5);
 RWStructuredBuffer<TestOutput> results : register(u0);
 [numthreads(64, 1, 1)]
@@ -25,5 +25,22 @@ void precisionCS(uint id : SV_DispatchThreadID) {
     float exposure = exp2(int(id % 5) - 2);
     result.tone = float4(acesToneMap(float3(0.18, 1, 4), exposure), acesToneMap(float3(20, 20, 20), exposure).x);
     result.clouds = cloudIntervals(p, input.ray.xyz, 5e7);
+    result.solar = cloudSolarIntervals(result.geometry.x, dot(p.hi, input.ray.xyz) + dot(p.lo, input.ray.xyz));
+    const float2 wind = float2(-0.0699428473, 0.00244899975); // inverse rotation by 0.07 rad
+    float3 position = p.hi + p.lo;
+    float3 moved = cloudRotationOffset(position, wind);
+    float3 back = cloudRotationOffset(position + moved, float2(-wind.x, wind.y));
+    result.wind = float4(moved, length(moved + back));
+    result.density = 0;
+    if (result.geometry.x > cloudLayer.x - atmosphere.x && result.geometry.x < cloudLayer.y - atmosphere.x) {
+        // Reconstruct the same physical point from two cameras with different
+        // elevations and bearings. Both rays use the same band limit.
+        DF3 observerA = df3Add(p, df3(float3(72000, -420, 10000), 0));
+        DF3 observerB = df3Add(p, df3(float3(-4600, 350000, -8500), 0));
+        DF3 sampleA = df3Add(observerA, df3(float3(-72000, 420, -10000), 0));
+        DF3 sampleB = df3Add(observerB, df3(float3(4600, -350000, 8500), 0));
+        result.density.x = cloudSample(sampleA.hi + sampleA.lo, result.geometry.x, 80, 80);
+        result.density.y = cloudSample(sampleB.hi + sampleB.lo, result.geometry.x, 80, 80);
+    }
     results[id] = result;
 }

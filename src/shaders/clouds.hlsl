@@ -40,28 +40,44 @@ float2 cloudWeather(float3 position, float footprint) {
     return float2(coverage, a.a);
 }
 
-float cloudSample(float3 position, float height, float footprint, float2 weather, bool fine) {
+float cloudDetailBand(float3 position, float footprint, float period, float3 phase) {
+    // The Worley channel has 16 feature cells across the periodic volume.
+    // Fade this band across its sampling limit, independently of the others.
+    float feature = period / 16;
+    float visible = 1 - smoothstep(feature * 0.25, feature * 0.67, footprint);
+    [branch] if (visible <= 0) return 0;
+    float value = cloudNoise.SampleLevel(cloudSampler, position / period + phase, cloudLod(footprint, period)).b;
+    float mean = cloudNoise.SampleLevel(cloudSampler, 0.5, 6).b;
+    return (value - mean) * visible * visible;
+}
+
+float cloudSample(float3 position, float height, float footprint, float detailFootprint) {
     float bottom = cloudLayer.x - atmosphere.x, thickness = cloudLayer.y - cloudLayer.x;
     float h = (height - bottom) / thickness;
-    if (h <= 0 || h >= 1 || weather.x <= 0.001) return 0;
+    if (h <= 0 || h >= 1) return 0;
+    position += cloudRotationOffset(position, cloudWind.xy);
+    float2 weather = cloudWeather(position, footprint);
+    if (weather.x <= 0.001) return 0;
     float top = lerp(0.62, 1.0, weather.y);
     float profile = smoothstep(0, 0.10, h) * (1 - smoothstep(top * 0.55, top, h));
     if (profile <= 0) return 0;
     float period = cloudShape.y * 8;
     float verticalStretch = clamp(cloudShape.y / (thickness * 0.6), 1, 24);
     float3 shapedPosition = position + normalize(position) * (height - bottom) * (verticalStretch - 1);
-    float3 q = (shapedPosition + cloudWind.xyz) / period;
+    float3 q = shapedPosition / period;
     float shape = cloudNoise.SampleLevel(cloudSampler, q, cloudLod(footprint, period)).g;
     // Remove unresolved billows rather than inventing thousands of tiny clouds
     // at orbital distances. The global weather mask remains unchanged.
     float detail = 1 - smoothstep(3000, 35000, footprint);
     shape = lerp(0.5, shape, detail);
     float amount = saturate((shape - 0.60 + weather.x * 0.22) * 5);
-    [branch] if (fine && footprint < 3500 && amount > 0) {
-        float finePeriod = cloudShape.y * 0.5;
-        float erosion = 1 - cloudNoise.SampleLevel(cloudSampler,
-            (position + cloudWind.xyz) / finePeriod, cloudLod(footprint, finePeriod)).b;
-        amount = max(0, amount - erosion * 0.19 * (1 - amount) * (1 - smoothstep(500, 3500, footprint)));
+    [branch] if (cloudShape.z > 0 && amount > 0 && amount < 1 && detailFootprint < cloudShape.y * (0.5 * 0.67 / 16)) {
+        float edge = cloudDetailBand(position, detailFootprint, cloudShape.y * 0.5, float3(0.37, 0.11, 0.67));
+        float curl = cloudDetailBand(position.zxy, detailFootprint, cloudShape.y * 0.13, float3(0.19, 0.71, 0.43));
+        float wisps = cloudDetailBand(position.yzx, detailFootprint, cloudShape.y * 0.055, float3(0.83, 0.37, 0.17));
+        // The zero-mean bands affect the partially occupied boundary. The
+        // amount*(1-amount) envelope preserves clear air and opaque cores.
+        amount = saturate(amount + amount * (1 - amount) * cloudShape.z * (0.62 * edge + 0.57 * curl + 0.43 * wisps));
     }
     return amount * profile;
 }
@@ -70,25 +86,51 @@ float cloudPhase(float cosine, float g) {
     return (1 - g * g) / (12.5663706 * pow(max(0.001, 1 + g * g - 2 * g * cosine), 1.5));
 }
 
-float cloudSun(float3 position, float height, float footprint, float2 weather) {
-    float radial = dot(position, sunlight.xyz);
-    float groundDelta = height * (2 * atmosphere.x + height);
-    if (radial < 0 && radial * radial > groundDelta) return 0;
+float4 cloudSolarIntervals(float height, float radial) {
     float topHeight = cloudLayer.y - atmosphere.x;
     float c = (height - topHeight) * (2 * atmosphere.x + height + topHeight);
     float root = sqrt(max(0, radial * radial - c));
     float span = radial < 0 ? root - radial : -c / max(1, root + radial);
-    span = min(max(0, span), 250000);
-    float optical = 0;
-    [unroll] for (int i = 0; i < 4; ++i) {
-        float a = float(i) / 4, b = float(i + 1) / 4;
-        float t = 0.5 * (a * a + b * b) * span;
-        float delta = groundDelta + t * (2 * radial + t);
-        float h = delta / (sqrt(max(0, atmosphere.x * atmosphere.x + delta)) + atmosphere.x);
-        optical += cloudSample(position + sunlight.xyz * t, h,
-            max(footprint, (b * b - a * a) * span * 0.4), weather, false) * (b * b - a * a) * span;
+    float bottom = cloudLayer.x - atmosphere.x;
+    float innerC = (height - bottom) * (2 * atmosphere.x + height + bottom);
+    float gap = radial * radial - innerC;
+    [branch] if (radial < 0 && gap > 0) {
+        float exitGap = -radial + sqrt(gap);
+        return float4(0, innerC / exitGap, exitGap, span);
     }
-    return exp(-cloudLayer.w * optical);
+    return float4(0, max(0, span), 0, 0);
+}
+
+float cloudSun(float3 position, float height, float footprint) {
+    float radial = dot(position, sunlight.xyz);
+    float groundDelta = height * (2 * atmosphere.x + height);
+    if (radial < 0 && radial * radial > groundDelta) return 0;
+    [branch] if (cloudShape.w <= 0) return 1;
+    float4 intervals = cloudSolarIntervals(height, radial);
+    float extinction = cloudLayer.w * cloudShape.w;
+    float optical = 0;
+    int farSteps = cloudRender.y <= 32 ? 3 : cloudRender.y >= 96 ? 6 : 4;
+    [loop] for (int segment = 0; segment < 2; ++segment) {
+        float start = intervals[2 * segment], end = intervals[2 * segment + 1];
+        if (end <= start) continue;
+        float nearSpan = segment == 0 ? min(end - start, 1600) : 0;
+        float farSpan = end - start - nearSpan;
+        float previous = start;
+        [loop] for (int i = nearSpan > 0 ? 0 : 2; i < farSteps + 2; ++i) {
+            float u = max(0, i - 1) / float(farSteps);
+            float next = start + (i == 0 ? nearSpan * 0.13 : nearSpan + u * u * farSpan);
+            float step = next - previous;
+            float t = 0.5 * (next + previous);
+            previous = next;
+            if (step <= 0) continue;
+            float delta = groundDelta + t * (2 * radial + t);
+            float h = delta / (sqrt(max(0, atmosphere.x * atmosphere.x + delta)) + atmosphere.x);
+            float filter = max(footprint, max(step * 0.65, t * 0.0047));
+            optical += cloudSample(position + sunlight.xyz * t, h, filter, filter) * step * extinction;
+            if (optical >= 8) return exp(-optical);
+        }
+    }
+    return exp(-optical);
 }
 
 struct CloudRay { float3 ray; float opaqueDistance; float4 intervals; float referenceDistance; };
@@ -144,17 +186,23 @@ CloudOutput traceCloud(CloudRay camera, int2 pixel) {
         [loop] for (int i = 0; i < steps; ++i) {
             float a = float(i) / steps, b = float(i + 1) / steps;
             float s0 = lerp(a, a * a, curve), s1 = lerp(b, b * b, curve);
-            float step = span * (s1 - s0), t = span * lerp(s0, s1, sampleOffset), distance = start + t;
+            float step = span * (s1 - s0);
+            float middle = start + span * (0.5 * (s0 + s1));
+            // Keep the near strata close to their midpoints so newly resolved
+            // curls do not crawl with the frame jitter. Distant strata still
+            // use the full offset to hide long-step integration bands.
+            float offset = lerp(0.5, sampleOffset, lerp(0.20, 1, smoothstep(6000, 75000, middle)));
+            float t = span * lerp(s0, s1, offset), distance = start + t;
             result.distances.w += 1;
             float localDelta = delta + t * (2 * radial + t * raySquared);
             float height = localDelta / (sqrt(max(0, atmosphere.x * atmosphere.x + localDelta)) + atmosphere.x);
             float3 position = anchor.hi + (anchor.lo + ray * t);
             float footprint = max(distance * pixelAngle, step * 0.5);
-            float2 weather = cloudWeather(position, footprint);
-            float sampleDensity = cloudSample(position, height, footprint, weather, true);
+            float detailFootprint = max(footprint, step * 0.85);
+            float sampleDensity = cloudSample(position, height, footprint, detailFootprint);
             if (sampleDensity <= 0.0001) continue;
             float alpha = 1 - exp(-sampleDensity * cloudLayer.w * step);
-            float sun = cloudSun(position, height, footprint, weather);
+            float sun = cloudSun(position, height, footprint);
             float h = saturate((height - (cloudLayer.x - atmosphere.x)) / (cloudLayer.y - cloudLayer.x));
             float3 ambient = lerp(float3(0.075, 0.105, 0.155), float3(0.26, 0.32, 0.41), h);
             float day = smoothstep(-0.12, 0.08, dot(normalize(position), sunlight.xyz));
@@ -231,7 +279,7 @@ float cloudGroundShadow(float3 position) {
     float root = sqrt(max(0, b * b - c));
     float t = b < 0 ? root - b : -c / max(1, root + b);
     float3 p = position + sunlight.xyz * t;
-    float cover = cloudWeather(p, 5000).x;
+    float cover = cloudWeather(p + cloudRotationOffset(p, cloudWind.xy), 5000).x;
     float optical = cover * (cloudLayer.y - cloudLayer.x) * cloudLayer.w * 0.45;
     return 0.25 + 0.75 * exp(-optical);
 }

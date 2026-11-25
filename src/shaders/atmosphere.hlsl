@@ -12,9 +12,9 @@ cbuffer Camera : register(b0) {
     float4 scatteringParams; // Rayleigh strength, Mie strength, Mie anisotropy
     float4 terrainParams; // preset, texture seed, minimum terrain elevation
     float4 cloudLayer; // inner/outer radius, coverage, extinction per meter
-    float4 cloudShape; // global weather scale, formation scale (meters)
+    float4 cloudShape; // weather and formation scales (meters), detail and self-shadow strengths
     float4 cloudRender; // enabled, primary steps, half-resolution width/height
-    float4 cloudWind; // periodic planet-relative noise displacement (meters)
+    float4 cloudWind; // sin(angle), 1-cos(angle) for the inverse spherical wind rotation
     float4 previousRight, previousUp, previousForward; // w: x/y projection scale, previous near
     float4 eyeDeltaHi, eyeDeltaLo; // current planet-relative eye minus previous eye, split on CPU
     float4 temporalJitter; // current/previous NDC offsets
@@ -22,10 +22,17 @@ cbuffer Camera : register(b0) {
     float4 taaFilter; // motion response, depth rejection, sharpening, frame index
     float4 cloudTemporal; // enabled, history valid, feedback, sparse sampling pattern
     float4 cloudTemporalFilter; // depth rejection, ray jitter strength
-    float4 cloudWindDelta; // unwrapped displacement since the previous frame
+    float4 cloudWindDelta; // inverse wind rotation between this frame and the previous one
 };
 cbuffer DrawPass : register(b1) { uint cascadeIndex; uint objectPass; };
 StructuredBuffer<float4> previousObjectPositions : register(t17);
+
+// Rodrigues' formula as a displacement to retain small wind movements when
+// adding them to a camera-relative sample position.
+float3 cloudRotationOffset(float3 position, float2 rotation) {
+    const float3 axis = float3(0, 0.6, 0.8);
+    return cross(axis, position) * rotation.x + (axis * dot(axis, position) - position) * rotation.y;
+}
 
 float3 previousRelative(float3 relative) {
     DF3 p = df3Add(df3(relative, 0), df3(eyeDeltaHi.xyz, eyeDeltaLo.xyz));

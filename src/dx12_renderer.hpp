@@ -18,6 +18,7 @@ struct Camera {
     TerrainPreset terrain{TerrainPreset::Classic};
     std::uint32_t terrainSeed{};
     double timeSeconds{};
+    Vec sunDirection{0.45, 0.25, 0.86};
 };
 
 struct RenderDiagnostics {
@@ -35,6 +36,10 @@ struct RenderDiagnostics {
     double maxObjectMotionPixels{};
 };
 
+struct CloudGpuTiming {
+    double integrationMs{}, reconstructionMs{};
+};
+
 class Dx12Renderer {
 public:
     Dx12Renderer(HWND window, bool forceWarp, bool debug = false);
@@ -47,8 +52,10 @@ public:
     void setClipmapLines(const std::vector<Vertex>& lines);
     void setShadowResolution(int resolution);
     void resetTemporalHistory();
+    void enableCloudGpuTiming();
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {}, bool inspectPipeline = false);
     RenderDiagnostics diagnostics() const;
+    CloudGpuTiming cloudGpuTiming() const;
     bool isWarp() const;
 private:
     struct Impl;

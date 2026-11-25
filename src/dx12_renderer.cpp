@@ -775,6 +775,17 @@ struct Dx12Renderer::Impl {
         if (lastDiagnostics.invalidValues) throw std::runtime_error("Pipeline validation found invalid GPU values");
     }
 
+    void enableCloudGpuTiming() {
+        D3D12_QUERY_HEAP_DESC queries{};
+        queries.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; queries.Count = 3;
+        require(device->CreateQueryHeap(&queries, IID_PPV_ARGS(&cloudTimestamps)), "Create cloud timestamp queries");
+        const auto properties = heap(D3D12_HEAP_TYPE_READBACK);
+        const auto desc = buffer(queries.Count * sizeof(UINT64));
+        require(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&cloudTimestampReadback)), "Create cloud timestamp readback");
+        require(queue->GetTimestampFrequency(&timestampFrequency), "Get direct-queue timestamp frequency");
+    }
+
     void draw(const Camera& camera, const std::vector<Vertex>& vertices, const std::filesystem::path& capture, bool inspectPipeline) {
         RECT rect{}; GetClientRect(window, &rect);
         if (rect.right <= 0 || rect.bottom <= 0) return;
@@ -806,7 +817,7 @@ struct Dx12Renderer::Impl {
         uploadPreviousObjects(vertices, camera);
         upload(objects, vertices);
         FrameConstants frame{};
-        const Vec sun = unit(Vec{0.45,0.25,0.86});
+        const Vec sun = unit(camera.sunDirection);
         const auto ex = splitDouble(camera.eye.x), ey = splitDouble(camera.eye.y), ez = splitDouble(camera.eye.z);
         const auto px = splitDouble(planetEye.x), py = splitDouble(planetEye.y), pz = splitDouble(planetEye.z);
         const float xScale = float(1.92 * double(height) / width), yScale = 1.92f;
@@ -851,19 +862,25 @@ struct Dx12Renderer::Impl {
         frame.cloudLayer[3] = float(settings.cloudDensity * 0.00035);
         frame.cloudShape[0] = float(settings.cloudWeatherKm * 1000);
         frame.cloudShape[1] = float(settings.cloudFormationKm * 1000);
+        frame.cloudShape[2] = float(settings.cloudDetailStrength);
+        frame.cloudShape[3] = float(settings.cloudSelfShadowStrength);
         frame.cloudRender[0] = settings.cloudsEnabled ? 1.0f : 0.0f;
         frame.cloudRender[1] = float(settings.cloudSteps);
         frame.cloudRender[2] = float((width + 1) / 2); frame.cloudRender[3] = float((height + 1) / 2);
-        constexpr double windAxes[]{1, 0.37, 0.13};
-        for (int i = 0; i < 3; ++i) frame.cloudWind[i] = float(std::fmod(
-            camera.timeSeconds * settings.cloudWindSpeed * windAxes[i], settings.cloudFormationKm * 8000));
         const Camera& previous = previousCamera ? *previousCamera : camera;
+        const auto inverseWind = [&](double seconds, float* rotation) {
+            const double angle = std::remainder(-seconds * settings.cloudWindSpeed / planetRadius, 6.283185307179586);
+            const double sineHalfAngle = std::sin(angle * 0.5);
+            rotation[0] = float(std::sin(angle));
+            rotation[1] = float(2 * sineHalfAngle * sineHalfAngle);
+        };
+        inverseWind(camera.timeSeconds, frame.cloudWind);
+        inverseWind(camera.timeSeconds - previous.timeSeconds, frame.windDelta);
         const Vec eyeDelta = planetEye - (previous.eye - previous.planetCenter);
         for (int i = 0; i < 3; ++i) {
             frame.previousRight[i] = float(previous.right[i]); frame.previousUp[i] = float(previous.up[i]);
             frame.previousForward[i] = float(previous.forward[i]);
             const auto delta = splitDouble(eyeDelta[i]); frame.eyeDeltaHi[i] = delta.hi; frame.eyeDeltaLo[i] = delta.lo;
-            frame.windDelta[i] = float((camera.timeSeconds - previous.timeSeconds) * settings.cloudWindSpeed * windAxes[i]);
         }
         frame.previousRight[3] = previousCamera ? previousProjection[0] : xScale;
         frame.previousUp[3] = previousCamera ? previousProjection[1] : yScale;
@@ -958,6 +975,7 @@ struct Dx12Renderer::Impl {
         transition(*list.Get(), motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (settings.cloudsEnabled) {
+            if (cloudTimestamps) list->EndQuery(cloudTimestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
             transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             transition(*list.Get(), cloudDepth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             const D3D12_VIEWPORT cloudViewport{0, 0, frame.cloudRender[2], frame.cloudRender[3], 0, 1};
@@ -968,6 +986,7 @@ struct Dx12Renderer::Impl {
             list->SetPipelineState(cloudPipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
             transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             transition(*list.Get(), cloudDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (cloudTimestamps) list->EndQuery(cloudTimestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
             if (cloudAccumulation) {
                 transition(*list.Get(), cloudColor[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 transition(*list.Get(), cloudMetadata[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -976,6 +995,10 @@ struct Dx12Renderer::Impl {
                 list->SetPipelineState(cloudResolvePipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
                 transition(*list.Get(), cloudColor[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 transition(*list.Get(), cloudMetadata[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            if (cloudTimestamps) {
+                list->EndQuery(cloudTimestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                list->ResolveQueryData(cloudTimestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, cloudTimestampReadback.Get(), 0);
             }
             list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
         }
@@ -1027,6 +1050,17 @@ struct Dx12Renderer::Impl {
         require(list->Close(), "Close draw command list");
         ID3D12CommandList* commands[]{list.Get()}; queue->ExecuteCommandLists(1, commands); submitted = true;
         const HRESULT presented = swap->Present(1,0); wait(); require(presented, "Present frame");
+        lastCloudTiming = {};
+        if (cloudTimestamps && settings.cloudsEnabled) {
+            const D3D12_RANGE read{0, 3 * sizeof(UINT64)}, noWrites{0, 0};
+            void* timestampData{};
+            require(cloudTimestampReadback->Map(0, &read, &timestampData), "Read cloud GPU timestamps");
+            const auto* ticks = static_cast<const UINT64*>(timestampData);
+            const double toMilliseconds = 1000.0 / double(timestampFrequency);
+            lastCloudTiming.integrationMs = double(ticks[1] - ticks[0]) * toMilliseconds;
+            if (cloudAccumulation) lastCloudTiming.reconstructionMs = double(ticks[2] - ticks[1]) * toMilliseconds;
+            cloudTimestampReadback->Unmap(0, &noWrites);
+        }
         previousCamera = camera; previousJitter = jitterNdc; previousProjection = {xScale, yScale};
         historyValid = settings.taaEnabled; ++temporalFrame;
         if (screenshot.resource) {
@@ -1042,6 +1076,10 @@ struct Dx12Renderer::Impl {
     HWND window;
     bool warp{}, submitted{}, debugLayer{};
     RenderDiagnostics lastDiagnostics;
+    CloudGpuTiming lastCloudTiming;
+    UINT64 timestampFrequency{};
+    ComPtr<ID3D12QueryHeap> cloudTimestamps;
+    ComPtr<ID3D12Resource> cloudTimestampReadback;
     UINT width{}, height{}, rtvSize{}, dsvSize{}, srvSize{}, shadowResolution{};
     UINT64 lastFence{};
     HANDLE completed{};
@@ -1104,10 +1142,12 @@ void Dx12Renderer::publishTerrainPages() {
 void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
 void Dx12Renderer::setShadowResolution(int resolution) { impl_->setShadowResolution(resolution); }
 void Dx12Renderer::resetTemporalHistory() { impl_->resetHistory(); }
+void Dx12Renderer::enableCloudGpuTiming() { impl_->enableCloudGpuTiming(); }
 void Dx12Renderer::draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture, bool inspectPipeline) {
     impl_->draw(camera, objects, capture, inspectPipeline);
 }
 RenderDiagnostics Dx12Renderer::diagnostics() const { return impl_->lastDiagnostics; }
+CloudGpuTiming Dx12Renderer::cloudGpuTiming() const { return impl_->lastCloudTiming; }
 bool Dx12Renderer::isWarp() const { return impl_->warp; }
 
 }  // namespace voxel

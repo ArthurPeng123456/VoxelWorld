@@ -62,6 +62,7 @@ struct Options {
     std::uint64_t seed{42};
     int invokers{2};
     bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{};
+    bool cloudFlight{}, cloudFlightCaptures{};
     double voxelDensity{1};
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
@@ -159,6 +160,8 @@ Options readOptions() {
         else if (option == L"--capture-clouds") { result.captures = next(); result.cloudCaptures = true; }
         else if (option == L"--capture-temporal") { result.captures = next(); result.temporalCaptures = true; }
         else if (option == L"--capture-stability") { result.captures = next(); result.stabilityCaptures = true; }
+        else if (option == L"--replay-cloud-flight") result.cloudFlight = true;
+        else if (option == L"--capture-cloud-flight") { result.captures = next(); result.cloudFlightCaptures = true; }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
@@ -349,6 +352,8 @@ public:
     }
 
     int run() {
+        if (opts_.cloudFlightCaptures) return captureCloudFlight();
+        if (opts_.cloudFlight) return replayCloudFlight();
         if (opts_.stabilityCaptures) return captureStability();
         if (opts_.temporalCaptures) return captureTemporal();
         if (opts_.cloudCaptures) return captureClouds();
@@ -860,6 +865,112 @@ private:
                 lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
     }
 
+    Vec cloudFlightTarget(const RenderSettings& settings) const {
+        // A daylit weather front in the default seed. A fixed planet-space
+        // target makes the descent and ascent directly comparable.
+        const Vec direction = unit(Vec{0.35485, -0.61883, 0.70081});
+        return direction * (planetRadius + (settings.cloudBaseKm + settings.cloudThicknessKm * 0.45) * 1000);
+    }
+
+    Camera cloudFlightCamera(double progress) const {
+        Camera view = camera();
+        view.settings.cloudsEnabled = true;
+        // Travel along the same line of sight on both legs so the frames can
+        // be compared at matching camera positions.
+        const double leg = 1 - std::abs(2 * progress - 1);
+        const double eased = leg * leg * (3 - 2 * leg);
+        const double distance = 900 * std::pow(4e6 / 900, 1 - eased);
+        const Vec target = cloudFlightTarget(view.settings);
+        const Vec normal = unit(target);
+        const Vec offset = unit(normal * 0.77 + frameAt(normal)[0] * 0.64);
+        view.eye = target + offset * distance;
+        view.forward = offset * -1;
+        view.right = unit(cross(view.forward, normal));
+        view.up = cross(view.right, view.forward);
+        view.nearPlane = std::max(0.3, distance * 0.0001);
+        view.timeSeconds = 0;
+        return view;
+    }
+
+    int replayCloudFlight() {
+        auto start = Clock::now();
+        for (;;) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT || (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE)) return 0;
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if (closed_) return 0;
+            const double progress = std::chrono::duration<double>(Clock::now() - start).count() / 16;
+            auto view = cloudFlightCamera(std::min(1.0, progress));
+            view.timeSeconds = std::min(1.0, progress) * 16;
+            renderer_->draw(view, {});
+            if (progress >= 1) return 0;
+        }
+    }
+
+    int captureCloudFlight() {
+        SetWindowPos(window_, nullptr, 0, 0, 1100, 800, SWP_NOMOVE | SWP_NOZORDER);
+        renderer_->setClipmapLines({});
+        renderer_->clearTerrain();
+        renderer_->enableCloudGpuTiming();
+        std::ofstream measurements(opts_.captures / "cloud-flight.csv");
+        measurements.exceptions(std::ios::badbit | std::ios::failbit);
+        measurements << "mode,frame,phase,distance_m,integration_ms,reconstruction_ms\n";
+        constexpr int orbitFrames = 16, flightFrames = 193;
+        const auto route = [&](const char* mode, const auto& configure) {
+            renderer_->resetTemporalHistory();
+            const auto viewAt = [&](double progress) {
+                Camera view = cloudFlightCamera(progress);
+                view.settings.shadowsEnabled = false;
+                view.settings.taaCutDistanceKm = 2000; // The recorded orbit leg advances in large, continuous increments.
+                configure(view.settings);
+                return view;
+            };
+            for (int i = 0; i < 24; ++i) renderer_->draw(viewAt(0), {});
+            for (int i = 0; i < orbitFrames + flightFrames; ++i) {
+                const bool orbit = i < orbitFrames;
+                const double progress = orbit ? 0 : double(i - orbitFrames) / (flightFrames - 1);
+                const auto view = viewAt(progress);
+                const auto stem = std::string(mode) + "-" + std::to_string(i);
+                renderer_->draw(view, {}, opts_.captures / (stem + ".bmp"));
+                const auto timing = renderer_->cloudGpuTiming();
+                const double distance = length(view.eye - cloudFlightTarget(view.settings));
+                measurements << mode << ',' << i << ',' << (orbit ? "orbit" : progress <= 0.5 ? "descent" : "ascent") << ','
+                             << distance << ',' << timing.integrationMs << ',' << timing.reconstructionMs << '\n';
+            }
+        };
+        route("detail-off", [](RenderSettings& settings) { settings.cloudDetailStrength = 0; });
+        route("enhanced", [](RenderSettings&) {});
+        route("full", [](RenderSettings& settings) { settings.taaEnabled = false; settings.cloudTemporalEnabled = false; });
+        route("full-detail-off", [](RenderSettings& settings) {
+            settings.taaEnabled = false; settings.cloudTemporalEnabled = false; settings.cloudDetailStrength = 0;
+        });
+        route("shadow-off", [](RenderSettings& settings) { settings.cloudSelfShadowStrength = 0; });
+        Camera view = cloudFlightCamera(0.5);
+        view.settings.shadowsEnabled = false;
+        renderer_->resetTemporalHistory();
+        for (int i = 0; i < 24; ++i) renderer_->draw(view, {});
+        for (int i = 0; i < orbitFrames; ++i)
+            renderer_->draw(view, {}, opts_.captures / ("inside-" + std::to_string(i) + ".bmp"));
+        view.settings.taaEnabled = false;
+        for (int i = 0; i < 2; ++i) {
+            view.sunDirection = i == 0 ? Vec{0.45, 0.25, 0.86} : Vec{-0.70, 0.25, 0.68};
+            const auto stem = "sun-" + std::to_string(i);
+            renderer_->draw(view, {}, opts_.captures / (stem + "-on.bmp"), true);
+            Camera clear = view; clear.settings.cloudSelfShadowStrength = 0;
+            renderer_->draw(clear, {}, opts_.captures / (stem + "-off.bmp"), true);
+        }
+        std::ofstream report(opts_.captures / "cloud-flight.txt");
+        RECT viewport{};
+        GetClientRect(viewport_, &viewport);
+        report << "renderer=" << (renderer_->isWarp() ? "WARP" : "hardware") << "\norbit_frames=" << orbitFrames
+               << "\nflight_frames=" << flightFrames << "\ncoverage=" << opts_.render.cloudCoverage
+               << "\nviewport=" << viewport.right << 'x' << viewport.bottom << '\n';
+        return 0;
+    }
+
     int captureStability() {
         std::filesystem::create_directories(opts_.captures);
         SetWindowPos(window_, nullptr, 0, 0, 960, 720, SWP_NOMOVE | SWP_NOZORDER);
@@ -1082,6 +1193,7 @@ private:
         local.eye.z = planetRadius + 9000;
         local.forward = {1, 0, 0}; local.up = {0, 0, 1};
         local.settings.cloudCoverage = 1;
+        local.settings.cloudWindSpeed = 250;
         capture("cloud-inside", local);
         local.timeSeconds = 600;
         capture("cloud-wind", local);
