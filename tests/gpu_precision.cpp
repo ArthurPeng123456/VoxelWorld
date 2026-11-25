@@ -104,11 +104,12 @@ int main(int argc, char** argv) {
         context->CSSetShader(cs.Get(), nullptr, 0);
         const Vec sun = unit(Vec{0.45, 0.25, 0.86});
         constexpr RenderSettings defaults;
+        constexpr auto air = atmosphereDimensions(defaults);
         float camera[116]{};
         camera[11] = 1; // Atmosphere enabled, matching the viewer default.
         camera[24] = float(sun.x); camera[25] = float(sun.y); camera[26] = float(sun.z);
-        camera[36] = float(planetRadius); camera[37] = float(planetRadius + defaults.atmosphereHeightKm * 1000);
-        camera[38] = float(defaults.rayleighHeightKm * 1000); camera[39] = float(defaults.mieHeightKm * 1000);
+        camera[36] = float(planetRadius); camera[37] = float(planetRadius + air.thickness);
+        camera[38] = float(air.rayleighScale); camera[39] = float(air.mieScale);
         camera[106] = 1;
         camera[108] = float(defaults.rayleighStrength);
         camera[109] = float(defaults.mieStrength);

@@ -71,6 +71,8 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 | 大气 | 开关、厚度、Rayleigh / Mie 各自的尺度高度与散射强度、Mie 各向异性 |
 | HDR | 曝光（−10 到 +10 EV）和色调映射（ACES、Reinhard、线性裁剪） |
 
+`Thickness (km)` 同时调整大气外边界和密度曲线的垂直尺度。Rayleigh 与 Mie 的尺度高度按 100 公里厚度填写，运行时随厚度等比缩放。例如默认 Rayleigh 尺度高度为 8 公里，厚度调到 200 公里时对应的实际尺度高度为 16 公里。轨道截图验证固定机位，只切换 100 公里与 300 公里厚度，检查外缘光晕的变化。
+
 四张 D32 阴影贴图的显存用量分别约为 16、64、256 MiB。切换分辨率时会重建阴影资源。HDR 场景仍通过色调映射输出到 sRGB/SDR 交换链。
 
 命令行可用 `--shadow-resolution`、`--shadow-distance-km`、`--shadow-split-blend`、`--shadow-normal-bias`、`--shadow-depth-bias` 设置 CSM。大气对应 `--atmosphere-height-km`、`--rayleigh-height-km`、`--mie-height-km`、`--rayleigh-strength`、`--mie-strength`、`--mie-anisotropy` 和 `--no-atmosphere`。HDR 使用 `--exposure` 和 `--tone-map aces|reinhard|linear`。

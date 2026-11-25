@@ -9,6 +9,7 @@
 namespace voxel {
 
 inline constexpr std::array<int, 3> shadowResolutions{1024, 2048, 4096};
+inline constexpr double referenceAtmosphereHeightKm = 100;
 constexpr bool validShadowResolution(int resolution) {
     for (int supported : shadowResolutions) if (resolution == supported) return true;
     return false;
@@ -22,11 +23,20 @@ struct RenderSettings {
     double shadowDistanceKm{200}, shadowSplitBlend{0.85};
     double shadowNormalBias{1}, shadowDepthBias{1};
     bool atmosphereEnabled{true};
-    double atmosphereHeightKm{100}, rayleighHeightKm{8}, mieHeightKm{1.2};
+    double atmosphereHeightKm{referenceAtmosphereHeightKm}, rayleighHeightKm{8}, mieHeightKm{1.2};
     double rayleighStrength{1}, mieStrength{1}, mieAnisotropy{0.76};
     double exposureEV{};
     ToneMapping toneMapping{ToneMapping::Aces};
 };
+
+struct AtmosphereDimensions { double thickness, rayleighScale, mieScale; };
+
+constexpr AtmosphereDimensions atmosphereDimensions(const RenderSettings& settings) {
+    // Stretch the density profile and its outer boundary together. The scale
+    // height controls describe the reference profile at 100 km thickness.
+    const double scale = 1000 * settings.atmosphereHeightKm / referenceAtmosphereHeightKm;
+    return {1000 * settings.atmosphereHeightKm, scale * settings.rayleighHeightKm, scale * settings.mieHeightKm};
+}
 
 struct RenderParameter {
     const wchar_t* option;
@@ -43,8 +53,8 @@ inline constexpr std::array shadowParameters{
 };
 inline constexpr std::array atmosphereParameters{
     RenderParameter{L"--atmosphere-height-km", L"Thickness (km)", &RenderSettings::atmosphereHeightKm, 1, 1000},
-    RenderParameter{L"--rayleigh-height-km", L"Rayleigh scale height (km)", &RenderSettings::rayleighHeightKm, 0.1, 100},
-    RenderParameter{L"--mie-height-km", L"Mie scale height (km)", &RenderSettings::mieHeightKm, 0.1, 100},
+    RenderParameter{L"--rayleigh-height-km", L"Rayleigh scale (km at 100 km)", &RenderSettings::rayleighHeightKm, 0.1, 100},
+    RenderParameter{L"--mie-height-km", L"Mie scale (km at 100 km)", &RenderSettings::mieHeightKm, 0.1, 100},
     RenderParameter{L"--rayleigh-strength", L"Rayleigh strength", &RenderSettings::rayleighStrength, 0, 8},
     RenderParameter{L"--mie-strength", L"Mie strength", &RenderSettings::mieStrength, 0, 8},
     RenderParameter{L"--mie-anisotropy", L"Mie anisotropy", &RenderSettings::mieAnisotropy, -0.95, 0.95}

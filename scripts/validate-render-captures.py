@@ -49,6 +49,15 @@ def validate(directory):
     orbit_edges = orbit_shading_edges(orbit_file)
     if terrain == "classic" and orbit_edges > 0.005:
         raise ValueError(f"Mesh shading bands visible in the orbit capture: {orbit_edges:.2%}")
+    orbit_size, clear = bitmap(orbit_file)
+    thin_size, thin = bitmap(directory / "grid-atmosphere-100km.bmp")
+    thick_size, thick = bitmap(directory / "grid-atmosphere-300km.bmp")
+    if thin_size != orbit_size or thick_size != orbit_size:
+        raise ValueError("Atmosphere thickness captures have different viewport sizes")
+    halo = sum(max(clear[i:i+3]) <= 8 and max(thick[i:i+3]) >= max(thin[i:i+3]) + 12
+               for i in range(0, len(clear), 4))
+    if halo < 250:
+        raise ValueError(f"Changing atmospheric thickness alone did not extend the halo: {halo} sky pixels")
     bitmap(directory / "invoker-control.bmp")
     if "invoker_controls=passed" not in report:
         raise ValueError("Invoker movement and camera controls did not finish validation")
@@ -99,10 +108,11 @@ def validate(directory):
         size, configured = bitmap(directory / f"pipeline-{name}.bmp")
         if size != on_size or sum(abs(p - q) > 2 for p, q in zip(on, configured)) < 1000:
             raise ValueError(f"Rendering settings did not reach the GPU in {name}")
-    count = 48 if terrain == "mars" else 46
+    count = 50 if terrain == "mars" else 48
     print(f"{count} required captures verified for {terrain}; orbit shading edges={orbit_edges:.2%}; CSM 1024/2048/4096; "
           f"translation max difference={maximum}/255, mean={mean:.9f}/255; "
-          f"shadowed={shadowed}, exposure-brightened={brightened}; HDR max={diagnostics['hdr_max_component']}")
+          f"shadowed={shadowed}, exposure-brightened={brightened}, thicker-atmosphere halo={halo}; "
+          f"HDR max={diagnostics['hdr_max_component']}")
 
 
 if __name__ == "__main__":

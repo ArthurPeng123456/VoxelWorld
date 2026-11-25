@@ -708,6 +708,12 @@ void selfTest() {
         check(!readRenderParameter(L"nan", hdrParameters.front()) && !readRenderParameter(L"11", hdrParameters.front()) &&
               readRenderParameter(L"-1.5", hdrParameters.front()) == -1.5 && !validShadowResolution(8192),
               "render arguments validate finite values, bounds and supported shadow sizes");
+        const auto referenceAir = atmosphereDimensions(settings);
+        settings.atmosphereHeightKm = 300;
+        const auto thickerAir = atmosphereDimensions(settings);
+        check(referenceAir.thickness == 100000 && referenceAir.rayleighScale == 8000 && referenceAir.mieScale == 1200 &&
+              thickerAir.thickness == 300000 && thickerAir.rayleighScale == 24000 && thickerAir.mieScale == 3600,
+              "atmosphere thickness stretches both density profiles in meters");
     }
     {
         FreeCamera camera;

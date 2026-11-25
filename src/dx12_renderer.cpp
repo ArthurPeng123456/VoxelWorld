@@ -547,6 +547,7 @@ struct Dx12Renderer::Impl {
         }
         if (infoQueue) infoQueue->ClearStoredMessages();
         const auto& settings = camera.settings;
+        const auto air = atmosphereDimensions(settings);
         setShadowResolution(settings.shadowResolution);
         upload(objects, vertices);
         FrameConstants frame{};
@@ -563,8 +564,8 @@ struct Dx12Renderer::Impl {
             xScale,yScale,float(camera.nearPlane),float(camera.farPlane),
             float(sun.x),float(sun.y),float(sun.z),camera.lodTint ? 1.0f : 0.0f,
             px.hi,py.hi,pz.hi,0,px.lo,py.lo,pz.lo,0,
-            float(planetRadius),float(planetRadius + settings.atmosphereHeightKm * 1000),
-            float(settings.rayleighHeightKm * 1000),float(settings.mieHeightKm * 1000)
+            float(planetRadius),float(planetRadius + air.thickness),
+            float(air.rayleighScale),float(air.mieScale)
         };
         std::copy(std::begin(constants), std::end(constants), frame.camera);
         const auto csm = buildShadowCascades(planetEye, camera.right, camera.up, camera.forward,

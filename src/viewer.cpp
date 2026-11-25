@@ -763,6 +763,11 @@ private:
                 orbitClear.settings.atmosphereEnabled = false;
                 orbitClear.settings.shadowsEnabled = false;
                 renderer_->draw(orbitClear, objects_, opts_.captures / (prefix + "-orbit-no-effects.bmp"));
+                Camera atmosphereCheck = orbitClear;
+                atmosphereCheck.settings.atmosphereEnabled = true;
+                renderer_->draw(atmosphereCheck, objects_, opts_.captures / "grid-atmosphere-100km.bmp");
+                atmosphereCheck.settings.atmosphereHeightKm = 300;
+                renderer_->draw(atmosphereCheck, objects_, opts_.captures / "grid-atmosphere-300km.bmp");
             }
             Camera orbitWire = camera();
             orbitWire.wireframe = true;
