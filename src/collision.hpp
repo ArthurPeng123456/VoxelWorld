@@ -41,6 +41,49 @@ using Chunks = std::map<Key, std::unique_ptr<Chunk>>;
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to);
 Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to);
 
+// Why a field sweep gave up: the recursion budget ran out, or the remaining
+// interval sank below the tolerance that the search promises to resolve. Both
+// cases collapse into the same Unresolved answer, so they are counted apart here.
+// The counters are process-wide and single threaded.
+struct SweepDiagnostics {
+    std::size_t budgetStops{};
+    std::size_t toleranceStops{};
+};
+void setSweepBudget(int budget);
+int sweepBudget();
+// Distance along the cast that the field sweep promises to resolve. A tighter
+// value subdivides deeper before it refuses, so it trades time for fewer
+// Unresolved answers.
+void setSweepTolerance(double meters);
+double sweepToleranceMeters();
+// Per-cast trace of one field sweep: how deep the interval recursion went, how
+// many cells it visited, and where it gave up. Used by --cast-at to explain a
+// single Unresolved answer.
+struct SweepTrace {
+    int visits{};
+    int depth{};
+    int budgetStops{};
+    int toleranceStops{};
+    // The earliest give-up is what becomes Hit::fraction on an Unresolved answer,
+    // so both the earliest and the latest stop are kept.
+    double earliestFirst{}, earliestLast{};
+    int earliestLevel{};
+    double latestFirst{}, latestLast{};
+    int latestLevel{};
+    double stopTravel{}, stopDimension{};
+    // The contact the search did prove, kept even when the answer is downgraded to
+    // Unresolved, so a refusal can be told apart from a real disagreement.
+    double provenFraction{-1};
+    // Proved contact minus the end of the earliest unresolved interval, in meters.
+    // Unresolved is returned only when this exceeds 2 * tolerance.
+    double unknownMargin{-1};
+};
+void beginSweepTrace();
+SweepTrace endSweepTrace();
+
+void resetSweepDiagnostics();
+SweepDiagnostics sweepDiagnostics();
+
 class Physics {
 public:
     explicit Physics(Method method, const Chunks& chunks);

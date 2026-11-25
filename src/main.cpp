@@ -8,6 +8,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,6 +37,16 @@ struct Options {
     int spawnEvery{10};
     bool bodyPairs{};
     int settle{240};
+    int sweepBudget{48000};
+    double sweepTolerance{0.75};
+    int mismatchSamples{10};
+    int castAtFrame{-1};
+    int castAtIndex{0};
+    fs::path sweepCsv{};
+    fs::path sweepLast{};
+    fs::path sweepOutliers{};
+    int sweepOutlierLimit{64};
+    fs::path castObj{};
     QueryMode mode{QueryMode::Ray};
     std::vector<Method> compare{Method::Grid};
     fs::path output{"results"};
@@ -46,7 +57,10 @@ void help() {
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress] [--self-test]\n"
               << "  [--ray-compare] [--rays-per-invoker N] [--sweep] [--shapes-per-invoker N]\n"
-              << "  [--collision] [--settle N] [--compare grid|vdb|dag|all]\n"
+              << "  [--collision] [--settle N] [--compare grid|vdb|dag|all] [--sweep-budget N]\n"
+              << "  [--sweep-tolerance METERS] [--mismatch-samples N] [--cast-at FRAME,INDEX]\n"
+              << "  [--sweep-csv PATH] [--sweep-last PATH] [--sweep-outliers PATH] [--sweep-outlier-limit N]\n"
+              << "  [--cast-obj PATH]\n"
               << "  [--trajectory] [--spawn-every N] [--body-pairs]  one backend per run, chosen by --scheme\n"
               << "  --obj dumps the final frame: mesh.obj, <backend>.obj and bodies_<backend>.csv under --out\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
@@ -78,6 +92,20 @@ Options options(int argc, char** argv) {
             }
             return int(value);
         };
+        auto real = [&](double lo, double hi) {
+            const auto text = next();
+            double value = 0;
+            std::size_t count = 0;
+            try {
+                value = std::stod(text, &count);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("Expected a decimal number for " + arg);
+            }
+            if (count != text.size() || !(value >= lo && value <= hi)) {
+                throw std::invalid_argument("Out of range for " + arg + " (" + std::to_string(lo) + ".." + std::to_string(hi) + ")");
+            }
+            return value;
+        };
         if (arg == "--scheme") {
             const auto method = next();
             if (method == "all") opts.methods = {Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
@@ -108,6 +136,23 @@ Options options(int argc, char** argv) {
         else if (arg == "--spawn-every") opts.spawnEvery = bounded(1, 10000);
         else if (arg == "--body-pairs") opts.bodyPairs = true;
         else if (arg == "--settle") opts.settle = bounded(0, 10000);
+        else if (arg == "--sweep-budget") opts.sweepBudget = bounded(1, 10000000);
+        else if (arg == "--sweep-tolerance") opts.sweepTolerance = real(0.01, 10.0);
+        else if (arg == "--mismatch-samples") opts.mismatchSamples = bounded(0, 100000);
+        else if (arg == "--sweep-csv") opts.sweepCsv = next();
+        else if (arg == "--sweep-last") opts.sweepLast = next();
+        else if (arg == "--sweep-outliers") opts.sweepOutliers = next();
+        else if (arg == "--sweep-outlier-limit") opts.sweepOutlierLimit = bounded(0, 100000);
+        else if (arg == "--cast-obj") opts.castObj = next();
+        else if (arg == "--cast-at") {
+            const auto text = next();
+            const auto comma = text.find(',');
+            if (comma == std::string::npos) throw std::invalid_argument("Expected FRAME,INDEX for --cast-at");
+            opts.castAtFrame = std::stoi(text.substr(0, comma));
+            opts.castAtIndex = std::stoi(text.substr(comma + 1));
+            if (opts.castAtFrame < 0 || opts.castAtIndex < 0)
+                throw std::invalid_argument("--cast-at needs a nonnegative FRAME,INDEX");
+        }
         else if (arg == "--compare") {
             const auto backend = next();
             if (backend == "all") opts.compare = {Method::Grid, Method::Dag, Method::Vdb};
@@ -768,7 +813,7 @@ void compareRayToMesh(const Options& opts, Method other) {
               << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
     report(meshMicro, "mesh");
     report(fieldMicro, name(other));
-    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? meshMicro / fieldMicro : 0) << "x\n"
+    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? fieldMicro / meshMicro : 0) << "x\n"
               << "  contacts mesh " << meshOutcome.hits << ", " << name(other) << ' ' << fieldOutcome.hits
               << ", state mismatches " << mismatches << ", unresolved " << meshOutcome.unresolved << '/'
               << fieldOutcome.unresolved << '\n';
@@ -785,6 +830,114 @@ void compareRayToMesh(const Options& opts, Method other) {
 // positions and the clipmap is built once, so no chunk is rebuilt; each backend
 // is timed in its own pass, one timed region per frame that contains nothing but
 // the sweep calls (the cast generation sits outside the clock stamps).
+// Geometry writer for the sweep outlier dump. One OBJ group per case holds the
+// cast path, the shape at the start pose and at each backend's contact pose, plus
+// the two reported contact points and the mesh normal, so a single row of
+// --sweep-outliers can be loaded into a viewer instead of replayed blind.
+namespace obj {
+
+struct Mesh {
+    std::ostream& out;
+    int next{1};
+    int vertex(Vec p) {
+        out << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+        return next++;
+    }
+    void tri(int a, int b, int c) { out << "f " << a << ' ' << b << ' ' << c << '\n'; }
+    void line(int a, int b) { out << "l " << a << ' ' << b << '\n'; }
+};
+
+constexpr double pi = 3.141592653589793;
+
+// Triangulated surface of the shape centred at `center`, rotated by its own axes.
+void shape(Mesh& mesh, const Shape& shape, Vec center) {
+    const auto place = [&](Vec local) { return center + shape.direction(local); };
+    if (shape.kind == ShapeKind::Box) {
+        int id[8];
+        for (int i = 0; i < 8; ++i) {
+            id[i] = mesh.vertex(place({(i & 1) ? shape.size.x : -shape.size.x,
+                                       (i & 2) ? shape.size.y : -shape.size.y,
+                                       (i & 4) ? shape.size.z : -shape.size.z}));
+        }
+        const int face[12][3] = {{0, 1, 3}, {0, 3, 2}, {4, 6, 7}, {4, 7, 5}, {0, 4, 5}, {0, 5, 1},
+                                 {2, 3, 7}, {2, 7, 6}, {0, 2, 6}, {0, 6, 4}, {1, 5, 7}, {1, 7, 3}};
+        for (const auto& f : face) mesh.tri(id[f[0]], id[f[1]], id[f[2]]);
+        return;
+    }
+    // Profile of revolution around axes[2]: (axial offset, radius). A sphere is a
+    // half circle, a capsule adds the straight cylindrical segment between the caps.
+    std::vector<std::pair<double, double>> profile;
+    if (shape.kind == ShapeKind::Sphere) {
+        for (int i = 0; i <= 12; ++i) {
+            const double phi = -0.5 * pi + pi * i / 12.0;
+            profile.emplace_back(shape.size.x * std::sin(phi), shape.size.x * std::cos(phi));
+        }
+    } else {
+        for (int i = 0; i <= 6; ++i) {
+            const double phi = -0.5 * pi + 0.5 * pi * i / 6.0;
+            profile.emplace_back(-shape.size.z + shape.size.x * std::sin(phi), shape.size.x * std::cos(phi));
+        }
+        for (int i = 0; i <= 6; ++i) {
+            const double phi = 0.5 * pi * i / 6.0;
+            profile.emplace_back(shape.size.z + shape.size.x * std::sin(phi), shape.size.x * std::cos(phi));
+        }
+    }
+    constexpr int slices = 24;
+    std::vector<int> rings(profile.size() * slices);
+    for (std::size_t i = 0; i < profile.size(); ++i) {
+        for (int j = 0; j < slices; ++j) {
+            const double angle = 2 * pi * j / slices;
+            const Vec radial = shape.axes[0] * std::cos(angle) + shape.axes[1] * std::sin(angle);
+            rings[i * slices + std::size_t(j)] =
+                mesh.vertex(center + shape.axes[2] * profile[i].first + radial * profile[i].second);
+        }
+    }
+    for (std::size_t i = 0; i + 1 < profile.size(); ++i) {
+        for (int j = 0; j < slices; ++j) {
+            const int a = rings[i * slices + std::size_t(j)];
+            const int b = rings[i * slices + std::size_t((j + 1) % slices)];
+            const int c = rings[(i + 1) * slices + std::size_t((j + 1) % slices)];
+            const int d = rings[(i + 1) * slices + std::size_t(j)];
+            mesh.tri(a, b, c);
+            mesh.tri(a, c, d);
+        }
+    }
+}
+
+// A small three axis cross marks a point, and an optional segment shows a normal.
+void marker(Mesh& mesh, Vec point, double size, Vec normal = {}) {
+    mesh.line(mesh.vertex(point - Vec{size, 0, 0}), mesh.vertex(point + Vec{size, 0, 0}));
+    mesh.line(mesh.vertex(point - Vec{0, size, 0}), mesh.vertex(point + Vec{0, size, 0}));
+    mesh.line(mesh.vertex(point - Vec{0, 0, size}), mesh.vertex(point + Vec{0, 0, size}));
+    if (length(normal) > 1e-9) mesh.line(mesh.vertex(point), mesh.vertex(point + normal * (4 * size)));
+}
+
+}  // namespace obj
+
+// Closest point on a triangle (Ericson, Real-Time Collision Detection 5.1.5). Used
+// by the --cast-at face report to answer whether two reported contact points sit on
+// the same terrain triangle, which is what makes a normal projected gap meaningful.
+Vec closestOnTriangle(Vec p, Vec a, Vec b, Vec c) {
+    const Vec ab = b - a, ac = c - a, ap = p - a;
+    const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) return a;
+    const Vec bp = p - b;
+    const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) return b;
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) return a + ab * (d1 / (d1 - d3));
+    const Vec cp = p - c;
+    const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return c;
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return a + ac * (d2 / (d2 - d6));
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    const double denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
 void compareSweepToMesh(const Options& opts, Method other) {
     Planet planet(opts.seed);
     World meshWorld(planet, Method::Mesh, false);
@@ -793,6 +946,12 @@ void compareSweepToMesh(const Options& opts, Method other) {
     const auto invokers = invokerPositions(planet, opts.invokers, 0.0);
     const WorldStats meshBuild = meshWorld.update(invokers, opts.global, std::nullopt);
     const WorldStats otherBuild = otherWorld.update(invokers, opts.global, std::nullopt);
+
+    // Every cast below uses this budget, and the stop counters are cleared here
+    // so the tally covers the measured and the validated pass only.
+    setSweepBudget(opts.sweepBudget);
+    setSweepTolerance(opts.sweepTolerance);
+    resetSweepDiagnostics();
 
     // One shape of the invoker's three kinds: the up axis is tilted by up to
     // ~0.22 rad in a random azimuth and the size is scaled 0.7x..1.5x.
@@ -863,56 +1022,465 @@ void compareSweepToMesh(const Options& opts, Method other) {
         for (int frame = 0; frame < opts.frames; ++frame) {
             fillFrame(frame, measuredSalt, local);
             const auto timer = Clock::now();
-            for (const Cast& cast : local) world.physics.sweep(cast.shape, cast.from, cast.to);
+            for (int i = 0; i < local.size(); ++i) {
+                Cast& cast = local[i];
+                world.physics.sweep(cast.shape, cast.from, cast.to);
+            }
             micro += milliseconds(timer) * 1000;
         }
         return micro;  // microseconds
     };
 
     // Correctness is checked in a separate untimed pass, which issues both
-    // backends on the same cast so it can also compare the times of impact.
-    struct Verdict { int meshContacts{}, otherContacts{}, mismatches{}, initial{}; std::vector<double> errors; };
-    auto verify = [&]() {
+    // backends on the same cast so it can also compare the times of impact. Two
+    // kinds of disagreement are counted apart: a conflict is the two backends
+    // answering differently about a contact (contact vs miss), a refusal is the
+    // field search declining to decide at all (Unresolved).
+    struct Sample { int frame, index; ShapeKind kind; Hit::State mesh, other; double meshFraction, otherFraction, span; };
+    struct Verdict {
+        int meshContacts{}, otherContacts{}, conflicts{}, refusals{}, initial{};
+        int meshMiss{}, otherMiss{}, meshUnresolved{}, otherUnresolved{};
+        std::vector<double> errors;
+        std::vector<Sample> samples;
+    };
+    // --sweep-csv PATH streams every cast of the untimed validation pass, so the two
+    // backends can be diffed row by row offline. Rows are results, not timings: the
+    // reported timing block stays per-frame, this one is per-cast.
+    auto csvState = [](Hit::State state) {
+        switch (state) {
+            case Hit::State::Contact: return "contact";
+            case Hit::State::Miss: return "miss";
+            case Hit::State::Unresolved: return "unresolved";
+        }
+        return "?";
+    };
+    auto csvKind = [](ShapeKind kind) {
+        switch (kind) {
+            case ShapeKind::Sphere: return "sphere";
+            case ShapeKind::Capsule: return "capsule";
+            case ShapeKind::Box: return "box";
+        }
+        return "?";
+    };
+    std::ofstream sweepCsv;
+    std::size_t sweepCsvRows = 0;
+    if (!opts.sweepCsv.empty()) {
+        sweepCsv.open(opts.sweepCsv, std::ios::trunc);
+        if (!sweepCsv) throw std::runtime_error("Cannot open --sweep-csv " + opts.sweepCsv.string());
+        sweepCsv << std::fixed << std::setprecision(3)
+                 << "frame,index,kind,span_m,mesh_state,mesh_toi_m," << name(other) << "_state," << name(other)
+                 << "_toi_m,delta_m\n";
+    }
+    // --sweep-last PATH dumps the final frame cast by cast, in space rather than in
+    // cast parameter: the shape centre each cast started from, and the contact point
+    // both backends reported. `point_delta_m` is the plain distance between those two
+    // points; `normal_gap_m` projects it onto the mesh normal, so a negative value
+    // means the field's contact sits embedded inside the mesh surface (the direction
+    // that lets a body sink in) and a positive value means it floats above it.
+    std::ofstream sweepLast;
+    std::vector<std::string> lastLines;
+    std::vector<double> lastPointDelta, lastNormalGap;
+    double lastPathDelta = 0;
+    std::size_t lastRows = 0, lastNegative = 0, lastBeyond = 0;
+    if (!opts.sweepLast.empty()) {
+        sweepLast.open(opts.sweepLast, std::ios::trunc);
+        if (!sweepLast) throw std::runtime_error("Cannot open --sweep-last " + opts.sweepLast.string());
+        sweepLast << std::fixed << std::setprecision(3)
+                  << "frame,index,invoker,shape,kind,span_m,center_x,center_y,center_z,"
+                  << "mesh_state,mesh_toi_m,mesh_x,mesh_y,mesh_z,"
+                  << name(other) << "_state," << name(other) << "_toi_m,"
+                  << name(other) << "_x," << name(other) << "_y," << name(other) << "_z,"
+                  << "path_delta_m,point_delta_m,normal_gap_m\n";
+    }
+    // --sweep-outliers PATH writes every cast whose two reported contact points are
+    // further apart than the tolerance the sweep promises, over all validated frames.
+    // The CSV carries the full cast (size, all three axes, from, to, both answers),
+    // which is enough to replay it with --cast-at FRAME,INDEX; the OBJ carries the
+    // geometry of the first --sweep-outlier-limit cases (0 = no limit).
+    std::ofstream outlierCsv, outlierObj;
+    obj::Mesh outlierMesh{outlierObj};
+    std::vector<std::string> outlierLines;
+    std::size_t outlierRows = 0, outlierObjects = 0, outlierShown = 0;
+    if (!opts.sweepOutliers.empty()) {
+        outlierCsv.open(opts.sweepOutliers.string() + ".csv", std::ios::trunc);
+        if (!outlierCsv) throw std::runtime_error("Cannot open " + opts.sweepOutliers.string() + ".csv");
+        outlierCsv << std::fixed << std::setprecision(3)
+                   << "frame,index,invoker,shape,kind,size_x,size_y,size_z,"
+                   << "a0x,a0y,a0z,a1x,a1y,a1z,a2x,a2y,a2z,"
+                   << "from_x,from_y,from_z,to_x,to_y,to_z,span_m,"
+                   << "mesh_toi_m," << name(other) << "_toi_m,"
+                   << "mesh_x,mesh_y,mesh_z," << name(other) << "_x," << name(other) << "_y," << name(other) << "_z,"
+                   << "mesh_nx,mesh_ny,mesh_nz,path_delta_m,point_delta_m,normal_gap_m\n";
+        outlierObj.open(opts.sweepOutliers.string() + ".obj", std::ios::trunc);
+        if (!outlierObj) throw std::runtime_error("Cannot open " + opts.sweepOutliers.string() + ".obj");
+        outlierObj << std::fixed << std::setprecision(3)
+                   << "# voxel_world sweep outliers; one group per case: cast path, shape at start,"
+                   << " shape at each backend's contact, contact points and the mesh normal\n";
+    }
+    auto validate = [&]() {
         Verdict verdict;
         std::vector<Cast> local;
         local.reserve(perFrame);
         for (int frame = 0; frame < opts.frames; ++frame) {
             fillFrame(frame, measuredSalt, local);
+            int index = 0;
             for (const Cast& cast : local) {
                 const Hit meshHit = meshWorld.physics.sweep(cast.shape, cast.from, cast.to);
                 const Hit otherHit = otherWorld.physics.sweep(cast.shape, cast.from, cast.to);
+                const double span = length(cast.to - cast.from);
                 verdict.meshContacts += meshHit.state == Hit::State::Contact;
                 verdict.otherContacts += otherHit.state == Hit::State::Contact;
-                verdict.mismatches += meshHit.state != otherHit.state;
+                verdict.meshMiss += meshHit.state == Hit::State::Miss;
+                verdict.otherMiss += otherHit.state == Hit::State::Miss;
+                verdict.meshUnresolved += meshHit.state == Hit::State::Unresolved;
+                verdict.otherUnresolved += otherHit.state == Hit::State::Unresolved;
                 verdict.initial += meshHit.initial || otherHit.initial;
+                if (meshHit.state != otherHit.state) {
+                    const bool refusal = meshHit.state == Hit::State::Unresolved || otherHit.state == Hit::State::Unresolved;
+                    verdict.refusals += refusal;
+                    verdict.conflicts += !refusal;
+                    if (verdict.samples.size() < std::size_t(opts.mismatchSamples) || opts.mismatchSamples == 0)
+                        verdict.samples.push_back({frame, index, cast.shape.kind, meshHit.state, otherHit.state,
+                                                   meshHit.fraction, otherHit.fraction, length(cast.to - cast.from)});
+                }
                 if (meshHit.state == Hit::State::Contact && otherHit.state == Hit::State::Contact)
-                    verdict.errors.push_back(std::abs(meshHit.fraction - otherHit.fraction) * length(cast.to - cast.from));
+                    verdict.errors.push_back(std::abs(meshHit.fraction - otherHit.fraction) * span);
+                // Space level disagreement, both dumps below use it: the path delta is
+                // the distance along the cast, the point delta the distance between the
+                // two reported contact points, and the gap that distance projected onto
+                // the mesh normal (negative = the field contact sits inside the mesh).
+                const bool paired = meshHit.state == Hit::State::Contact && otherHit.state == Hit::State::Contact;
+                const double path = paired ? std::abs(meshHit.fraction - otherHit.fraction) * span : 0.0;
+                const double point = paired ? length(otherHit.position - meshHit.position) : 0.0;
+                const double gap = paired ? dot(otherHit.position - meshHit.position, meshHit.normal) : 0.0;
+                if (sweepCsv) {
+                    sweepCsv << frame << ',' << index << ',' << csvKind(cast.shape.kind) << ',' << span << ','
+                             << csvState(meshHit.state) << ',' << meshHit.fraction * span << ','
+                             << csvState(otherHit.state) << ',' << otherHit.fraction * span << ',';
+                    if (meshHit.state == Hit::State::Contact && otherHit.state == Hit::State::Contact)
+                        sweepCsv << std::abs(meshHit.fraction - otherHit.fraction) * span;
+                    sweepCsv << '\n';
+                    ++sweepCsvRows;
+                }
+                if (sweepLast && frame + 1 == opts.frames) {
+                    const Vec center = cast.from;
+                    if (paired) {
+                        lastPointDelta.push_back(point);
+                        lastNormalGap.push_back(gap);
+                        lastPathDelta += path;
+                        lastNegative += gap < 0;
+                        lastBeyond += std::abs(gap) > sweepToleranceMeters();
+                    }
+                    sweepLast << frame << ',' << index << ',' << index / opts.shapesPerInvoker << ','
+                              << index % opts.shapesPerInvoker << ',' << csvKind(cast.shape.kind) << ',' << span << ','
+                              << center.x << ',' << center.y << ',' << center.z << ',' << csvState(meshHit.state)
+                              << ',' << meshHit.fraction * span << ',' << meshHit.position.x << ','
+                              << meshHit.position.y << ',' << meshHit.position.z << ',' << csvState(otherHit.state)
+                              << ',' << otherHit.fraction * span << ',' << otherHit.position.x << ','
+                              << otherHit.position.y << ',' << otherHit.position.z << ',' << path << ',' << point
+                              << ',' << gap << '\n';
+                    std::ostringstream line;
+                    line << std::fixed << std::setprecision(3) << "    #" << index << " inv "
+                         << index / opts.shapesPerInvoker << " shape " << index % opts.shapesPerInvoker << " "
+                         << csvKind(cast.shape.kind) << " span " << span
+                         << " | center " << center.x << '/' << center.y << '/' << center.z << " | mesh "
+                         << csvState(meshHit.state) << ' ' << meshHit.fraction * span << " pt " << meshHit.position.x
+                         << '/' << meshHit.position.y << '/' << meshHit.position.z << " | " << name(other) << ' '
+                         << csvState(otherHit.state) << ' ' << otherHit.fraction * span << " pt "
+                         << otherHit.position.x << '/' << otherHit.position.y << '/' << otherHit.position.z
+                         << " | path " << path << " point " << point << " gap " << gap;
+                    lastLines.push_back(line.str());
+                    ++lastRows;
+                }
+                // Anything whose two contact points are further apart than the tolerance
+                // goes out with its full cast, so it can be replayed alone with --cast-at
+                // and inspected in the OBJ dump.
+                if (paired && outlierCsv && point > sweepToleranceMeters()) {
+                    const Shape& shape = cast.shape;
+                    outlierCsv << frame << ',' << index << ',' << index / opts.shapesPerInvoker << ','
+                               << index % opts.shapesPerInvoker << ',' << csvKind(shape.kind) << ',' << shape.size.x
+                               << ',' << shape.size.y << ',' << shape.size.z;
+                    for (const Vec& axis : shape.axes) outlierCsv << ',' << axis.x << ',' << axis.y << ',' << axis.z;
+                    outlierCsv << ',' << cast.from.x << ',' << cast.from.y << ',' << cast.from.z << ',' << cast.to.x
+                               << ',' << cast.to.y << ',' << cast.to.z << ',' << span << ',' << meshHit.fraction * span
+                               << ',' << otherHit.fraction * span << ',' << meshHit.position.x << ','
+                               << meshHit.position.y << ',' << meshHit.position.z << ',' << otherHit.position.x
+                               << ',' << otherHit.position.y << ',' << otherHit.position.z << ',' << meshHit.normal.x
+                               << ',' << meshHit.normal.y << ',' << meshHit.normal.z << ',' << path << ',' << point
+                               << ',' << gap << '\n';
+                    ++outlierRows;
+                    if (outlierObj && (opts.sweepOutlierLimit == 0 || outlierObjects < std::size_t(opts.sweepOutlierLimit))) {
+                        ++outlierObjects;
+                        const Vec delta = cast.to - cast.from;
+                        const Vec meshCenter = cast.from + delta * meshHit.fraction;
+                        const Vec otherCenter = cast.from + delta * otherHit.fraction;
+                        outlierObj << "o cast_" << frame << '_' << index << '\n';
+                        const int a = outlierMesh.vertex(cast.from), b = outlierMesh.vertex(cast.to);
+                        outlierMesh.line(a, b);
+                        obj::shape(outlierMesh, shape, cast.from);
+                        obj::shape(outlierMesh, shape, meshCenter);
+                        obj::shape(outlierMesh, shape, otherCenter);
+                        obj::marker(outlierMesh, meshHit.position, 1.0, meshHit.normal);
+                        obj::marker(outlierMesh, otherHit.position, 1.0);
+                    }
+                    if (outlierShown < std::size_t(opts.mismatchSamples) || opts.mismatchSamples == 0) {
+                        ++outlierShown;
+                        std::ostringstream line;
+                        line << std::fixed << std::setprecision(3) << "  outlier frame " << frame << ", index "
+                             << index << " (invoker " << index / opts.shapesPerInvoker << ", shape "
+                             << index % opts.shapesPerInvoker << "), " << csvKind(shape.kind) << " size "
+                             << shape.size.x << '/' << shape.size.y << '/' << shape.size.z << ", axis "
+                             << shape.axes[2].x << '/' << shape.axes[2].y << '/' << shape.axes[2].z << '\n'
+                             << "    from " << cast.from.x << '/' << cast.from.y << '/' << cast.from.z << "  to "
+                             << cast.to.x << '/' << cast.to.y << '/' << cast.to.z << "  span " << span << " m\n"
+                             << "    mesh " << meshHit.fraction * span << " m pt " << meshHit.position.x << '/'
+                             << meshHit.position.y << '/' << meshHit.position.z << " | " << name(other) << ' '
+                             << otherHit.fraction * span << " m pt " << otherHit.position.x << '/'
+                             << otherHit.position.y << '/' << otherHit.position.z << '\n'
+                             << "    point " << point << " m, gap " << gap << " m | replay: --cast-at " << frame
+                             << ',' << index;
+                        outlierLines.push_back(line.str());
+                    }
+                }
+                ++index;
             }
         }
         std::sort(verdict.errors.begin(), verdict.errors.end());
         return verdict;
     };
 
-    const double meshMicro = timePass(meshWorld);
-    const double fieldMicro = timePass(otherWorld);
-    Verdict verdict = verify();
-
-    auto report = [&](double micro, const char* label) {
-        std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
-                  << micro / sweeps << " us, " << (micro > 0 ? sweeps / (micro / 1e6) : 0) << " sweeps/s\n";
+    // --cast-at FRAME,INDEX reproduces exactly one cast and explains both answers,
+    // so a reported refusal can be inspected without a full run.
+    const bool debugCast = opts.castAtFrame >= 0;
+    auto kindName = [](ShapeKind kind) {
+        switch (kind) {
+            case ShapeKind::Sphere: return "sphere";
+            case ShapeKind::Capsule: return "capsule";
+            case ShapeKind::Box: return "box";
+        }
+        return "?";
     };
-    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [sweep]: " << opts.invokers
-              << " static invokers x " << opts.shapesPerInvoker << " shapes x " << opts.frames << " frames = "
-              << std::size_t(opts.frames) * perFrame << " sweeps per backend (identical list)\n"
-              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
-    report(meshMicro, "mesh");
-    report(fieldMicro, name(other));
-    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? meshMicro / fieldMicro : 0) << "x\n"
-              << "  contacts mesh " << verdict.meshContacts << ", " << name(other) << ' ' << verdict.otherContacts
-              << ", initial " << verdict.initial << ", state mismatches " << verdict.mismatches << '\n';
+    if (debugCast) {
+        std::vector<Cast> local;
+        local.reserve(perFrame);
+        fillFrame(opts.castAtFrame, measuredSalt, local);
+        if (std::size_t(opts.castAtIndex) >= local.size()) {
+            throw std::invalid_argument("--cast-at index out of range for frame " + std::to_string(opts.castAtFrame) +
+                                        " (" + std::to_string(local.size()) + " casts)");
+        }
+        const Cast& cast = local[std::size_t(opts.castAtIndex)];
+        const Hit meshHit = meshWorld.physics.sweep(cast.shape, cast.from, cast.to);
+        beginSweepTrace();
+        const Hit fieldHit = otherWorld.physics.sweep(cast.shape, cast.from, cast.to);
+        const SweepTrace trace = endSweepTrace();
+        const double span = length(cast.to - cast.from);
+        std::cout << std::fixed << std::setprecision(3)
+                  << "  cast " << opts.castAtFrame << ',' << opts.castAtIndex << " of " << local.size()
+                  << " casts (invoker " << opts.castAtIndex / opts.shapesPerInvoker << ", shape "
+                  << opts.castAtIndex % opts.shapesPerInvoker << "), " << kindName(cast.shape.kind)
+                  << " half sizes " << cast.shape.size.x << '/' << cast.shape.size.y << '/' << cast.shape.size.z
+                  << ", span " << span << " m\n"
+                  << "    from " << cast.from.x << '/' << cast.from.y << '/' << cast.from.z << "  to " << cast.to.x << '/'
+                  << cast.to.y << '/' << cast.to.z << '\n'
+                  << "    mesh " << (meshHit.state == Hit::State::Contact ? "contact" : "no contact") << " at "
+                  << meshHit.fraction * span << " m, point " << meshHit.position.x << '/' << meshHit.position.y << '/'
+                  << meshHit.position.z << ", normal " << meshHit.normal.x << '/' << meshHit.normal.y << '/'
+                  << meshHit.normal.z << '\n'
+                  << "    field " << (fieldHit.state == Hit::State::Contact ? "contact"
+                                       : fieldHit.state == Hit::State::Unresolved ? "unresolved" : "miss")
+                  << " at " << fieldHit.fraction * span << " m (fraction " << fieldHit.fraction << ")\n"
+                  << "    field trace: visits " << trace.visits << ", depth " << trace.depth << ", budget stops "
+                  << trace.budgetStops << ", tolerance stops " << trace.toleranceStops << '\n';
+        if (trace.provenFraction >= 0) {
+            std::cout << "    field proved a contact at " << trace.provenFraction * span << " m (mesh "
+                      << meshHit.fraction * span << " m, gap " << (meshHit.fraction - trace.provenFraction) * span
+                      << " m), unresolved band starts " << trace.unknownMargin << " m before it (limit "
+                      << 2 * sweepToleranceMeters() << " m)\n";
+        }
+        if (trace.toleranceStops > 0 || trace.budgetStops > 0) {
+            const int stops = trace.budgetStops + trace.toleranceStops;
+            std::cout << "    earliest give up (this is what Unresolved reports): level " << trace.earliestLevel
+                      << ", interval " << trace.earliestFirst * span << " .. " << trace.earliestLast * span << " m ("
+                      << (trace.earliestLast - trace.earliestFirst) * span << " m long)\n"
+                      << "    last give up: level " << trace.latestLevel << ", interval " << trace.latestFirst * span
+                      << " .. " << trace.latestLast * span << " m, travel " << trace.stopTravel << " m, cell "
+                      << trace.stopDimension << " m, " << stops << " stops in total\n";
+        }
+        std::cout << "    verdict: " << (meshHit.state == fieldHit.state ? "agree" : "disagree") << '\n';
+        // Which terrain triangle did each backend land on? The gap metric only means
+        // something when both points sit on the same face, so report the nearest
+        // triangle of each point: chunk, index, distance, plane normal and the signed
+        // distance along it.
+        struct Face {
+            double distance;
+            Key key;
+            int lod;
+            std::size_t index;
+            Vec normal, closest;
+            double spacing;
+            int coarseNeighbor;
+            Box box;
+        };
+        auto nearestFace = [&](Vec point) {
+            Face best{std::numeric_limits<double>::infinity(), Key{0, 0, 0}, 0, 0, Vec{}, Vec{}, 0, 0, Box{}};
+            for (const auto& entry : meshWorld.chunks) {
+                const auto& chunk = *entry.second;
+                if (chunk.mesh.empty() || !chunk.box.expanded(Vec{200, 200, 200}).contains(point)) continue;
+                for (std::size_t i = 0; i < chunk.mesh.size(); ++i) {
+                    const auto& triangle = chunk.mesh[i];
+                    const Vec closest =
+                        closestOnTriangle(point, triangle.vertices[0], triangle.vertices[1], triangle.vertices[2]);
+                    const double distance = length(point - closest);
+                    if (distance >= best.distance) continue;
+                    const Vec normal =
+                        unit(cross(triangle.vertices[1] - triangle.vertices[0], triangle.vertices[2] - triangle.vertices[0]));
+                    const int coarse = *std::max_element(chunk.neighborhood.begin(), chunk.neighborhood.end());
+                    best = {distance, chunk.key, chunk.lod, i, normal, closest, chunk.spacing, coarse, chunk.box};
+                }
+            }
+            return best;
+        };
+        auto faceReport = [&](const char* label, Vec point, Vec reportedNormal) {
+            const Face face = nearestFace(point);
+            if (!std::isfinite(face.distance)) {
+                std::cout << "    " << label << " face: no triangle within the chunk window\n";
+                return face;
+            }
+            const double planeSigned = dot(point - face.closest, face.normal);
+            double toFace = std::numeric_limits<double>::infinity();
+            for (int axis = 0; axis < 3; ++axis) toFace = std::min(toFace, std::min(point[axis] - face.box.lo[axis], face.box.hi[axis] - point[axis]));
+            std::cout << "    " << label << " face: chunk " << face.key.x << '/' << face.key.y << '/' << face.key.z
+                      << " lod " << face.lod << " spacing " << face.spacing << " m, coarsest neighbor lod "
+                      << face.coarseNeighbor << ", tri " << face.index << ", distance " << face.distance
+                      << " m, " << toFace << " m inside its chunk, plane normal " << face.normal.x << '/'
+                      << face.normal.y << '/' << face.normal.z << ", signed " << planeSigned << " m";
+            if (length(reportedNormal) > 0)
+                std::cout << ", dot with reported normal " << dot(face.normal, reportedNormal);
+            std::cout << '\n';
+            return face;
+        };
+        Face meshFace{}, fieldFace{};
+        if (meshHit.state == Hit::State::Contact) meshFace = faceReport("mesh", meshHit.position, meshHit.normal);
+        if (fieldHit.state == Hit::State::Contact) fieldFace = faceReport("field", fieldHit.position, fieldHit.normal);
+        if (meshHit.state == Hit::State::Contact && fieldHit.state == Hit::State::Contact) {
+            const bool same = meshFace.key == fieldFace.key && meshFace.index == fieldFace.index;
+            std::cout << "    same triangle: " << (same ? "yes" : "no");
+            if (!same) std::cout << " (field point is " << fieldFace.distance << " m from its own triangle)";
+            std::cout << '\n';
+        }
+        // --cast-obj PATH writes this one cast as an OBJ: the path, the shape at the
+        // start pose and at each backend's contact pose, plus the contact points.
+        if (!opts.castObj.empty()) {
+            std::ofstream file(opts.castObj, std::ios::trunc);
+            if (!file) throw std::runtime_error("Cannot open --cast-obj " + opts.castObj.string());
+            obj::Mesh mesh{file};
+            file << std::fixed << std::setprecision(3) << "# cast " << opts.castAtFrame << ',' << opts.castAtIndex
+                 << " " << kindName(cast.shape.kind) << " size " << cast.shape.size.x << ' ' << cast.shape.size.y
+                 << ' ' << cast.shape.size.z << "\n# axes\n";
+            for (const Vec& axis : cast.shape.axes) file << "# " << axis.x << ' ' << axis.y << ' ' << axis.z << '\n';
+            file << "o cast_" << opts.castAtFrame << '_' << opts.castAtIndex << '\n';
+            const Vec delta = cast.to - cast.from;
+            const int a = mesh.vertex(cast.from), b = mesh.vertex(cast.to);
+            mesh.line(a, b);
+            obj::shape(mesh, cast.shape, cast.from);
+            if (meshHit.state == Hit::State::Contact && meshHit.fraction > 0) {
+                obj::shape(mesh, cast.shape, cast.from + delta * meshHit.fraction);
+                obj::marker(mesh, meshHit.position, 1.0, meshHit.normal);
+            }
+            if (fieldHit.state == Hit::State::Contact && fieldHit.fraction > 0) {
+                obj::shape(mesh, cast.shape, cast.from + delta * fieldHit.fraction);
+                obj::marker(mesh, fieldHit.position, 1.0);
+            }
+            std::cout << "    cast obj " << opts.castObj.string() << '\n';
+        }
+        return;
+    }
+
+    //const double meshMicro = timePass(meshWorld);
+    //const double fieldMicro = timePass(otherWorld);
+    Verdict verdict = validate();
+    const SweepDiagnostics stops = sweepDiagnostics();
+
+    auto stateName = [](Hit::State state) {
+        switch (state) {
+            case Hit::State::Contact: return "contact";
+            case Hit::State::Miss: return "miss";
+            case Hit::State::Unresolved: return "unresolved";
+        }
+        return "?";
+    };
+    //auto report = [&](double micro, const char* label) {
+    //    std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
+    //              << micro / sweeps << " us, " << (micro > 0 ? sweeps / (micro / 1e6) : 0) << " sweeps/s\n";
+    //};
+    //std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [sweep]: " << opts.invokers
+    //          << " static invokers x " << opts.shapesPerInvoker << " shapes x " << opts.frames << " frames = "
+    //          << std::size_t(opts.frames) * perFrame << " sweeps per backend (identical list)\n"
+    //          << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
+    //report(meshMicro, "mesh");
+    //report(fieldMicro, name(other));
+    //std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? fieldMicro / meshMicro : 0) << "x\n"
+    //          << "  contacts mesh " << verdict.meshContacts << ", " << name(other) << ' ' << verdict.otherContacts
+    //          << ", initial " << verdict.initial << ", conflicts " << verdict.conflicts
+    //          << ", refusals " << verdict.refusals << '\n'
+    //          << "  states mesh " << verdict.meshContacts << '/' << verdict.meshMiss << '/' << verdict.meshUnresolved
+    //          << ", " << name(other) << ' ' << verdict.otherContacts << '/' << verdict.otherMiss << '/'
+    //          << verdict.otherUnresolved << " (contact/miss/unresolved)\n"
+    //          << "  sweep stops: budget " << stops.budgetStops << " (limit " << sweepBudget() << "), tolerance "
+    //          << stops.toleranceStops << " (limit " << sweepToleranceMeters() << " m)\n";
+    //const int disagreements = verdict.conflicts + verdict.refusals;
+    //if (disagreements > 0) {
+    //    const int printed = int(verdict.samples.size());
+    //    std::cout << "  disagreeing casts " << disagreements;
+    //    if (printed < disagreements)
+    //        std::cout << " (first " << printed << " shown, raise --mismatch-samples to see more)";
+    //    std::cout << '\n';
+    //}
     if (!verdict.errors.empty()) {
         std::cout << "  paired " << verdict.errors.size() << ", p95 TOI difference " << percentile(verdict.errors, 0.95)
                   << " m, max " << verdict.errors.back() << " m\n";
+    }
+    for (const Sample& sample : verdict.samples) {
+        std::cout << "  mismatch: frame " << sample.frame << ", shape " << sample.index << " ("
+                  << (sample.kind == ShapeKind::Sphere ? "sphere" : sample.kind == ShapeKind::Capsule ? "capsule" : "box")
+                  << "), mesh " << stateName(sample.mesh) << " at " << sample.meshFraction * sample.span << " m, "
+                  << name(other) << ' ' << stateName(sample.other) << " at " << sample.otherFraction * sample.span
+                  << " m (span " << sample.span << " m)\n";
+    }
+    if (sweepCsv.is_open()) {
+        sweepCsv.close();
+        std::cout << "  sweep csv " << opts.sweepCsv.string() << ": " << sweepCsvRows
+                  << " rows (one per cast, from the untimed validation pass)\n";
+    }
+    if (sweepLast.is_open()) {
+        sweepLast.close();
+        std::cout << "  last frame " << opts.frames - 1 << ": " << lastRows << " casts, "
+                  << lastPointDelta.size() << " paired contacts\n";
+        if (!lastPointDelta.empty()) {
+            std::sort(lastPointDelta.begin(), lastPointDelta.end());
+            std::sort(lastNormalGap.begin(), lastNormalGap.end());
+            const double meanPoint = std::accumulate(lastPointDelta.begin(), lastPointDelta.end(), 0.0)
+                                   / double(lastPointDelta.size());
+            const double meanGap = std::accumulate(lastNormalGap.begin(), lastNormalGap.end(), 0.0)
+                                 / double(lastNormalGap.size());
+            std::cout << "    path delta: mean " << lastPathDelta / double(lastPointDelta.size()) << " m | point delta: mean "
+                      << meanPoint << " m, p95 " << percentile(lastPointDelta, 0.95) << " m, max "
+                      << lastPointDelta.back() << " m\n"
+                      << "    normal gap: mean " << meanGap << " m, min " << lastNormalGap.front() << " m, max "
+                      << lastNormalGap.back() << " m, embedded (gap < 0) " << lastNegative << ", |gap| > tolerance "
+                      << sweepToleranceMeters() << " m: " << lastBeyond << '\n';
+        }
+        for (const std::string& line : lastLines) std::cout << line << '\n';
+    }
+    if (outlierCsv.is_open()) {
+        outlierCsv.close();
+        outlierObj.close();
+        std::cout << "  sweep outliers " << opts.sweepOutliers.string() << ": " << outlierRows << " casts with point delta > "
+                  << sweepToleranceMeters() << " m, " << outlierObjects << " of them in the obj (limit "
+                  << opts.sweepOutlierLimit << ", 0 = all)" << '\n';
+        if (outlierShown < outlierRows)
+            std::cout << "  (first " << outlierShown << " shown, raise --mismatch-samples to see more)\n";
+        for (const std::string& line : outlierLines) std::cout << line << '\n';
     }
 }
 
@@ -1260,7 +1828,16 @@ void queryCompare(const Options& opts) {
 int main(int argc, char** argv) {
     using namespace voxel;
     try {
-        const auto opts = options(argc, argv);
+        auto opts = options(argc, argv);
+        // Fixed benchmark configuration: grid vs mesh, 16 static invokers, 21 shapes
+        // each, 20 measured frames after 2 warmup frames, so every run reports the
+        // same 6720 sweeps per backend and the numbers stay comparable over time.
+        opts.mode = QueryMode::Sweep;
+        opts.compare = {Method::Grid};
+        opts.invokers = 16;
+        opts.shapesPerInvoker = 21;
+        opts.frames = 20;
+        opts.warmup = 2;
         queryCompare(opts); return 0;
         //if (opts.help) { help(); return 0; }
         //if (opts.selfTest) { selfTest(); return 0; }

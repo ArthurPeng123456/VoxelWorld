@@ -38,8 +38,28 @@ double Shape::distance(Vec offset) const {
 namespace {
 
 constexpr double epsilon = 1e-6;
-constexpr double sweepTolerance = 0.75;
-constexpr int sweepBudget = 12000;
+constexpr double sweepToleranceDefault = 0.75;
+constexpr int sweepBudgetDefault = 48000;
+// How many times one cast may keep subdividing past the tolerance floor before it
+// gives up on the interval instead. Bounds the worst case a knife-edge cell can cost.
+constexpr int sweepRefinementLimit = 32;
+
+// Mutable process-wide settings and counters for the field sweep search. The
+// benchmark runs one query stream at a time, so plain statics are enough.
+double sweepToleranceCurrent = sweepToleranceDefault;
+int sweepBudgetCurrent = sweepBudgetDefault;
+std::size_t budgetStops = 0;
+std::size_t toleranceStops = 0;
+bool traceOn = false;
+SweepTrace traceRecord;
+
+// Increments while inside one visit(), so a trace knows how deep the interval
+// recursion had gone when it gave up.
+struct LevelGuard {
+    int& level;
+    explicit LevelGuard(int& value) : level(value) { ++level; }
+    ~LevelGuard() { --level; }
+};
 
 template<class Operation>
 void forChunks(const Chunks& chunks, Vec from, Vec to, Vec extents, Operation operation) {
@@ -380,7 +400,14 @@ struct SweepSearch {
     double speed;
     Hit hit;
     double unknown{std::numeric_limits<double>::infinity()};
-    int budget{sweepBudget};
+    // A contact hidden in an unresolved interval can be no earlier than that
+    // interval's start, so `unknown` -- not its end -- is the honest bound on how
+    // much earlier than the proved contact an unresolved contact could sit. The
+    // band is only recorded when that bound really exceeds the budget; otherwise
+    // it is refined away or dropped, see visit().
+    int refinements{0};
+    int budget{sweepBudgetCurrent};
+    int level{0};
     std::array<Axis, 12> axes{};
     int axisCount{};
 
@@ -504,7 +531,28 @@ struct SweepSearch {
 
     double cutoff() const {
         return hit.state == Hit::State::Contact && speed > 0
-            ? std::max(0.0, hit.fraction - sweepTolerance / speed) : hit.fraction;
+            ? std::max(0.0, hit.fraction - sweepToleranceCurrent / speed) : hit.fraction;
+    }
+
+    void markUnknown(double first) {
+        unknown = std::min(unknown, first);
+    }
+
+    void noteStop(double first, double last) {
+        // Called after the stop counter was bumped, so a sum of 1 is the first stop.
+        if (traceRecord.budgetStops + traceRecord.toleranceStops == 1) {
+            traceRecord.earliestFirst = first;
+            traceRecord.earliestLast = last;
+            traceRecord.earliestLevel = level;
+        }
+        if (first < traceRecord.earliestFirst) {
+            traceRecord.earliestFirst = first;
+            traceRecord.earliestLast = last;
+            traceRecord.earliestLevel = level;
+        }
+        traceRecord.latestFirst = first;
+        traceRecord.latestLast = last;
+        traceRecord.latestLevel = level;
     }
 
     void sample(const Trilinear& field, Box box, Vec point, double time) {
@@ -519,6 +567,11 @@ struct SweepSearch {
     }
 
     void visit(const Cell& cell, const Trilinear& curvature, Box box, double first, double last, bool seed = false) {
+        LevelGuard guard{level};
+        if (traceOn) {
+            ++traceRecord.visits;
+            traceRecord.depth = std::max(traceRecord.depth, level);
+        }
         last = std::min(last, cutoff());
         if (first > last || hit.initial || !clip(box.expanded(extents), from, delta, first, last)) return;
         const double priorSpan = last - first;
@@ -544,7 +597,12 @@ struct SweepSearch {
         if (!clipPlane(gradient, threshold, first, last) ||
             !clipConstrainedPlane(gradient, threshold, box, extreme, first, last)) return;
         if (budget-- <= 0) {
-            unknown = std::min(unknown, first);
+            markUnknown(first);
+            ++budgetStops;
+            if (traceOn) {
+                ++traceRecord.budgetStops;
+                noteStop(first, last);
+            }
             return;
         }
         sample(curvature, box, from + delta * first + extreme, first);
@@ -569,7 +627,7 @@ struct SweepSearch {
         if (first > last || hit.initial) return;
         const double midpoint = (first + last) * 0.5;
         const double travel = speed * (last - first);
-        if (speed * priorSpan > 2 * sweepTolerance && last - first < priorSpan * 0.4) {
+        if (speed * priorSpan > 2 * sweepToleranceCurrent && last - first < priorSpan * 0.4) {
             visit(cell, curvature, box, first, last);
             return;
         }
@@ -577,13 +635,35 @@ struct SweepSearch {
         sample(curvature, box, deepest, midpoint);
         const int axis = dimensions.x >= dimensions.y && dimensions.x >= dimensions.z ? 0
                        : dimensions.y >= dimensions.z ? 1 : 2;
-        if (travel <= sweepTolerance && dimensions[axis] <= sweepTolerance) {
+        if (travel <= sweepToleranceCurrent && dimensions[axis] <= sweepToleranceCurrent) {
             sample(curvature, box, deepest, last);
             sample(curvature, box, center, midpoint);
-            unknown = std::min(unknown, first);
+            // A hidden contact cannot sit earlier than `first`, so this margin bounds
+            // the most the band can hide. Within the budget it is harmless and is
+            // dropped; beyond it the band would be dishonest to ignore, so spend
+            // geometry instead of honesty and split the cell further.
+            const bool harmless = hit.state == Hit::State::Contact &&
+                (hit.fraction - first) * speed <= 2 * sweepToleranceCurrent;
+            if (!harmless && refinements < sweepRefinementLimit) {
+                ++refinements;
+                Box low = box, high = box;
+                low.hi[axis] = high.lo[axis] = center[axis];
+                if (delta[axis] < 0) std::swap(low, high);
+                visit(cell, curvature, low, first, last);
+                visit(cell, curvature, high, first, last);
+                return;
+            }
+            markUnknown(first);
+            ++toleranceStops;
+            if (traceOn) {
+                ++traceRecord.toleranceStops;
+                noteStop(first, last);
+                traceRecord.stopTravel = travel;
+                traceRecord.stopDimension = dimensions[axis];
+            }
             return;
         }
-        if (travel > sweepTolerance && travel >= dimensions[axis]) {
+        if (travel > sweepToleranceCurrent && travel >= dimensions[axis]) {
             visit(cell, curvature, box, first, midpoint);
             visit(cell, curvature, box, midpoint, last);
         } else {
@@ -597,6 +677,41 @@ struct SweepSearch {
 };
 
 }  // namespace
+
+void setSweepBudget(int budget) {
+    sweepBudgetCurrent = std::max(1, budget);
+}
+
+int sweepBudget() {
+    return sweepBudgetCurrent;
+}
+
+void beginSweepTrace() {
+    traceRecord = SweepTrace{};
+    traceOn = true;
+}
+
+SweepTrace endSweepTrace() {
+    traceOn = false;
+    return traceRecord;
+}
+
+void setSweepTolerance(double meters) {
+    sweepToleranceCurrent = std::clamp(meters, 0.01, 10.0);
+}
+
+double sweepToleranceMeters() {
+    return sweepToleranceCurrent;
+}
+
+void resetSweepDiagnostics() {
+    budgetStops = 0;
+    toleranceStops = 0;
+}
+
+SweepDiagnostics sweepDiagnostics() {
+    return {budgetStops, toleranceStops};
+}
 
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to) {
     Hit hit;
@@ -650,10 +765,15 @@ Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
         if (search.hit.initial || candidate.first > search.cutoff()) break;
         search.visit(candidate.cell, Trilinear(candidate.cell), candidate.box, candidate.first, candidate.last, true);
     }
+    if (traceOn && search.hit.state == Hit::State::Contact) traceRecord.provenFraction = search.hit.fraction;
     if (!search.hit.initial && std::isfinite(search.unknown)) {
-        if (search.hit.state == Hit::State::Miss || (search.hit.fraction - search.unknown) * search.speed > 2 * sweepTolerance) {
-            return {Hit::State::Unresolved, search.unknown};
-        }
+        // A contact hidden in the earliest unresolved interval can sit anywhere in
+        // that interval, including its start, so `unknown` -- the start -- is the
+        // honest bound on how much earlier than the proved contact it could be.
+        const bool hidden = search.hit.state == Hit::State::Miss ||
+            (search.hit.fraction - search.unknown) * search.speed > 2 * sweepToleranceCurrent;
+        if (traceOn) traceRecord.unknownMargin = (search.hit.fraction - search.unknown) * search.speed;
+        if (hidden) return {Hit::State::Unresolved, search.unknown};
     }
     return search.hit;
 }
