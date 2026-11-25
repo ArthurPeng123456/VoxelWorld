@@ -2,6 +2,7 @@
 #include "shaders.hpp"
 #include "shadow_cascades.hpp"
 #include "cloud_noise.hpp"
+#include "temporal_math.hpp"
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -15,6 +16,7 @@
 #include <type_traits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace voxel {
 namespace {
@@ -30,8 +32,10 @@ struct FrameConstants {
     float shadowRows[4][3][4]{};
     float splits[4]{}, texels[4]{}, biases[4]{}, shadow[4]{}, render[4]{}, scattering[4]{}, terrain[4]{};
     float cloudLayer[4]{}, cloudShape[4]{}, cloudRender[4]{}, cloudWind[4]{};
+    float previousRight[4]{}, previousUp[4]{}, previousForward[4]{}, eyeDeltaHi[4]{}, eyeDeltaLo[4]{};
+    float jitter[4]{}, taa[4]{}, taaFilter[4]{}, cloudTemporal[4]{}, cloudTemporalFilter[4]{}, windDelta[4]{};
 };
-static_assert(sizeof(FrameConstants) == 132 * sizeof(float));
+static_assert(sizeof(FrameConstants) == 176 * sizeof(float));
 
 struct RelativeBounds {
     Vec center, extent;
@@ -43,8 +47,8 @@ struct RelativeBounds {
     double maximum(Vec axis) const { return dot(center, axis) + projectionRadius(axis); }
     bool visible(const Camera& camera, double xScale, double yScale) const {
         return maximum(camera.forward) >= camera.nearPlane && -maximum(camera.forward * -1) <= camera.farPlane &&
-               maximum(camera.forward + camera.right * xScale) >= 0 && maximum(camera.forward - camera.right * xScale) >= 0 &&
-               maximum(camera.forward + camera.up * yScale) >= 0 && maximum(camera.forward - camera.up * yScale) >= 0;
+               maximum(camera.forward * 1.01 + camera.right * xScale) >= 0 && maximum(camera.forward * 1.01 - camera.right * xScale) >= 0 &&
+               maximum(camera.forward * 1.01 + camera.up * yScale) >= 0 && maximum(camera.forward * 1.01 - camera.up * yScale) >= 0;
     }
     bool visible(const ShadowCascade& cascade) const {
         for (int axis = 0; axis < 3; ++axis) {
@@ -188,7 +192,7 @@ struct Dx12Renderer::Impl {
 
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        desc.NumDescriptors = buffers + 5;
+        desc.NumDescriptors = buffers + 14;
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(rtv.GetAddressOf())), "Create render target descriptor heap");
         rtvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -196,7 +200,7 @@ struct Dx12Renderer::Impl {
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(dsv.GetAddressOf())), "Create depth descriptor heap");
         dsvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        desc.NumDescriptors = 9;
+        desc.NumDescriptors = 18;
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(srv.GetAddressOf())), "Create shader resource heap");
         srvSize = device->GetDescriptorHandleIncrementSize(desc.Type);
@@ -275,16 +279,86 @@ struct Dx12Renderer::Impl {
         texture(cloudLight, (width + 1) / 2, (height + 1) / 2, 1, hdrFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                 D3D12_CLEAR_VALUE{hdrFormat, {0, 0, 0, 1}});
         device->CreateRenderTargetView(cloudLight.Get(), nullptr, target(buffers + 3));
-        D3D12_CLEAR_VALUE cloudClear{}; cloudClear.Format = DXGI_FORMAT_R32G32_FLOAT;
-        texture(cloudDepth, (width + 1) / 2, (height + 1) / 2, 1, DXGI_FORMAT_R32G32_FLOAT,
+        D3D12_CLEAR_VALUE cloudClear{}; cloudClear.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        texture(cloudDepth, (width + 1) / 2, (height + 1) / 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, cloudClear);
         device->CreateRenderTargetView(cloudDepth.Get(), nullptr, target(buffers + 4));
         shader.Format = hdrFormat;
         device->CreateShaderResourceView(cloudLight.Get(), &shader, shaderView(7));
-        shader.Format = DXGI_FORMAT_R32G32_FLOAT;
+        shader.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         device->CreateShaderResourceView(cloudDepth.Get(), &shader, shaderView(8));
         shader.Format = pixelFormat;
         device->CreateShaderResourceView(nullptr, &shader, shaderView(5)); // Reserved by D3D11 precision tests.
+        texture(motion, width, height, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, cloudClear);
+        device->CreateRenderTargetView(motion.Get(), nullptr, target(buffers + 5));
+        textureView(motion.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 9);
+        for (UINT i = 0; i < 2; ++i) {
+            D3D12_CLEAR_VALUE colorClear{}; colorClear.Format = hdrFormat;
+            texture(taaColor[i], width, height, 1, hdrFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, colorClear);
+            device->CreateRenderTargetView(taaColor[i].Get(), nullptr, target(buffers + 6 + 2 * i));
+            D3D12_CLEAR_VALUE depthClear{}; depthClear.Format = DXGI_FORMAT_R32G32_FLOAT;
+            texture(taaDepth[i], width, height, 1, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, depthClear);
+            device->CreateRenderTargetView(taaDepth[i].Get(), nullptr, target(buffers + 7 + 2 * i));
+            texture(cloudColor[i], (width + 1) / 2, (height + 1) / 2, 1, hdrFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, colorClear);
+            device->CreateRenderTargetView(cloudColor[i].Get(), nullptr, target(buffers + 10 + 2 * i));
+            texture(cloudMetadata[i], (width + 1) / 2, (height + 1) / 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, cloudClear);
+            device->CreateRenderTargetView(cloudMetadata[i].Get(), nullptr, target(buffers + 11 + 2 * i));
+        }
+        textureView(cloudLight.Get(), hdrFormat, 15);
+        textureView(cloudDepth.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 16);
+        resetHistory();
+    }
+
+    void textureView(ID3D12Resource* resource, DXGI_FORMAT format, UINT slot) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = format; view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(resource, &view, shaderView(slot));
+    }
+
+    void resetHistory() { historyValid = false; temporalFrame = 0; }
+
+    void historyViews(UINT read, UINT write, bool taaEnabled, bool cloudEnabled) {
+        textureView(taaColor[read].Get(), hdrFormat, 10);
+        textureView(taaDepth[read].Get(), DXGI_FORMAT_R32G32_FLOAT, 11);
+        textureView(cloudColor[read].Get(), hdrFormat, 12);
+        textureView(cloudMetadata[read].Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 13);
+        textureView(taaEnabled ? taaColor[write].Get() : hdr.Get(), hdrFormat, 14);
+        textureView(cloudEnabled ? cloudColor[write].Get() : cloudLight.Get(), hdrFormat, 7);
+        textureView(cloudEnabled ? cloudMetadata[write].Get() : cloudDepth.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 8);
+    }
+
+    void uploadPreviousObjects(const std::vector<Vertex>& vertices, const Camera& camera) {
+        std::unordered_map<std::uint64_t, std::vector<Vec>> next;
+        for (const auto& vertex : vertices) next[vertex.motionId].push_back(vertex.position);
+        std::unordered_map<std::uint64_t, std::size_t> indices;
+        std::vector<std::array<float, 4>> positions;
+        positions.reserve(std::max<std::size_t>(1, vertices.size()));
+        for (const auto& vertex : vertices) {
+            const auto index = indices[vertex.motionId]++;
+            const auto previous = previousObjects.find(vertex.motionId);
+            const bool valid = previousCamera && previous != previousObjects.end() &&
+                               previous->second.size() == next.at(vertex.motionId).size();
+            const Vec p = valid ? previous->second[index] - previousCamera->eye : vertex.position - camera.eye;
+            positions.push_back({float(p.x), float(p.y), float(p.z), valid ? 1.0f : 0.0f});
+        }
+        if (positions.empty()) positions.push_back({});
+        const auto size = UINT64(positions.size() * sizeof(positions.front()));
+        if (previousObjectUpload.capacity < size) {
+            const auto properties = heap(D3D12_HEAP_TYPE_UPLOAD); const auto desc = buffer(size);
+            require(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(previousObjectUpload.resource.ReleaseAndGetAddressOf())), "Create object motion upload");
+            previousObjectUpload.capacity = size;
+        }
+        void* pointer = nullptr; const D3D12_RANGE noReads{0, 0};
+        require(previousObjectUpload.resource->Map(0, &noReads, &pointer), "Map object motion upload");
+        std::memcpy(pointer, positions.data(), SIZE_T(size)); previousObjectUpload.resource->Unmap(0, nullptr);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = UINT(positions.size()); view.Buffer.StructureByteStride = sizeof(positions.front());
+        device->CreateShaderResourceView(previousObjectUpload.resource.Get(), &view, shaderView(17));
+        previousObjects = std::move(next);
     }
 
     void createCloudNoise() {
@@ -366,12 +440,12 @@ struct Dx12Renderer::Impl {
 
     void createPipelines() {
         D3D12_DESCRIPTOR_RANGE range{};
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 9;
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 18;
         D3D12_ROOT_PARAMETER parameters[3]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[0].Descriptor.ShaderRegister = 0;
         parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        parameters[1].Constants.ShaderRegister = 1; parameters[1].Constants.Num32BitValues = 1;
+        parameters[1].Constants.ShaderRegister = 1; parameters[1].Constants.Num32BitValues = 2;
         parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[2].DescriptorTable.NumDescriptorRanges = 1; parameters[2].DescriptorTable.pDescriptorRanges = &range;
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -383,11 +457,13 @@ struct Dx12Renderer::Impl {
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC desc{};
         desc.NumParameters = UINT(std::size(parameters)); desc.pParameters = parameters;
-        D3D12_STATIC_SAMPLER_DESC samplers[]{sampler, sampler};
+        D3D12_STATIC_SAMPLER_DESC samplers[]{sampler, sampler, sampler};
         samplers[1].ShaderRegister = 1;
         samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplers[2] = samplers[1]; samplers[2].ShaderRegister = 2;
+        samplers[2].AddressU = samplers[2].AddressV = samplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         desc.NumStaticSamplers = UINT(std::size(samplers)); desc.pStaticSamplers = samplers;
         desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ComPtr<ID3DBlob> data;
@@ -416,6 +492,7 @@ struct Dx12Renderer::Impl {
         state.BlendState.RenderTarget[0] = {FALSE,FALSE,D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,
             D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,D3D12_LOGIC_OP_NOOP,D3D12_COLOR_WRITE_ENABLE_ALL};
         state.BlendState.RenderTarget[1] = state.BlendState.RenderTarget[0];
+        state.BlendState.RenderTarget[2] = state.BlendState.RenderTarget[0];
         state.DepthStencilState.DepthEnable = TRUE;
         state.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         state.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
@@ -423,7 +500,8 @@ struct Dx12Renderer::Impl {
         state.DepthStencilState.BackFace = state.DepthStencilState.FrontFace;
         state.InputLayout = {inputs, UINT(std::size(inputs))};
         state.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        state.NumRenderTargets = 2; state.RTVFormats[0] = pixelFormat; state.RTVFormats[1] = hdrFormat;
+        state.NumRenderTargets = 3; state.RTVFormats[0] = pixelFormat; state.RTVFormats[1] = hdrFormat;
+        state.RTVFormats[2] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         state.DSVFormat = depthFormat; state.SampleDesc.Count = 1;
         auto create = [&](const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pso, ComPtr<ID3D12PipelineState>& output, const char* name) {
             require(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(output.ReleaseAndGetAddressOf())), name);
@@ -443,7 +521,8 @@ struct Dx12Renderer::Impl {
         wire.RasterizerState.DepthBias = 2; wire.RasterizerState.SlopeScaledDepthBias = 1;
         create(wire, wireframePipeline, "Create G-buffer wireframe pipeline");
         auto overlay = state;
-        overlay.NumRenderTargets = 1; overlay.RTVFormats[0] = hdrFormat; overlay.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+        overlay.NumRenderTargets = 1; overlay.RTVFormats[0] = hdrFormat;
+        for (int i = 1; i < 8; ++i) overlay.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
         overlay.DepthStencilState.DepthEnable = FALSE;
         overlay.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         overlay.DSVFormat = DXGI_FORMAT_UNKNOWN;
@@ -460,8 +539,15 @@ struct Dx12Renderer::Impl {
         auto clouds = overlay;
         const auto cloudPS = compile("cloudPS", "ps_5_0");
         clouds.PS = {cloudPS->GetBufferPointer(), cloudPS->GetBufferSize()};
-        clouds.NumRenderTargets = 2; clouds.RTVFormats[1] = DXGI_FORMAT_R32G32_FLOAT;
+        clouds.NumRenderTargets = 2; clouds.RTVFormats[1] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         create(clouds, cloudPipeline, "Create half-resolution planetary cloud pipeline");
+        const auto cloudResolve = compile("cloudResolvePS", "ps_5_0");
+        clouds.PS = {cloudResolve->GetBufferPointer(), cloudResolve->GetBufferSize()};
+        create(clouds, cloudResolvePipeline, "Create cloud temporal reconstruction pipeline");
+        const auto temporal = compile("temporalPS", "ps_5_0");
+        clouds.PS = {temporal->GetBufferPointer(), temporal->GetBufferSize()};
+        clouds.RTVFormats[1] = DXGI_FORMAT_R32G32_FLOAT;
+        create(clouds, temporalPipeline, "Create HDR temporal anti-aliasing pipeline");
         const auto postPS = compile("toneMapPS", "ps_5_0");
         overlay.PS = {postPS->GetBufferPointer(), postPS->GetBufferSize()};
         overlay.RTVFormats[0] = pixelFormat;
@@ -566,8 +652,11 @@ struct Dx12Renderer::Impl {
     }
 
     void inspect(const Readback& color, const Readback& sceneDepth, const Readback& normals,
-                 const std::array<Readback, 4>& maps, const Readback& clouds, const std::filesystem::path& capture) {
+                 const std::array<Readback, 4>& maps, const Readback& clouds, const Readback& temporal,
+                 const Readback& rawCloudMetadata, const Readback& resolvedCloudMetadata, const Readback& velocities,
+                 bool historyUsed, const std::filesystem::path& capture) {
         lastDiagnostics = {}; lastDiagnostics.debugLayer = debugLayer;
+        lastDiagnostics.temporalHistoryValid = historyUsed;
         lastDiagnostics.shadowResolution = maps.front().footprint.Footprint.Width;
         readRows(color, [&](UINT, const std::uint8_t* row) {
             const auto* values = reinterpret_cast<const std::uint16_t*>(row);
@@ -619,6 +708,53 @@ struct Dx12Renderer::Impl {
             auto path = capture; path.replace_extension(".cloud-opacity.bmp");
             writeBitmap(path, opacity.data(), w * 4, w, h);
         }
+        if (temporal.resource) readRows(temporal, [&](UINT, const std::uint8_t* row) {
+            const auto* values = reinterpret_cast<const std::uint16_t*>(row);
+            for (UINT x = 0; x < width; ++x) {
+                for (int c = 0; c < 4; ++c) if (!std::isfinite(halfValue(values[x * 4 + c]))) ++lastDiagnostics.invalidValues;
+                lastDiagnostics.taaHistoryPixels += halfValue(values[x * 4 + 3]) > 1;
+            }
+        });
+        if (velocities.resource) readRows(velocities, [&](UINT y, const std::uint8_t* row) {
+            const auto* values = reinterpret_cast<const float*>(row);
+            for (UINT x = 0; x < width; ++x) {
+                for (int c = 0; c < 4; ++c) if (!std::isfinite(values[x * 4 + c])) ++lastDiagnostics.invalidValues;
+                if (values[x * 4 + 3] < 253 || values[x * 4 + 2] <= 0) continue;
+                const double dx = values[x * 4] * width - (x + 0.5), dy = values[x * 4 + 1] * height - (y + 0.5);
+                const double motion = std::hypot(dx, dy);
+                lastDiagnostics.maxObjectMotionPixels = std::max(lastDiagnostics.maxObjectMotionPixels, motion);
+                lastDiagnostics.movingObjectPixels += motion > 2;
+            }
+        });
+        if (rawCloudMetadata.resource) readRows(rawCloudMetadata, [&](UINT, const std::uint8_t* row) {
+            const auto* values = reinterpret_cast<const float*>(row);
+            for (UINT x = 0; x < rawCloudMetadata.footprint.Footprint.Width; ++x) {
+                for (int c = 0; c < 4; ++c) if (!std::isfinite(values[x * 4 + c])) ++lastDiagnostics.invalidValues;
+                lastDiagnostics.cloudTracedPixels += values[x * 4 + 2] > 0;
+                lastDiagnostics.cloudSkippedPixels += values[x * 4 + 2] < 0;
+                lastDiagnostics.cloudRaySteps += std::uint64_t(std::max(0.0f, values[x * 4 + 3]));
+            }
+        });
+        if (resolvedCloudMetadata.resource) readRows(resolvedCloudMetadata, [&](UINT, const std::uint8_t* row) {
+            const auto* values = reinterpret_cast<const float*>(row);
+            for (UINT x = 0; x < resolvedCloudMetadata.footprint.Footprint.Width; ++x) {
+                for (int c = 0; c < 4; ++c) if (!std::isfinite(values[x * 4 + c])) ++lastDiagnostics.invalidValues;
+                lastDiagnostics.cloudFallbackPixels += values[x * 4 + 3] > 0;
+                lastDiagnostics.cloudRaySteps += std::uint64_t(std::max(0.0f, values[x * 4 + 3]));
+            }
+        });
+        if (capture.filename().wstring().find(L"taa-") == 0) {
+            auto path = capture; path.replace_extension(".linear.bin");
+            std::ofstream linear(path, std::ios::binary);
+            const UINT w = std::min<UINT>(256, width), h = std::min<UINT>(256, height);
+            const UINT x = (width - w) / 2, y = (height - h) / 2;
+            const UINT header[]{w, h};
+            linear.write(reinterpret_cast<const char*>(header), sizeof(header));
+            for (const auto* source : {&color, temporal.resource ? &temporal : &color})
+                readRows(*source, [&](UINT row, const std::uint8_t* data) {
+                    if (row >= y && row < y + h) linear.write(reinterpret_cast<const char*>(data + x * 8), w * 8);
+                });
+        }
         auto path = capture; path.replace_extension(".pipeline.txt");
         std::ofstream report(path);
         report << "gbuffer_geometry_pixels=" << lastDiagnostics.geometryPixels
@@ -627,7 +763,14 @@ struct Dx12Renderer::Impl {
                << "\nshadow_resolution=" << lastDiagnostics.shadowResolution
                << "\nd3d12_debug_layer=" << debugLayer
                << "\ncloud_pixels=" << lastDiagnostics.cloudPixels
-               << "\ncloud_max_opacity=" << lastDiagnostics.maxCloudOpacity << '\n';
+               << "\ncloud_max_opacity=" << lastDiagnostics.maxCloudOpacity
+               << "\ntaa_history_valid=" << historyUsed << "\ntaa_history_pixels=" << lastDiagnostics.taaHistoryPixels
+               << "\ncloud_traced_pixels=" << lastDiagnostics.cloudTracedPixels
+               << "\ncloud_skipped_pixels=" << lastDiagnostics.cloudSkippedPixels
+               << "\ncloud_fallback_pixels=" << lastDiagnostics.cloudFallbackPixels
+               << "\ncloud_primary_steps=" << lastDiagnostics.cloudRaySteps
+               << "\nmoving_object_pixels=" << lastDiagnostics.movingObjectPixels
+               << "\nmax_object_motion_pixels=" << lastDiagnostics.maxObjectMotionPixels << '\n';
         for (int i = 0; i < shadowCascadeCount; ++i) report << "cascade_" << i << "_depth_pixels=" << lastDiagnostics.shadowPixels[i] << '\n';
         if (lastDiagnostics.invalidValues) throw std::runtime_error("Pipeline validation found invalid GPU values");
     }
@@ -646,13 +789,29 @@ struct Dx12Renderer::Impl {
         const auto& settings = camera.settings;
         const auto air = atmosphereDimensions(settings);
         setShadowResolution(settings.shadowResolution);
+        const Vec planetEye = camera.eye - camera.planetCenter;
+        if (previousCamera) {
+            const auto& previous = *previousCamera;
+            if (!sameHistorySettings(settings, previous.settings) || camera.terrain != previous.terrain ||
+                camera.terrainSeed != previous.terrainSeed || camera.lodTint != previous.lodTint || camera.wireframe != previous.wireframe ||
+                camera.timeSeconds < previous.timeSeconds || camera.timeSeconds - previous.timeSeconds > 0.25 ||
+                std::abs(camera.farPlane - previous.farPlane) > previous.farPlane * 0.01 ||
+                temporalCameraCut(planetEye, previous.eye - previous.planetCenter, camera.forward, previous.forward,
+                                  camera.up, previous.up, settings)) resetHistory();
+        }
+        const bool validHistory = settings.taaEnabled && historyValid && previousCamera.has_value();
+        const bool cloudAccumulation = settings.taaEnabled && settings.cloudsEnabled && settings.cloudTemporalEnabled;
+        const UINT historyWrite = temporalFrame & 1u, historyRead = 1 - historyWrite;
+        historyViews(historyRead, historyWrite, settings.taaEnabled, cloudAccumulation);
+        uploadPreviousObjects(vertices, camera);
         upload(objects, vertices);
         FrameConstants frame{};
         const Vec sun = unit(Vec{0.45,0.25,0.86});
         const auto ex = splitDouble(camera.eye.x), ey = splitDouble(camera.eye.y), ez = splitDouble(camera.eye.z);
-        const Vec planetEye = camera.eye - camera.planetCenter;
         const auto px = splitDouble(planetEye.x), py = splitDouble(planetEye.y), pz = splitDouble(planetEye.z);
         const float xScale = float(1.92 * double(height) / width), yScale = 1.92f;
+        const auto jitter = temporalJitter(temporalFrame, settings);
+        const std::array<float, 2> jitterNdc{float(2 * jitter[0] / width), float(-2 * jitter[1] / height)};
         const float constants[] = {
             ex.hi,ey.hi,ez.hi,0,ex.lo,ey.lo,ez.lo,0,
             float(camera.right.x),float(camera.right.y),float(camera.right.z),settings.atmosphereEnabled ? 1.0f : 0.0f,
@@ -698,6 +857,28 @@ struct Dx12Renderer::Impl {
         constexpr double windAxes[]{1, 0.37, 0.13};
         for (int i = 0; i < 3; ++i) frame.cloudWind[i] = float(std::fmod(
             camera.timeSeconds * settings.cloudWindSpeed * windAxes[i], settings.cloudFormationKm * 8000));
+        const Camera& previous = previousCamera ? *previousCamera : camera;
+        const Vec eyeDelta = planetEye - (previous.eye - previous.planetCenter);
+        for (int i = 0; i < 3; ++i) {
+            frame.previousRight[i] = float(previous.right[i]); frame.previousUp[i] = float(previous.up[i]);
+            frame.previousForward[i] = float(previous.forward[i]);
+            const auto delta = splitDouble(eyeDelta[i]); frame.eyeDeltaHi[i] = delta.hi; frame.eyeDeltaLo[i] = delta.lo;
+            frame.windDelta[i] = float((camera.timeSeconds - previous.timeSeconds) * settings.cloudWindSpeed * windAxes[i]);
+        }
+        frame.previousRight[3] = previousCamera ? previousProjection[0] : xScale;
+        frame.previousUp[3] = previousCamera ? previousProjection[1] : yScale;
+        frame.previousForward[3] = float(previous.nearPlane);
+        frame.jitter[0] = jitterNdc[0]; frame.jitter[1] = jitterNdc[1];
+        frame.jitter[2] = previousJitter[0]; frame.jitter[3] = previousJitter[1];
+        frame.taa[0] = settings.taaEnabled ? 1.0f : 0.0f; frame.taa[1] = validHistory ? 1.0f : 0.0f;
+        frame.taa[2] = float(settings.taaHistoryWeight); frame.taa[3] = float(settings.taaVarianceGamma);
+        frame.taaFilter[0] = float(settings.taaMotionResponse); frame.taaFilter[1] = float(settings.taaDepthThreshold);
+        frame.taaFilter[2] = float(settings.taaSharpen); frame.taaFilter[3] = float(temporalFrame % 1024);
+        frame.cloudTemporal[0] = cloudAccumulation ? 1.0f : 0.0f;
+        frame.cloudTemporal[1] = validHistory && cloudAccumulation ? 1.0f : 0.0f;
+        frame.cloudTemporal[2] = float(settings.cloudHistoryWeight); frame.cloudTemporal[3] = float(settings.cloudSampling);
+        frame.cloudTemporalFilter[0] = float(settings.cloudDepthThreshold);
+        frame.cloudTemporalFilter[1] = cloudAccumulation ? float(settings.cloudRayJitter) : 0.0f;
         void* mapped = nullptr; const D3D12_RANGE noReads{0,0};
         require(frameUpload->Map(0, &noReads, &mapped), "Map frame constants");
         std::memcpy(mapped, &frame, sizeof(frame));
@@ -713,6 +894,7 @@ struct Dx12Renderer::Impl {
         ID3D12DescriptorHeap* heaps[]{srv.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootConstantBufferView(0, frameUpload->GetGPUVirtualAddress());
         list->SetGraphicsRoot32BitConstant(1, 0, 0);
+        list->SetGraphicsRoot32BitConstant(1, 0, 1);
         list->SetGraphicsRootDescriptorTable(2, srv->GetGPUDescriptorHandleForHeapStart());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         std::vector<const TerrainPage*> visible;
@@ -729,8 +911,10 @@ struct Dx12Renderer::Impl {
                 list->IASetVertexBuffers(0, 1, &view);
                 list->DrawInstanced(count, 1, 0, 0);
             };
+            list->SetGraphicsRoot32BitConstant(1, 0, 1);
             drawBatch(terrain.view, terrain.count);
             for (const auto* page : pages) drawBatch(page->view, page->staging.count);
+            list->SetGraphicsRoot32BitConstant(1, 1, 1);
             drawBatch(objects.view, objects.count);
         };
         // Four conventional-depth CSM layers; scene depth remains reverse Z.
@@ -755,20 +939,23 @@ struct Dx12Renderer::Impl {
         // Geometry/material pass.
         transition(*list.Get(), albedo.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         transition(*list.Get(), normal.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transition(*list.Get(), motion.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         transition(*list.Get(), depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        const D3D12_CPU_DESCRIPTOR_HANDLE targets[]{target(buffers), target(buffers + 1)};
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[]{target(buffers), target(buffers + 1), target(buffers + 5)};
         const auto sceneDsv = depthTarget(0); const float zero[4]{};
         list->ClearRenderTargetView(targets[0], zero, 0, nullptr);
         list->ClearRenderTargetView(targets[1], zero, 0, nullptr);
+        list->ClearRenderTargetView(targets[2], zero, 0, nullptr);
         list->ClearDepthStencilView(sceneDsv, D3D12_CLEAR_FLAG_DEPTH, 0, 0, 0, nullptr);
         if (camera.wireframe) {
             list->OMSetRenderTargets(0, nullptr, FALSE, &sceneDsv);
             list->SetPipelineState(depthPipeline.Get()); geometry(visible);
         }
-        list->OMSetRenderTargets(2, targets, FALSE, &sceneDsv);
+        list->OMSetRenderTargets(3, targets, FALSE, &sceneDsv);
         list->SetPipelineState(camera.wireframe ? wireframePipeline.Get() : surfacePipeline.Get()); geometry(visible);
         transition(*list.Get(), albedo.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), normal.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        transition(*list.Get(), motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(*list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (settings.cloudsEnabled) {
             transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -781,6 +968,15 @@ struct Dx12Renderer::Impl {
             list->SetPipelineState(cloudPipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
             transition(*list.Get(), cloudLight.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             transition(*list.Get(), cloudDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (cloudAccumulation) {
+                transition(*list.Get(), cloudColor[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                transition(*list.Get(), cloudMetadata[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                const D3D12_CPU_DESCRIPTOR_HANDLE resolved[]{target(buffers + 10 + 2 * historyWrite), target(buffers + 11 + 2 * historyWrite)};
+                list->OMSetRenderTargets(2, resolved, FALSE, nullptr);
+                list->SetPipelineState(cloudResolvePipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
+                transition(*list.Get(), cloudColor[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                transition(*list.Get(), cloudMetadata[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
             list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
         }
         // Linear HDR lighting, sky and aerial perspective share one HDR target.
@@ -789,6 +985,7 @@ struct Dx12Renderer::Impl {
         list->OMSetRenderTargets(1, &hdrTarget, FALSE, nullptr);
         list->SetPipelineState(lightingPipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
         if (clipmapLines.count) {
+            list->SetGraphicsRoot32BitConstant(1, 0, 1);
             list->SetPipelineState(linePipeline.Get());
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
             list->IASetVertexBuffers(0, 1, &clipmapLines.view);
@@ -796,18 +993,33 @@ struct Dx12Renderer::Impl {
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
         transition(*list.Get(), hdr.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (settings.taaEnabled) {
+            transition(*list.Get(), taaColor[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(*list.Get(), taaDepth[historyWrite].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const D3D12_CPU_DESCRIPTOR_HANDLE resolved[]{target(buffers + 6 + 2 * historyWrite), target(buffers + 7 + 2 * historyWrite)};
+            list->OMSetRenderTargets(2, resolved, FALSE, nullptr);
+            list->SetPipelineState(temporalPipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
+            transition(*list.Get(), taaColor[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            transition(*list.Get(), taaDepth[historyWrite].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
         const UINT index = swap->GetCurrentBackBufferIndex(); const auto backTarget = target(index);
         transition(*list.Get(), back[index].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->OMSetRenderTargets(1, &backTarget, FALSE, nullptr);
         list->SetPipelineState(tonePipeline.Get()); list->DrawInstanced(3, 1, 0, 0);
-        Readback screenshot, hdrRead, depthRead, normalRead, cloudRead;
+        Readback screenshot, hdrRead, depthRead, normalRead, cloudRead, temporalRead, rawCloudMetadataRead, resolvedCloudMetadataRead, motionRead;
         std::array<Readback, 4> shadowRead;
         if (!capture.empty()) screenshot = copyReadback(back[index].Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (inspectPipeline) {
             hdrRead = copyReadback(hdr.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             depthRead = copyReadback(depth.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             normalRead = copyReadback(normal.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            if (settings.cloudsEnabled) cloudRead = copyReadback(cloudLight.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            motionRead = copyReadback(motion.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (settings.taaEnabled) temporalRead = copyReadback(taaColor[historyWrite].Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (settings.cloudsEnabled) {
+                cloudRead = copyReadback(cloudAccumulation ? cloudColor[historyWrite].Get() : cloudLight.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                rawCloudMetadataRead = copyReadback(cloudDepth.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                if (cloudAccumulation) resolvedCloudMetadataRead = copyReadback(cloudMetadata[historyWrite].Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
             for (UINT i = 0; i < shadowCascadeCount; ++i)
                 shadowRead[i] = copyReadback(shadows.Get(), i, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
@@ -815,13 +1027,16 @@ struct Dx12Renderer::Impl {
         require(list->Close(), "Close draw command list");
         ID3D12CommandList* commands[]{list.Get()}; queue->ExecuteCommandLists(1, commands); submitted = true;
         const HRESULT presented = swap->Present(1,0); wait(); require(presented, "Present frame");
+        previousCamera = camera; previousJitter = jitterNdc; previousProjection = {xScale, yScale};
+        historyValid = settings.taaEnabled; ++temporalFrame;
         if (screenshot.resource) {
             void* bytes = nullptr; require(screenshot.resource->Map(0, nullptr, &bytes), "Read screenshot");
             writeBitmap(capture, static_cast<const std::uint8_t*>(bytes) + screenshot.footprint.Offset,
                         screenshot.footprint.Footprint.RowPitch, width, height);
             const D3D12_RANGE noWrites{0,0}; screenshot.resource->Unmap(0, &noWrites);
         }
-        if (inspectPipeline) inspect(hdrRead, depthRead, normalRead, shadowRead, cloudRead, capture);
+        if (inspectPipeline) inspect(hdrRead, depthRead, normalRead, shadowRead, cloudRead, temporalRead,
+                                     rawCloudMetadataRead, resolvedCloudMetadataRead, motionRead, validHistory, capture);
     }
 
     HWND window;
@@ -846,6 +1061,15 @@ struct Dx12Renderer::Impl {
     std::map<Key, TerrainPage> terrainPages;
     std::map<Key, TerrainPage> stagedTerrainPages;
     bool terrainCopiesPending{};
+    ComPtr<ID3D12Resource> motion;
+    std::array<ComPtr<ID3D12Resource>, 2> taaColor, taaDepth, cloudColor, cloudMetadata;
+    ComPtr<ID3D12PipelineState> cloudResolvePipeline, temporalPipeline;
+    bool historyValid{};
+    unsigned temporalFrame{};
+    std::optional<Camera> previousCamera;
+    std::array<float, 2> previousJitter{}, previousProjection{};
+    Upload previousObjectUpload;
+    std::unordered_map<std::uint64_t, std::vector<Vec>> previousObjects;
 };
 
 Dx12Renderer::Dx12Renderer(HWND target, bool forceWarp, bool debug) : impl_(std::make_unique<Impl>(target, forceWarp, debug)) {}
@@ -855,6 +1079,7 @@ void Dx12Renderer::setTerrain(const std::vector<Vertex>& terrain) {
     impl_->upload(impl_->terrain, terrain);
 }
 void Dx12Renderer::clearTerrain() {
+    impl_->resetHistory();
     impl_->terrainPages.clear();
     impl_->stagedTerrainPages.clear();
     impl_->terrainCopiesPending = false;
@@ -878,6 +1103,7 @@ void Dx12Renderer::publishTerrainPages() {
 }
 void Dx12Renderer::setClipmapLines(const std::vector<Vertex>& lines) { impl_->upload(impl_->clipmapLines, lines); }
 void Dx12Renderer::setShadowResolution(int resolution) { impl_->setShadowResolution(resolution); }
+void Dx12Renderer::resetTemporalHistory() { impl_->resetHistory(); }
 void Dx12Renderer::draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture, bool inspectPipeline) {
     impl_->draw(camera, objects, capture, inspectPipeline);
 }

@@ -9,6 +9,9 @@ R"voxelshader(
 @VOXEL_ATMOSPHERE_SHADER@
 )voxelshader"
 R"voxelshader(
+@VOXEL_TEMPORAL_COMMON_SHADER@
+)voxelshader"
+R"voxelshader(
 @VOXEL_TERRAIN_MATERIAL_SHADER@
 )voxelshader"
 R"voxelshader(
@@ -16,5 +19,8 @@ R"voxelshader(
 )voxelshader"
 R"voxelshader(
 @VOXEL_DEFERRED_SHADER@
+)voxelshader"
+R"voxelshader(
+@VOXEL_TEMPORAL_RESOLVE_SHADER@
 )voxelshader";
 }

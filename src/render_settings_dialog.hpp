@@ -6,6 +6,6 @@
 
 namespace voxel {
 
-bool editRenderSettings(HWND owner, RenderSettings& settings);
+bool editRenderSettings(HWND owner, RenderSettings& settings, const RenderSettings& defaults = {});
 
 } // namespace voxel

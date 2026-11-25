@@ -3,7 +3,7 @@
 Texture2D<float> gDepth : register(t2);
 Texture3D<float4> cloudNoise : register(t6);
 Texture2D<float4> cloudLighting : register(t7);
-Texture2D<float2> cloudDistances : register(t8);
+Texture2D<float4> cloudDistances : register(t8);
 SamplerState cloudSampler : register(s1);
 
 float cloudLod(float footprint, float period) {
@@ -91,27 +91,40 @@ float cloudSun(float3 position, float height, float footprint, float2 weather) {
     return exp(-cloudLayer.w * optical);
 }
 
-struct CloudOutput { float4 light : SV_Target0; float2 distances : SV_Target1; };
-CloudOutput cloudPS(Sky input) {
-    CloudOutput result;
-    result.light = float4(0, 0, 0, 1);
-    float2 uv = input.clip.xy / cloudRender.zw;
+struct CloudRay { float3 ray; float opaqueDistance; float4 intervals; float referenceDistance; };
+CloudRay makeCloudRay(float2 uv) {
+    CloudRay camera;
+    camera.intervals = 0; camera.referenceDistance = 0;
     int2 pixel = min(int2(uv * renderParams.xy), int2(renderParams.xy) - 1);
     float depth = gDepth.Load(int3(pixel, 0));
-    float2 ndc = uv * float2(2, -2) + float2(-1, 1);
-    float3 view = cameraForward.xyz + cameraRight.xyz * (ndc.x / projection.x) + cameraUp.xyz * (ndc.y / projection.y);
+    float3 view = cameraRay(uv);
     float viewLength = length(view);
     float3 ray = view / viewLength;
     float opaqueDistance = depth > 0 ? (projection.z / depth) * viewLength : projection.w;
-    result.distances = float2(0, opaqueDistance);
-    if (cloudRender.x < 0.5 || cloudLayer.z <= 0 || cloudLayer.w <= 0) return result;
+    camera.ray = ray; camera.opaqueDistance = opaqueDistance;
+    if (cloudRender.x < 0.5 || cloudLayer.z <= 0 || cloudLayer.w <= 0) return camera;
     float limit = opaqueDistance;
     // Only limit cloud integration at the planet: this never draws ground or
     // writes scene depth, which remains entirely supplied by actual meshes.
     float2 ground;
     if (dfRaySphere(planetEye(), ray, float2(atmosphere.x + terrainParams.z, 0), ground) && ground.x > 0)
         limit = min(limit, ground.x);
-    float4 intervals = cloudIntervals(planetEye(), ray, limit);
+    camera.intervals = cloudIntervals(planetEye(), ray, limit);
+    camera.referenceDistance = 0.5 * (camera.intervals.x + camera.intervals.y);
+    return camera;
+}
+struct CloudOutput { float4 light : SV_Target0; float4 distances : SV_Target1; };
+CloudOutput traceCloud(CloudRay camera, int2 pixel) {
+    CloudOutput result;
+    result.light = float4(0, 0, 0, 1);
+    result.distances = float4(camera.referenceDistance, camera.opaqueDistance, 0, 0);
+    float4 intervals = camera.intervals;
+    if (intervals.y <= intervals.x) return result;
+    result.distances.z = 1;
+    float3 ray = camera.ray;
+    uint hash = uint(pixel.x) * 1597334677u ^ uint(pixel.y) * 3812015801u ^ uint(taaFilter.w) * 747796405u;
+    hash = (hash ^ (hash >> 16)) * 2246822519u;
+    float sampleOffset = 0.5 + (float(hash & 65535u) / 65535 - 0.5) * cloudTemporalFilter.y;
     float transmittance = 1, weightedDistance = 0, weight = 0;
     float3 radiance = 0;
     float mu = dot(ray, sunlight.xyz);
@@ -131,7 +144,8 @@ CloudOutput cloudPS(Sky input) {
         [loop] for (int i = 0; i < steps; ++i) {
             float a = float(i) / steps, b = float(i + 1) / steps;
             float s0 = lerp(a, a * a, curve), s1 = lerp(b, b * b, curve);
-            float step = span * (s1 - s0), t = span * 0.5 * (s0 + s1), distance = start + t;
+            float step = span * (s1 - s0), t = span * lerp(s0, s1, sampleOffset), distance = start + t;
+            result.distances.w += 1;
             float localDelta = delta + t * (2 * radial + t * raySquared);
             float height = localDelta / (sqrt(max(0, atmosphere.x * atmosphere.x + localDelta)) + atmosphere.x);
             float3 position = anchor.hi + (anchor.lo + ray * t);
@@ -166,6 +180,25 @@ CloudOutput cloudPS(Sky input) {
     return result;
 }
 
+CloudOutput cloudPS(Sky input) {
+    int2 pixel = int2(input.clip.xy);
+    CloudRay camera = makeCloudRay(input.clip.xy / cloudRender.zw);
+    uint phase = uint(taaFilter.w);
+    // Rotate the phase between cycles so a pixel is not permanently paired
+    // with one subset of the Halton jitter sequence (especially its base-2 X).
+    uint checkerPhase = phase + (phase >> 1u), quarterPhase = phase + (phase >> 2u);
+    bool active = cloudTemporal.w < 0.5 || (cloudTemporal.w < 1.5
+        ? ((uint(pixel.x + pixel.y) + checkerPhase) & 1u) == 0
+        : ((uint(pixel.x) & 1u) | ((uint(pixel.y) & 1u) << 1u)) == (quarterPhase & 3u));
+    if (cloudTemporal.x > 0.5 && cloudTemporal.y > 0.5 && !active && camera.intervals.y > camera.intervals.x) {
+        CloudOutput skipped;
+        skipped.light = float4(0, 0, 0, -1); // Never composed directly; temporal resolve fills this pixel.
+        skipped.distances = float4(camera.referenceDistance, camera.opaqueDistance, -1, 0);
+        return skipped;
+    }
+    return traceCloud(camera, pixel);
+}
+
 float3 compositeClouds(float3 background, float2 uv, float opaqueDistance) {
     if (cloudRender.x < 0.5 || cloudLayer.z <= 0 || cloudLayer.w <= 0) return background;
     float2 p = uv * cloudRender.zw - 0.5;
@@ -175,7 +208,7 @@ float3 compositeClouds(float3 background, float2 uv, float opaqueDistance) {
     float totalWeight = 0;
     [unroll] for (int y = 0; y < 2; ++y) [unroll] for (int x = 0; x < 2; ++x) {
         int2 pixel = clamp(first + int2(x, y), int2(0, 0), int2(cloudRender.zw) - 1);
-        float2 distances = cloudDistances.Load(int3(pixel, 0));
+        float2 distances = cloudDistances.Load(int3(pixel, 0)).xy;
         float w = (x ? fraction.x : 1 - fraction.x) * (y ? fraction.y : 1 - fraction.y);
         // Reject low-resolution samples across foreground/sky discontinuities.
         w *= exp(-abs(distances.y - opaqueDistance) / max(100, opaqueDistance * 0.015));

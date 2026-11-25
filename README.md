@@ -46,7 +46,7 @@ GPU 测试包含 139 组数据，检查 df64 运算、毫米高度、地平线�
 
 DX12 地形顶点按空间分组缓存到 GPU。主视图和每级阴影各自剔除落在绘制范围外的分组。
 
-原生查看器的 RGBA8 G-buffer 保存地形高度、坡度与坑缘材质权重、其他物体的线性材质颜色及材质标记。RGBA16F G-buffer 保存世界法线与粗糙度，另有可读取的 D32 反向深度。全屏光照阶段从深度重建相机相对位置，计算方向光、环境光、镜面高光、级联阴影和大气空气透视。天空和调试线框也在线性 HDR 空间合成，最终统一处理曝光、ACES filmic 近似曲线和 sRGB 输出转换。场景颜色使用 `R16G16B16A16_FLOAT`，可以保留大于 1 的亮度；当前显示输出为色调映射后的 sRGB/SDR。[HDR 渲染参考](https://github.com/microsoft/DirectXTK12/wiki/Using-HDR-rendering) · [色调映射曲线来源](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
+原生查看器的 RGBA8 G-buffer 保存地形高度、坡度与坑缘材质权重、其他物体的线性材质颜色及材质标记。RGBA16F G-buffer 保存世界法线与粗糙度，RGBA32F 保存前帧屏幕位置、前帧视图深度和材质标记，另有可读取的 D32 反向深度。全屏光照阶段从深度重建相机相对位置，计算方向光、环境光、镜面高光、级联阴影和大气空气透视。天空和调试线框也在线性 HDR 空间合成，经过 TAA 后统一处理曝光、ACES filmic 近似曲线和 sRGB 输出转换。场景颜色使用 `R16G16B16A16_FLOAT`，可以保留大于 1 的亮度；当前显示输出为色调映射后的 sRGB/SDR。[HDR 渲染参考](https://github.com/microsoft/DirectXTK12/wiki/Using-HDR-rendering) · [色调映射曲线来源](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
 
 地形着色使用程序化海拔与其梯度生成的平滑法线。随着网格采样间距和每像素覆盖面积增大，细节逐步过渡到星球径向法线和基准颜色。远景大气光程也平滑过渡到参考球面深度。截图验证在关闭大气和阴影的轨道画面中检查环纹及块边界。
 
@@ -67,9 +67,9 @@ CSM 使用四张深度图，默认每张 1024×1024，按对数与均匀混合�
 
 云场采用分层尺度：默认 1,400 公里级的连续球面天气分布决定大片云区与晴空，45 公里级的三维场塑造其中的云团，更细的 Worley 侵蚀只在近处可分辨时参与。天气分布随星球方向采样，云形使用行星相对坐标，不随摄像机重新生成。每个采样点根据像素足迹和积分步长选择三维噪声 mip，并渐隐无法分辨的小云团与侵蚀，保留全球天气形态，减少轨道远景中密集平铺细节的观感。近处采用更密的非均匀步进。
 
-GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交段，支持云层内外摄像机与公共大坐标平移。云先按两个方向各一半的分辨率积分，计算 Beer–Lambert 消光、四次光照路径采样的自遮挡、前后向散射和经验多次散射补光，再按场景深度上采样合成到线性 HDR。地形接收低频天气阴影；前景不透明物体遮挡云。大气以云的贡献加权平均深度近似处理前方空气透视。64³ RGBA 噪声含完整 mip，约 1.14 MiB；云渲染目标额外占用约每个全分辨率像素 4 字节。
+GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交段，支持云层内外摄像机与公共大坐标平移。云先按两个方向各一半的分辨率积分，计算 Beer–Lambert 消光、四次光照路径采样的自遮挡、前后向散射和经验多次散射补光，经过独立的时域重建后，再按场景深度上采样合成到线性 HDR。地形接收低频天气阴影；前景不透明物体遮挡云。大气以云的贡献加权平均深度近似处理前方空气透视。64³ RGBA 噪声含完整 mip，约 1.14 MiB；原始云颜色与深度元数据目标约为每个全分辨率像素 6 字节，时域历史另计。
 
-这是一版针对当前项目的原型，并非复现 StarEngine 的内部实现。公开参考：[CIG 对轨道云细节重复问题的说明](https://robertsspaceindustries.com/en/comm-link/transmission/18251-Star-Citizen-Monthly-Report-July-2021)、[逐采样点纹理 LOD、散射与阴影](https://robertsspaceindustries.com/en/comm-link/transmission/18025-Squadron-42-Monthly-Report-February-2021)、[Guerrilla 的天气与噪声建模](https://www.guerrilla-games.com/read/nubis-authoring-real-time-volumetric-cloudscapes-with-the-decima-engine)。当前没有天气物理模拟、历史帧重投影或云体编辑；全局天气静态，风驱动局部云形。低分辨率深度过滤和有限步数在复杂遮挡与掠射角仍有误差，多次散射、地面云影及大气耦合均为近似。
+这是一版针对当前项目的原型，并非复现 StarEngine 的内部实现。公开参考：[CIG 对轨道云细节重复问题的说明](https://robertsspaceindustries.com/en/comm-link/transmission/18251-Star-Citizen-Monthly-Report-July-2021)、[逐采样点纹理 LOD、散射与阴影](https://robertsspaceindustries.com/en/comm-link/transmission/18025-Squadron-42-Monthly-Report-February-2021)、[Guerrilla 的天气与噪声建模](https://www.guerrilla-games.com/read/nubis-authoring-real-time-volumetric-cloudscapes-with-the-decima-engine)。当前没有天气物理模拟或云体编辑；全局天气静态，风驱动局部云形。低分辨率深度过滤和有限步数在复杂遮挡与掠射角仍有误差，多次散射、地面云影及大气耦合均为近似。
 
 命令行支持 `--clouds` / `--no-clouds`、`--cloud-base-km`、`--cloud-thickness-km`、`--cloud-coverage`、`--cloud-density`、`--cloud-weather-km`、`--cloud-formation-km`、`--cloud-wind-speed`、`--cloud-steps 32|64|96`。例如：
 
@@ -79,17 +79,57 @@ GPU 使用 df64 求球壳区间及积分锚点，保留空心云层的两个交�
 python scripts/validate-cloud-captures.py results-clouds
 ```
 
-`--capture-clouds` 生成轨道开关、零覆盖、零消光、两档采样质量、云下、地平线、云内、风、10¹² 米公共平移和前景遮挡共 14 个视图，以及云的不透明度图和 GPU 缓冲检查报告。GPU 数值测试增加球壳求交与云内视角，总计 139 组用例，同时检查噪声 mip 保持均值并降低方差。已有 `--capture-dir` 保持关闭云的地形与大气参考画面。
+`--capture-clouds` 生成轨道开关、零覆盖、零消光、两档采样质量、云下、地平线、云内、风、10¹² 米公共平移和前景遮挡共 14 个视图，以及云的不透明度图和 GPU 缓冲检查报告。GPU 数值测试增加球壳求交与云内视角，总计 139 组用例，同时检查噪声 mip 保持均值并降低方差。已有 `--capture-dir` 保持关闭云的地形与大气参考画面；这两个参考截图模式均关闭 TAA，时域功能使用下述专项场景验证。
+
+### TAA 与体积云时域重建
+
+默认开启 TAA，流程为 G-buffer → 云积分与云时域重建 → 延迟 HDR 光照 → 场景 TAA → 输出锐化、曝光与色调映射。投影采用 Halton(2,3) 亚像素抖动，可选择 8 / 16 / 32 帧周期，默认 16 帧、1 像素范围。场景历史在未曝光的线性 HDR 空间累积，使用深度和材质拒绝、YCoCg 邻域与方差裁剪、亮度加权混合，以及随运动降低的历史权重。锐化仅作用于最终输出，不反馈到历史。
+
+场景 TAA 的输出与历史统一保存在不抖动的像素网格上：用当前投影偏移重建抖动后的 HDR 输入，再从运动数据中扣除上一帧投影偏移，并补偿选中深度样本的亚像素位置。天空也使用同一套坐标约定。直接把抖动后的栅格颜色输出到固定屏幕，会使整个画面跟随 Halton 序列高频晃动，即使历史重投影本身是正确的。这里保留投影抖动的抗锯齿采样作用，在重建阶段去掉它对最终画面位置的影响。
+
+地形重投影使用前后帧相机基向量和 CPU double 计算后拆分的行星相对位移，避免把巨大世界坐标转成 float。刚体和 Invoker 标记通过稳定标识及顶点序号保存上一帧位置，包含自身平移与旋转；新增物体或拓扑变化不会继承无效运动。天空使用方向重投影，调试线框作为高响应覆盖层。切换场景、修改渲染参数、窗口缩放、相机瞬移或大角度转向都会清空历史；正常地形流式发布通过逐像素深度与材质检查处理。
+
+云具有独立的半分辨率双缓冲历史，按贡献加权平均深度重投影，并补偿局部云形的风位移。采样方式可选全采样、二相棋盘格（每帧约 1/2 像素）或四相 2×2（约 1/4 像素），默认二相。相位在周期之间轮换，避免长期只使用 Halton 序列的一个子集；积分点随机偏移随时间变化，由历史累积降低条带和噪声。历史越界、遮挡变化、无可用邻域或冷启动时，缺失像素当帧补做完整射线积分。关闭 TAA 或云时域重建会自动回到全采样，并关闭云射线的时间抖动。最终场景 TAA 根据云不透明度降低二次累积，减少与地面运动不同的云拖影。
+
+稀疏云只对当帧真正积分过的像素做当前邻域裁剪。未采样像素保留通过深度、遮挡及风重投影检查的自身历史，避免把四相模式下仅有一个有效邻居的退化裁剪框当成当前像素颜色，导致云图案随相位跳动。无效历史仍即时补采样。
+
+参考：[Karis 的 High Quality Temporal Supersampling](https://www.advances.realtimerendering.com/s2014/index.html)、[Salvi 的 Temporal Supersampling 与方差裁剪](https://developer.download.nvidia.com/gameworks/events/GDC2016/msalvi_temporal_supersampling.pdf)。当前云重投影用单一平均深度近似整个体积，复杂多层云、快速移动与掠射角仍可能有误差。提高历史权重可降低闪烁，也可能增加残影；降低历史权重、提高 Motion response 可以提高运动响应。TAA 对极细特征可能产生软化，可调整裁剪、历史和输出锐化。
+
+TAA 的运动目标和场景历史合计约为每个全分辨率像素 48 字节，云历史约为 12 字节，总计在 1920×1080 下约 119 MiB（不含资源对齐、原有 G-buffer 和云原始目标）。这些资源随窗口尺寸预分配；关闭时域过滤会跳过相关渲染与棋盘格流程，但保留分配。
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --taa --taa-samples 16 --taa-history 0.9 --taa-sharpen 0.15 --cloud-sampling checkerboard
+.\build-windows-native\dist\VoxelWorldViewer.exe --cloud-sampling quarter --cloud-history 0.92 --cloud-ray-jitter 0.85
+.\build-windows-native\dist\VoxelWorldViewer.exe --no-taa
+.\build-windows-native\dist\VoxelWorldViewer.exe --capture-temporal results-temporal
+python scripts/validate-temporal-captures.py results-temporal
+.\build-windows-native\dist\VoxelWorldViewer.exe --warp --capture-temporal results-temporal-warp
+python scripts/validate-temporal-captures.py results-temporal-warp
+```
+
+`--capture-temporal` 生成 36 个视图及 GPU 报告。它用 16 个独立抖动样本的线性 HDR 均值验证静态边缘误差，检查移动刚体的运动数据与色彩拖影、平移视角、相机切换、窗口缩放、10¹² 米公共平移、云采样档位、关闭／重启 TAA、前景遮挡出现和移除后的补采样，以及风驱动重投影。测试也输出中央 256² 像素的原始与累积 HDR 数据，避免仅凭色调映射后的截图判断抗锯齿。修正输出网格后，专项场景边缘 RMSE 约降低 63%，移动目标未检测到长色彩拖影，公共平移基准逐像素一致。轨道测试充分预热后，二相与四相云的主射线积分步数约为全采样的 50% 和 26%；这衡量主射线工作量，不等同于整个渲染器的耗时或帧率倍率。GPU 精度测试还编译全部 10 个发布版着色器入口。
+
+连续帧稳定性使用另一组固定机位、冻结模拟时间的场景验证。每组预热 64 帧，再采集 32 帧，覆盖无云轨道、全／二相云轨道、二相／四相云地平线，以及关闭投影抖动或云积分抖动的对照组。脚本检查历史连续有效、GPU 数值有限性和画面亮度的帧间二阶差分 RMS，避免单张截图通过但连续画面抖动。相对修复前的同机位结果，无云场景高频变化从 6.020 降到 0.229（约减少 96%），默认二相云轨道从 6.266 降到 0.788（约减少 87%），四相云地平线从 0.772 降到 0.140（约减少 82%）；数值单位为 8 位显示亮度级，属于这些固定测试场景的结果。
+
+```powershell
+.\build-windows-native\dist\VoxelWorldViewer.exe --capture-stability results-stability
+python scripts/validate-temporal-stability.py results-stability
+.\build-windows-native\dist\VoxelWorldViewer.exe --warp --capture-stability results-stability-warp
+python scripts/validate-temporal-stability.py results-stability-warp
+# 可选：与保留的修复前连续帧目录比较
+python scripts/validate-temporal-stability.py results-stability --baseline results-stability-before
+```
 
 ### 渲染设置
 
-工具栏 **`Render settings...`** 打开设置窗口。点击 `Apply` 即可应用到当前场景，`Defaults` 恢复初始参数。`J`、`H` 和 `[` / `]` 继续快速切换阴影、大气和曝光。
+工具栏 **`Render settings...`** 打开包含 **CSM / Atmosphere / Clouds / TAA / HDR** 五个 tab 页的设置窗口。切换页签保留尚未应用的输入；点击 `Apply` 验证全部页面、应用到当前场景并清空时域历史，`Defaults` 恢复各页初始参数，`Cancel` 放弃本次编辑。`J`、`H`、`V` 和 `[` / `]` 继续快速切换阴影、大气、云和曝光。
 
 | 分组 | 可调参数 |
 | --- | --- |
 | CSM | 开关、每级 Shadow Map 分辨率（1024² / 2048² / 4096²）、距离上限、对数分割权重、法线和深度偏移倍率 |
 | 大气 | 开关、厚度、Rayleigh / Mie 各自的尺度高度与散射强度、Mie 各向异性 |
-| 体积云 | 开关、云底、厚度、覆盖、消光、天气与云团尺度、风速、采样质量 |
+| 体积云 | 开关、云底、厚度、覆盖、消光、天气与云团尺度、风速、采样质量；时域重建开关、全／二相／四相采样、历史权重、深度拒绝、射线抖动 |
+| TAA | 开关、8 / 16 / 32 帧抖动周期、历史权重、抖动范围、方差裁剪 gamma、深度拒绝、运动响应、输出锐化、相机切换的距离与角度阈值 |
 | HDR | 曝光（−10 到 +10 EV）和色调映射（ACES、Reinhard、线性裁剪） |
 
 `Thickness (km)` 同时调整大气外边界和密度曲线的垂直尺度。Rayleigh 与 Mie 的尺度高度按 100 公里厚度填写，运行时随厚度等比缩放。例如默认 Rayleigh 尺度高度为 8 公里，厚度调到 200 公里时对应的实际尺度高度为 16 公里。轨道截图验证固定机位，只切换 100 公里与 300 公里厚度，检查外缘光晕的变化。
@@ -97,6 +137,8 @@ python scripts/validate-cloud-captures.py results-clouds
 四张 D32 阴影贴图的显存用量分别约为 16、64、256 MiB。切换分辨率时会重建阴影资源。HDR 场景仍通过色调映射输出到 sRGB/SDR 交换链。
 
 命令行可用 `--shadow-resolution`、`--shadow-distance-km`、`--shadow-split-blend`、`--shadow-normal-bias`、`--shadow-depth-bias` 设置 CSM。大气对应 `--atmosphere-height-km`、`--rayleigh-height-km`、`--mie-height-km`、`--rayleigh-strength`、`--mie-strength`、`--mie-anisotropy` 和 `--no-atmosphere`。HDR 使用 `--exposure` 和 `--tone-map aces|reinhard|linear`。
+
+TAA 使用 `--taa` / `--no-taa`、`--taa-samples 8|16|32`、`--taa-history`、`--taa-jitter`、`--taa-variance`、`--taa-depth-threshold`、`--taa-motion-response`、`--taa-sharpen`、`--taa-cut-distance-km`、`--taa-cut-angle`。云时域参数为 `--cloud-temporal` / `--no-cloud-temporal`、`--cloud-sampling full|checkerboard|quarter`、`--cloud-history`、`--cloud-depth-threshold`、`--cloud-ray-jitter`。
 
 ```powershell
 .\build-windows-native\dist\VoxelWorldViewer.exe --shadow-resolution 2048 --shadow-distance-km 80 --atmosphere-height-km 80 --exposure -0.5 --tone-map reinhard
@@ -124,7 +166,7 @@ python scripts/validate-cloud-captures.py results-clouds
 | 开关大气散射和地形空气透视（默认开启） | `H` 或 `Atmosphere [H]` |
 | 开关行星体积云（默认开启） | `V` 或 `Clouds [V]` |
 | 开关 CSM 阴影（默认开启） | `J` 或 `Shadows [J]` |
-| 调整 CSM、大气和 HDR | 工具栏 `Render settings...` |
+| 调整 CSM、大气、云、TAA 和 HDR | 工具栏 `Render settings...` 的对应 tab 页 |
 | 选择星球地形和材质 | 工具栏 `Terrain` |
 | 降低／提高曝光 0.5 EV | `[` / `]` |
 | 向当前 Invoker 附近投放一组球、胶囊和盒子 | `B` |
@@ -147,6 +189,8 @@ python scripts/validate-cloud-captures.py results-clouds
 | Classic | 原有的球面起伏和撞击坑 | 原有的灰色高度与坡度着色 |
 | Mars Craters | 全星球分布的撞击坑，从几十米级小坑到千公里级盆地，带坑缘、外侧抛射堆积和中央隆起 | 氧化铁红尘、深色坑缘、岩区和岩屑 |
 | Volcanic Highlands | 山脊、熔岩沟槽、宽广火山口及周围起伏 | 深色玄武岩、灰褐火山灰和氧化岩区 |
+
+Mars Craters 的默认大气厚度为 **300 km**，云底为 **6 km**、云层厚度为 **24 km**、天气覆盖为 **0.35**；其余大气与云参数使用设置窗口中的初始值，包括开启大气和云、64 步积分、二相棋盘格和云时域重建。启动 `--terrain mars`、在界面切换到 Mars Craters 或在该星球的渲染设置中点击 `Defaults` 都会使用对应默认值。命令行显式指定的渲染参数优先于启动预设，与参数顺序无关。切换其他星球时，大气厚度、云层厚度与覆盖率恢复各自预设值。
 
 预设使用当前工程的星球尺度和 LOD。区域起伏和坑形进入四种后端共用的 SDF。新预设的完全空区和实心区在远离零面时压缩为常量块。两套新材质使用连续的球面色区和 64、16、4 米三档程序化纹理，随屏幕像素覆盖范围渐隐。4 米层包含材质法线起伏。F 从轨道切到 Invoker 附近，滚轮可拉近看颗粒和坑壁。
 

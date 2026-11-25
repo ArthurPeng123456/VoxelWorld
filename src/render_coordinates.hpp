@@ -16,7 +16,7 @@ inline FloatPair splitDouble(double value) {
     const float hi = static_cast<float>(value);
     return {hi, static_cast<float>(value - static_cast<double>(hi))};
 }
-struct Vertex { Vec position, normal; std::uint32_t color; };
+struct Vertex { Vec position, normal; std::uint32_t color; std::uint64_t motionId{}; };
 struct GpuVertex { float hi[3], lo[3], normal[3]; std::uint32_t color; };
 inline GpuVertex packVertex(const Vertex& vertex) {
     GpuVertex result{};

@@ -15,7 +15,36 @@ cbuffer Camera : register(b0) {
     float4 cloudShape; // global weather scale, formation scale (meters)
     float4 cloudRender; // enabled, primary steps, half-resolution width/height
     float4 cloudWind; // periodic planet-relative noise displacement (meters)
+    float4 previousRight, previousUp, previousForward; // w: x/y projection scale, previous near
+    float4 eyeDeltaHi, eyeDeltaLo; // current planet-relative eye minus previous eye, split on CPU
+    float4 temporalJitter; // current/previous NDC offsets
+    float4 taaParams; // enabled, history valid, maximum feedback, variance gamma
+    float4 taaFilter; // motion response, depth rejection, sharpening, frame index
+    float4 cloudTemporal; // enabled, history valid, feedback, sparse sampling pattern
+    float4 cloudTemporalFilter; // depth rejection, ray jitter strength
+    float4 cloudWindDelta; // unwrapped displacement since the previous frame
 };
+cbuffer DrawPass : register(b1) { uint cascadeIndex; uint objectPass; };
+StructuredBuffer<float4> previousObjectPositions : register(t17);
+
+float3 previousRelative(float3 relative) {
+    DF3 p = df3Add(df3(relative, 0), df3(eyeDeltaHi.xyz, eyeDeltaLo.xyz));
+    return p.hi + p.lo;
+}
+float4 previousClip(float3 relative) {
+    float z = dot(relative, previousForward.xyz);
+    return float4(dot(relative, previousRight.xyz) * previousRight.w + temporalJitter.z * z,
+                  dot(relative, previousUp.xyz) * previousUp.w + temporalJitter.w * z, 1, z);
+}
+float2 clipUv(float4 clip) { return clip.xy / max(1e-6, clip.w) * float2(0.5, -0.5) + 0.5; }
+float3 cameraRay(float2 uv) {
+    float2 ndc = uv * float2(2, -2) + float2(-1, 1) - temporalJitter.xy;
+    return cameraForward.xyz + cameraRight.xyz * (ndc.x / projection.x) + cameraUp.xyz * (ndc.y / projection.y);
+}
+float3 previousRay(float2 uv) {
+    float2 ndc = uv * float2(2, -2) + float2(-1, 1) - temporalJitter.zw;
+    return normalize(previousForward.xyz + previousRight.xyz * (ndc.x / previousRight.w) + previousUp.xyz * (ndc.y / previousUp.w));
+}
 
 DF3 planetEye() { return df3(planetEyeHi.xyz, planetEyeLo.xyz); }
 float3 betaR() {
@@ -112,9 +141,10 @@ struct Surface {
     float3 normal : NORMAL;
     float4 material : COLOR;
     float3 relative : TEXCOORD0;
+    float4 previous : TEXCOORD1;
     float farClip : SV_ClipDistance0;
 };
-Surface surfaceVS(float3 hi : POSITION0, float3 lo : POSITION1, float3 normal : NORMAL, float4 material : COLOR) {
+Surface surfaceVS(float3 hi : POSITION0, float3 lo : POSITION1, float3 normal : NORMAL, float4 material : COLOR, uint id : SV_VertexID) {
     // UE translated-world pattern: subtract split world positions, THEN use float.
     DF3 translated = df3Sub(df3(hi, lo), df3(cameraEyeHi.xyz, cameraEyeLo.xyz));
     float3 relative = translated.hi + translated.lo;
@@ -122,6 +152,14 @@ Surface surfaceVS(float3 hi : POSITION0, float3 lo : POSITION1, float3 normal : 
     Surface result;
     result.clip = float4(dot(relative, cameraRight.xyz) * projection.x,
                          dot(relative, cameraUp.xyz) * projection.y, projection.z, depth);
+    result.clip.xy += temporalJitter.xy * depth;
+    DF3 old = df3Add(translated, df3(eyeDeltaHi.xyz, eyeDeltaLo.xyz));
+    result.previous = previousClip(old.hi + old.lo);
+    [branch] if (objectPass != 0) {
+        float4 previous = previousObjectPositions[id];
+        result.previous = previousClip(previous.xyz);
+        result.previous.z = previous.w;
+    }
     result.relative = relative;
     result.farClip = projection.w - depth;
     result.normal = normal;

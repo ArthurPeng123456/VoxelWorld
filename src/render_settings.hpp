@@ -11,6 +11,7 @@ namespace voxel {
 inline constexpr std::array<int, 3> shadowResolutions{1024, 2048, 4096};
 inline constexpr double referenceAtmosphereHeightKm = 100;
 inline constexpr std::array<int, 3> cloudStepCounts{32, 64, 96};
+inline constexpr std::array<int, 3> taaSampleCounts{8, 16, 32};
 constexpr bool validShadowResolution(int resolution) {
     for (int supported : shadowResolutions) if (resolution == supported) return true;
     return false;
@@ -30,6 +31,11 @@ struct RenderSettings {
     int cloudSteps{64};
     double cloudBaseKm{6}, cloudThicknessKm{8}, cloudCoverage{0.5}, cloudDensity{1};
     double cloudWeatherKm{1400}, cloudFormationKm{45}, cloudWindSpeed{25};
+    bool taaEnabled{true}, cloudTemporalEnabled{true};
+    int taaSamples{16}, cloudSampling{1}; // Full / two-phase checkerboard / four-phase 2x2.
+    double taaHistoryWeight{0.9}, taaJitter{1}, taaVarianceGamma{1.25}, taaDepthThreshold{0.01};
+    double taaMotionResponse{0.2}, taaSharpen{0.15}, taaCutDistanceKm{200}, taaCutAngle{45};
+    double cloudHistoryWeight{0.92}, cloudDepthThreshold{0.2}, cloudRayJitter{0.85};
     double exposureEV{};
     ToneMapping toneMapping{ToneMapping::Aces};
 };
@@ -76,6 +82,35 @@ inline constexpr std::array cloudParameters{
     RenderParameter{L"--cloud-formation-km", L"Formation scale (km)", &RenderSettings::cloudFormationKm, 5, 150},
     RenderParameter{L"--cloud-wind-speed", L"Wind speed (m/s)", &RenderSettings::cloudWindSpeed, 0, 300}
 };
+inline constexpr std::array taaParameters{
+    RenderParameter{L"--taa-history", L"History weight", &RenderSettings::taaHistoryWeight, 0, 0.98},
+    RenderParameter{L"--taa-jitter", L"Jitter spread (pixels)", &RenderSettings::taaJitter, 0, 1.5},
+    RenderParameter{L"--taa-variance", L"Variance clip gamma", &RenderSettings::taaVarianceGamma, 0.5, 3},
+    RenderParameter{L"--taa-depth-threshold", L"Depth rejection ratio", &RenderSettings::taaDepthThreshold, 0.0005, 0.1},
+    RenderParameter{L"--taa-motion-response", L"Motion response", &RenderSettings::taaMotionResponse, 0, 1},
+    RenderParameter{L"--taa-sharpen", L"Output sharpening", &RenderSettings::taaSharpen, 0, 1},
+    RenderParameter{L"--taa-cut-distance-km", L"Camera cut distance (km)", &RenderSettings::taaCutDistanceKm, 1, 2000},
+    RenderParameter{L"--taa-cut-angle", L"Camera cut angle (deg)", &RenderSettings::taaCutAngle, 10, 120}
+};
+inline constexpr std::array cloudTemporalParameters{
+    RenderParameter{L"--cloud-history", L"History weight", &RenderSettings::cloudHistoryWeight, 0, 0.98},
+    RenderParameter{L"--cloud-depth-threshold", L"Depth rejection ratio", &RenderSettings::cloudDepthThreshold, 0.01, 0.75},
+    RenderParameter{L"--cloud-ray-jitter", L"Ray jitter strength", &RenderSettings::cloudRayJitter, 0, 1}
+};
+
+inline bool sameHistorySettings(const RenderSettings& a, const RenderSettings& b) {
+    if (a.shadowsEnabled != b.shadowsEnabled || a.shadowResolution != b.shadowResolution ||
+        a.atmosphereEnabled != b.atmosphereEnabled || a.cloudsEnabled != b.cloudsEnabled ||
+        a.cloudSteps != b.cloudSteps || a.taaEnabled != b.taaEnabled || a.taaSamples != b.taaSamples ||
+        a.cloudTemporalEnabled != b.cloudTemporalEnabled || a.cloudSampling != b.cloudSampling) return false;
+    const auto equal = [&](const auto& parameters) {
+        for (const auto& parameter : parameters) if (a.*parameter.value != b.*parameter.value) return false;
+        return true;
+    };
+    // Histories store unexposed linear HDR; exposure and tone mapping are post effects.
+    return equal(shadowParameters) && equal(atmosphereParameters) && equal(cloudParameters) &&
+           equal(taaParameters) && equal(cloudTemporalParameters);
+}
 
 inline std::optional<double> readRenderParameter(const std::wstring& text, const RenderParameter& parameter) {
     try {

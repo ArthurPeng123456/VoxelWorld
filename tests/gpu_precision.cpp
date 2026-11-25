@@ -44,7 +44,8 @@ int main(int argc, char** argv) {
         // Compile the production entry points, including precise transforms, with release flags.
         for (const auto& entry : {std::pair{"surfaceVS", "vs_5_0"}, {"surfacePS", "ps_5_0"},
                                   {"skyVS", "vs_5_0"}, {"deferredPS", "ps_5_0"},
-                                  {"shadowVS", "vs_5_0"}, {"toneMapPS", "ps_5_0"}, {"linePS", "ps_5_0"}, {"cloudPS", "ps_5_0"}})
+                                  {"shadowVS", "vs_5_0"}, {"toneMapPS", "ps_5_0"}, {"linePS", "ps_5_0"}, {"cloudPS", "ps_5_0"},
+                                  {"cloudResolvePS", "ps_5_0"}, {"temporalPS", "ps_5_0"}})
             compile(shaderSource, entry.first, entry.second);
         const auto noise = makeCloudNoise();
         if (noise.size() != 7 || noise.front().edge != 64 || noise.back().edge != 1)
@@ -126,7 +127,7 @@ int main(int argc, char** argv) {
         const Vec sun = unit(Vec{0.45, 0.25, 0.86});
         constexpr RenderSettings defaults;
         constexpr auto air = atmosphereDimensions(defaults);
-        float camera[132]{};
+        float camera[176]{};
         camera[11] = 1; // Atmosphere enabled, matching the viewer default.
         camera[24] = float(sun.x); camera[25] = float(sun.y); camera[26] = float(sun.z);
         camera[36] = float(planetRadius); camera[37] = float(planetRadius + air.thickness);

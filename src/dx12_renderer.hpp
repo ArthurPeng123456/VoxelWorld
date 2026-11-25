@@ -28,6 +28,11 @@ struct RenderDiagnostics {
     bool debugLayer{};
     std::size_t cloudPixels{};
     double maxCloudOpacity{};
+    std::size_t taaHistoryPixels{}, cloudTracedPixels{}, cloudSkippedPixels{}, cloudFallbackPixels{};
+    std::uint64_t cloudRaySteps{};
+    bool temporalHistoryValid{};
+    std::size_t movingObjectPixels{};
+    double maxObjectMotionPixels{};
 };
 
 class Dx12Renderer {
@@ -41,6 +46,7 @@ public:
     void publishTerrainPages();
     void setClipmapLines(const std::vector<Vertex>& lines);
     void setShadowResolution(int resolution);
+    void resetTemporalHistory();
     void draw(const Camera& camera, const std::vector<Vertex>& objects, const std::filesystem::path& capture = {}, bool inspectPipeline = false);
     RenderDiagnostics diagnostics() const;
     bool isWarp() const;

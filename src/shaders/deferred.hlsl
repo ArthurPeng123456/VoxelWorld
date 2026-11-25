@@ -3,14 +3,14 @@ Texture2D<float4> gNormal : register(t1);
 Texture2DArray<float> shadowMaps : register(t3);
 Texture2D<float4> hdrScene : register(t4);
 SamplerComparisonState shadowSampler : register(s0);
-cbuffer ShadowPass : register(b1) { uint cascadeIndex; };
 
-struct GBuffer { float4 albedo : SV_Target0; float4 normal : SV_Target1; };
+struct GBuffer { float4 albedo : SV_Target0; float4 normal : SV_Target1; float4 motion : SV_Target2; };
 GBuffer surfacePS(Surface input) {
     GBuffer result;
     result.albedo = input.material;
     int code = int(round(input.material.a * 255));
     result.normal = float4(normalize(input.normal), code == 253 ? 0.35 : code == 254 ? 0.5 : 0.85);
+    result.motion = float4(clipUv(input.previous), input.previous.z > 0.5 ? input.previous.w : -1, code);
     return result;
 }
 
@@ -70,8 +70,7 @@ float3 skyRadiance(float3 ray) {
 float4 deferredPS(Sky input) : SV_Target {
     int2 pixel = int2(input.clip.xy);
     float depth = gDepth.Load(int3(pixel, 0));
-    float2 ndc = input.clip.xy / renderParams.xy * float2(2, -2) + float2(-1, 1);
-    float3 ray = cameraForward.xyz + cameraRight.xyz * (ndc.x / projection.x) + cameraUp.xyz * (ndc.y / projection.y);
+    float3 ray = cameraRay(input.clip.xy / renderParams.xy);
     float4 normalData = gNormal.Load(int3(pixel, 0));
     float2 uv = input.clip.xy / renderParams.xy;
     if (depth <= 0 || normalData.w <= 0)
@@ -127,7 +126,7 @@ float4 deferredPS(Sky input) : SV_Target {
     float3 inscatter = scatter(planetEye(), viewDirection, airDistance, transmittance);
     return float4(compositeClouds(radiance * transmittance + inscatter, uv, distance), 1);
 }
-float4 linePS(Surface input) : SV_Target { return float4(input.material.rgb * 2, 1); }
+float4 linePS(Surface input) : SV_Target { return float4(input.material.rgb * 2, 0); } // Reactive debug overlay.
 
 // ACES filmic fit (Narkowicz), then linear -> sRGB. Applied exactly once.
 float toSrgb(float x) { return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055; }
@@ -137,7 +136,18 @@ float3 acesToneMap(float3 radiance, float exposure) {
     return float3(toSrgb(mapped.x), toSrgb(mapped.y), toSrgb(mapped.z));
 }
 float4 toneMapPS(Sky input) : SV_Target {
-    float3 radiance = hdrScene.Load(int3(int2(input.clip.xy), 0)).rgb;
+    int2 pixel = int2(input.clip.xy);
+    float3 radiance = taaResolved.Load(int3(pixel, 0)).rgb;
+    [branch] if (taaParams.x > 0.5 && taaFilter.z > 0) {
+        float3 mean = 0, lower = radiance, upper = radiance;
+        const int2 offsets[4] = {int2(-1,0), int2(1,0), int2(0,-1), int2(0,1)};
+        [unroll] for (int i = 0; i < 4; ++i) {
+            int2 p = clamp(pixel + offsets[i], int2(0,0), int2(renderParams.xy) - 1);
+            float3 c = taaResolved.Load(int3(p, 0)).rgb;
+            mean += c * 0.25; lower = min(lower, c); upper = max(upper, c);
+        }
+        radiance = clamp(radiance + (radiance - mean) * taaFilter.z, lower, upper);
+    }
     if (renderParams.w < 0.5) return float4(acesToneMap(radiance, renderParams.z), 1);
     float3 x = max(radiance, 0) * renderParams.z;
     float3 mapped = renderParams.w < 1.5 ? x / (1 + x) : saturate(x);

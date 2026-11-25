@@ -61,7 +61,7 @@ struct Options {
     int method{1};
     std::uint64_t seed{42};
     int invokers{2};
-    bool warp{}, morton{}, cloudCaptures{};
+    bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{};
     double voxelDensity{1};
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
@@ -69,11 +69,25 @@ struct Options {
     std::filesystem::path streamProfile;
 };
 
+constexpr std::array terrainRenderFields{&RenderSettings::atmosphereHeightKm,
+    &RenderSettings::cloudThicknessKm, &RenderSettings::cloudCoverage};
+
+constexpr RenderSettings defaultRenderSettings(TerrainPreset preset) {
+    RenderSettings settings;
+    if (preset == TerrainPreset::Mars) {
+        settings.atmosphereHeightKm = 300;
+        settings.cloudThicknessKm = 24;
+        settings.cloudCoverage = 0.35;
+    }
+    return settings;
+}
+
 Options readOptions() {
     int count = 0;
     const std::unique_ptr<wchar_t*, decltype(&LocalFree)> args(CommandLineToArgvW(GetCommandLineW(), &count), LocalFree);
     if (!args) throw std::runtime_error("Could not read the command line");
     Options result;
+    std::array<bool, terrainRenderFields.size()> renderOverrides{};
     for (int i = 1; i < count; ++i) {
         const std::wstring option = args.get()[i];
         auto next = [&] {
@@ -96,6 +110,8 @@ Options readOptions() {
                     throw std::invalid_argument(flag + " requires a finite value within the supported range");
                 }
                 result.render.*parameter.value = *value;
+                for (std::size_t field = 0; field < terrainRenderFields.size(); ++field)
+                    if (parameter.value == terrainRenderFields[field]) renderOverrides[field] = true;
                 return true;
             }
             return false;
@@ -105,6 +121,22 @@ Options readOptions() {
         else if (option == L"--no-atmosphere") result.render.atmosphereEnabled = false;
         else if (option == L"--clouds") result.render.cloudsEnabled = true;
         else if (option == L"--no-clouds") result.render.cloudsEnabled = false;
+        else if (option == L"--taa") result.render.taaEnabled = true;
+        else if (option == L"--no-taa") result.render.taaEnabled = false;
+        else if (option == L"--cloud-temporal") result.render.cloudTemporalEnabled = true;
+        else if (option == L"--no-cloud-temporal") result.render.cloudTemporalEnabled = false;
+        else if (option == L"--taa-samples") {
+            const auto samples = integer();
+            if (std::find(taaSampleCounts.begin(), taaSampleCounts.end(), samples) == taaSampleCounts.end())
+                throw std::invalid_argument("--taa-samples requires 8, 16 or 32");
+            result.render.taaSamples = int(samples);
+        } else if (option == L"--cloud-sampling") {
+            const auto value = next();
+            if (value == L"full") result.render.cloudSampling = 0;
+            else if (value == L"checkerboard") result.render.cloudSampling = 1;
+            else if (value == L"quarter") result.render.cloudSampling = 2;
+            else throw std::invalid_argument("--cloud-sampling requires full, checkerboard or quarter");
+        }
         else if (option == L"--cloud-steps") {
             const auto steps = integer();
             if (std::find(cloudStepCounts.begin(), cloudStepCounts.end(), steps) == cloudStepCounts.end())
@@ -125,6 +157,8 @@ Options readOptions() {
         } else if (option == L"--morton") result.morton = true;
         else if (option == L"--capture-dir") result.captures = next();
         else if (option == L"--capture-clouds") { result.captures = next(); result.cloudCaptures = true; }
+        else if (option == L"--capture-temporal") { result.captures = next(); result.temporalCaptures = true; }
+        else if (option == L"--capture-stability") { result.captures = next(); result.stabilityCaptures = true; }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
@@ -148,9 +182,15 @@ Options readOptions() {
             else if (value == L"vdb" || value == L"4") result.method = 3;
             else throw std::invalid_argument("Choose mesh, grid, dag or vdb");
         } else if (!renderOption(shadowParameters) && !renderOption(atmosphereParameters) &&
-                   !renderOption(cloudParameters) && !renderOption(hdrParameters))
+                   !renderOption(cloudParameters) && !renderOption(taaParameters) &&
+                   !renderOption(cloudTemporalParameters) && !renderOption(hdrParameters))
             throw std::invalid_argument("Unknown viewer option");
     }
+    // Resolve terrain defaults after parsing so explicit flags win regardless
+    // of whether they appear before or after --terrain.
+    const auto defaults = defaultRenderSettings(result.terrain);
+    for (std::size_t field = 0; field < terrainRenderFields.size(); ++field)
+        if (!renderOverrides[field]) result.render.*terrainRenderFields[field] = defaults.*terrainRenderFields[field];
     return result;
 }
 
@@ -309,6 +349,8 @@ public:
     }
 
     int run() {
+        if (opts_.stabilityCaptures) return captureStability();
+        if (opts_.temporalCaptures) return captureTemporal();
         if (opts_.cloudCaptures) return captureClouds();
         if (!opts_.captures.empty()) return captureAll();
         std::ofstream profile;
@@ -771,12 +813,16 @@ private:
                 if (!freeView_ && length(pose.position - focus) > (controlling_ ? followDistance_ : surfaceDistance_) * 2.7) continue;
                 Shape shape = body.shape;
                 shape.axes = pose.axes;
+                const auto first = objects_.size();
                 if (shape.kind == ShapeKind::Box) appendBox(objects_, shape, pose.position, body.material);
                 else appendRound(objects_, shape, pose.position, body.material);
+                for (auto i = first; i < objects_.size(); ++i) objects_[i].motionId = body.index + 1;
             }
         }
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
+            const auto first = objects_.size();
             appendBeacon(objects_, invokers_[i], surface_ || freeView_ ? 24 : 380, i == selected_);
+            for (auto j = first; j < objects_.size(); ++j) objects_[j].motionId = (1ull << 63) | (i + 1);
         }
     }
 
@@ -814,6 +860,184 @@ private:
                 lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
     }
 
+    int captureStability() {
+        std::filesystem::create_directories(opts_.captures);
+        SetWindowPos(window_, nullptr, 0, 0, 960, 720, SWP_NOMOVE | SWP_NOZORDER);
+        renderer_->setClipmapLines({});
+        const auto sequence = [&](const std::string& name, const Camera& view) {
+            renderer_->resetTemporalHistory();
+            for (int frame = 0; frame < 64; ++frame) renderer_->draw(view, {});
+            for (int frame = 0; frame < 32; ++frame)
+                renderer_->draw(view, {}, opts_.captures / ("taa-stability-" + name + "-" + std::to_string(frame) + ".bmp"), true);
+        };
+        Camera orbit = camera();
+        orbit.timeSeconds = 0;
+        orbit.eye = Vec{0,-0.3,2.5} * planetRadius;
+        orbit.forward = unit(orbit.eye * -1); orbit.right = unit(cross(orbit.forward, {0,1,0}));
+        orbit.up = cross(orbit.right, orbit.forward); orbit.nearPlane = 10;
+        orbit.settings = opts_.render;
+        orbit.settings.shadowsEnabled = false;
+        Camera clear = orbit; clear.settings.cloudsEnabled = false;
+        sequence("clear", clear);
+        Camera full = orbit; full.settings.cloudSampling = 0;
+        sequence("orbit-full", full);
+        sequence("orbit-checker", orbit);
+        Camera horizon = orbit;
+        horizon.eye = {0,0,planetRadius + 18000}; horizon.forward = unit(Vec{1,0,-0.14});
+        horizon.right = {0,-1,0}; horizon.up = cross(horizon.right,horizon.forward); horizon.nearPlane = 0.3;
+        horizon.settings.cloudCoverage = 0.75;
+        sequence("horizon-checker", horizon);
+        Camera quarter = horizon; quarter.settings.cloudSampling = 2;
+        sequence("horizon-quarter", quarter);
+        Camera noJitter = horizon; noJitter.settings.taaJitter = 0;
+        sequence("horizon-no-projection-jitter", noJitter);
+        Camera noRayJitter = horizon; noRayJitter.settings.cloudRayJitter = 0;
+        sequence("horizon-no-ray-jitter", noRayJitter);
+        return 0;
+    }
+
+    int captureTemporal() {
+        std::filesystem::create_directories(opts_.captures);
+        SetWindowPos(window_, nullptr, 0, 0, 1100, 800, SWP_NOMOVE | SWP_NOZORDER);
+        renderer_->setClipmapLines({});
+        const Vec origin{0, 0, planetRadius + 3000};
+        std::vector<Vertex> floor;
+        Shape tile = sampleShape(3, {0,0,1}); tile.size = {6, 6, 0.15};
+        for (int y = -12; y <= 12; ++y) for (int x = -12; x <= 12; ++x)
+            appendBox(floor, tile, origin + Vec{x * 12.0, y * 12.0, -0.15},
+                      color(((x + y) & 1) ? Vec{0.045,0.045,0.045} : Vec{0.8,0.8,0.8}, 254));
+        Shape slat = tile; slat.size = {0.12, 65, 0.3};
+        const double angle = 0.47;
+        slat.axes = {Vec{std::cos(angle),std::sin(angle),0}, Vec{-std::sin(angle),std::cos(angle),0}, Vec{0,0,1}};
+        for (int i = -8; i <= 8; ++i) appendBox(floor, slat, origin + Vec{i * 5.0,0,0.3}, color({0.95,0.95,0.95},254));
+        renderer_->setTerrain(floor);
+        Camera view{};
+        view.eye = origin + Vec{3,-150,95};
+        view.forward = unit(origin - view.eye); view.right = unit(cross(view.forward, {0,0,1}));
+        view.up = cross(view.right, view.forward); view.nearPlane = 0.3; view.farPlane = 100000;
+        view.settings.cloudsEnabled = false; view.settings.atmosphereEnabled = false;
+        view.settings.shadowsEnabled = false; view.settings.taaSharpen = 0;
+        const auto capture = [&](const std::string& name, const Camera& camera, const std::vector<Vertex>& objects = std::vector<Vertex>{}) {
+            renderer_->draw(camera, objects, opts_.captures / (name + ".bmp"), true);
+        };
+        Camera off = view; off.settings.taaEnabled = false;
+        capture("taa-off", off);
+        renderer_->resetTemporalHistory();
+        Camera reference = view; reference.settings.taaHistoryWeight = 0;
+        for (int i = 0; i < 16; ++i) capture("taa-reference-" + std::to_string(i), reference);
+        renderer_->resetTemporalHistory();
+        for (int i = 0; i < 32; ++i) renderer_->draw(view, {});
+        capture("taa-static", view);
+        if (!renderer_->diagnostics().temporalHistoryValid || renderer_->diagnostics().taaHistoryPixels < 1000)
+            throw std::runtime_error("TAA did not accumulate a valid history");
+        Shape moving = sampleShape(3, {0,0,1}); moving.size = {7,7,9};
+        std::vector<Vertex> body;
+        for (int frame = 0; frame < 24; ++frame) {
+            body.clear();
+            appendBox(body, moving, origin + Vec{-32 + frame * 2.8,0,9}, color({0.8,0.045,0.02},254));
+            for (auto& vertex : body) vertex.motionId = 123;
+            if (frame == 23) capture("taa-moving", view, body);
+            else renderer_->draw(view, body);
+        }
+        if (renderer_->diagnostics().movingObjectPixels < 100)
+            throw std::runtime_error("Moving rigid-body vertices did not produce object motion vectors");
+        capture("taa-moving-reference", off, body);
+        renderer_->resetTemporalHistory();
+        for (int frame = 0; frame < 16; ++frame) {
+            Camera pan = view; pan.eye = pan.eye + Vec{frame * 0.6,0,0}; renderer_->draw(pan, {});
+            if (frame == 15) capture("taa-camera-pan", pan);
+        }
+        Camera cut = view; cut.eye = cut.eye + Vec{1000000,0,0};
+        capture("taa-camera-cut", cut);
+        if (renderer_->diagnostics().temporalHistoryValid) throw std::runtime_error("Camera cut retained stale TAA history");
+        renderer_->resetTemporalHistory(); capture("taa-cut-reference", cut);
+        for (int i = 0; i < 16; ++i) renderer_->draw(view, {});
+        SetWindowPos(window_, nullptr, 0, 0, 1200, 850, SWP_NOMOVE | SWP_NOZORDER);
+        capture("taa-resized", view);
+        if (renderer_->diagnostics().temporalHistoryValid) throw std::runtime_error("Resize retained stale TAA history");
+        SetWindowPos(window_, nullptr, 0, 0, 1100, 800, SWP_NOMOVE | SWP_NOZORDER);
+        // Rebase both camera and planet without a fictitious 1e12 m motion.
+        // Binary-exact visible geometry isolates temporal reprojection from the
+        // source-coordinate quantization of the subpixel diagonal slats at 1e12 m.
+        std::vector<Vertex> precisionFloor, precisionBody;
+        Shape exactTile = tile; exactTile.size.z = 0.125;
+        for (int y = -12; y <= 12; ++y) for (int x = -12; x <= 12; ++x)
+            appendBox(precisionFloor, exactTile, origin + Vec{x * 12.0,y * 12.0,-0.125},
+                      color(((x + y) & 1) ? Vec{0.045,0.045,0.045} : Vec{0.8,0.8,0.8},254));
+        appendBox(precisionBody, moving, origin + Vec{32,0,9}, color({0.8,0.045,0.02},254));
+        for (auto& vertex : precisionBody) vertex.motionId = 123;
+        renderer_->setTerrain(precisionFloor);
+        for (int i = 0; i < 16; ++i) renderer_->draw(view, precisionBody);
+        capture("taa-precision-base", view, precisionBody);
+        const Vec translation{1e12,-1e12,1e12};
+        auto shiftedFloor = precisionFloor, shiftedBody = precisionBody;
+        for (auto& vertex : shiftedFloor) vertex.position = vertex.position + translation;
+        for (auto& vertex : shiftedBody) vertex.position = vertex.position + translation;
+        renderer_->setTerrain(shiftedFloor);
+        Camera shifted = view; shifted.eye = shifted.eye + translation; shifted.planetCenter = translation;
+        for (int i = 0; i < 16; ++i) renderer_->draw(shifted, shiftedBody);
+        capture("taa-precision-translated", shifted, shiftedBody);
+
+        rebuild();
+        Camera clouds = camera();
+        clouds.eye = Vec{0,-0.3,2.5} * planetRadius;
+        clouds.forward = unit(clouds.eye * -1); clouds.right = unit(cross(clouds.forward,{0,1,0}));
+        clouds.up = cross(clouds.right,clouds.forward); clouds.nearPlane = 10;
+        clouds.settings.taaEnabled = true; clouds.settings.cloudsEnabled = true;
+        clouds.settings.cloudTemporalEnabled = true; clouds.settings.taaSharpen = 0;
+        std::array<std::uint64_t,3> steps{};
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            clouds.settings.cloudSampling = pattern;
+            renderer_->resetTemporalHistory();
+            for (int i = 0; i < 32; ++i) renderer_->draw(clouds, {});
+            capture("taa-cloud-pattern-" + std::to_string(pattern), clouds);
+            steps[std::size_t(pattern)] = renderer_->diagnostics().cloudRaySteps;
+            if (pattern && renderer_->diagnostics().cloudSkippedPixels == 0)
+                throw std::runtime_error("Sparse cloud sampling did not skip any raymarches");
+        }
+        clouds.settings.taaEnabled = false;
+        capture("taa-cloud-no-taa", clouds);
+        if (renderer_->diagnostics().cloudSkippedPixels || renderer_->diagnostics().cloudFallbackPixels)
+            throw std::runtime_error("Disabling TAA left sparse cloud rendering enabled");
+        clouds.settings.taaEnabled = true;
+        capture("taa-cloud-reenabled", clouds);
+        if (renderer_->diagnostics().temporalHistoryValid || renderer_->diagnostics().cloudSkippedPixels)
+            throw std::runtime_error("Enabling TAA reused invalid cloud history");
+        if (!steps[0] || steps[1] >= steps[0] * 0.75 || steps[2] >= steps[0] * 0.55)
+            throw std::runtime_error("Cloud temporal reconstruction did not reduce primary raymarch work");
+        // A foreground object is introduced and removed WITHOUT clearing history.
+        // Newly visible cloud pixels must trace immediately, even on skipped phases.
+        Camera foreground = clouds;
+        foreground.eye = {0,0,planetRadius + 2000}; foreground.forward = {0,0,1};
+        foreground.right = {1,0,0}; foreground.up = {0,1,0}; foreground.nearPlane = 0.3;
+        foreground.settings.cloudCoverage = 1; foreground.settings.shadowsEnabled = false;
+        foreground.settings.cloudSampling = 2;
+        std::vector<Vertex> blocker;
+        Shape plate = sampleShape(3,{0,0,1}); plate.size = {20000,20000,5};
+        appendBox(blocker, plate, foreground.eye + Vec{0,0,500}, color({0.65,0.08,0.025},254));
+        for (auto& vertex : blocker) vertex.motionId = 888;
+        for (int i = 0; i < 16; ++i) renderer_->draw(foreground, {});
+        capture("taa-cloud-occluded", foreground, blocker);
+        capture("taa-cloud-occluded-reference", [&] { auto v = foreground; v.settings.taaEnabled = false; return v; }(), blocker);
+        for (int i = 0; i < 16; ++i) renderer_->draw(foreground, blocker);
+        capture("taa-cloud-disoccluded", foreground);
+        const auto disoccluded = renderer_->diagnostics();
+        if (!disoccluded.cloudSkippedPixels || disoccluded.cloudFallbackPixels < disoccluded.cloudSkippedPixels * 0.9 ||
+            disoccluded.maxCloudOpacity < 0.1)
+            throw std::runtime_error("Disoccluded sparse cloud pixels did not raymarch missing history");
+        renderer_->resetTemporalHistory(); capture("taa-cloud-disoccluded-reference", foreground);
+        Camera wind = foreground;
+        wind.eye.z = planetRadius + 18000; wind.forward = unit(Vec{1,0,-0.14});
+        wind.right = {0,-1,0}; wind.up = cross(wind.right,wind.forward);
+        wind.settings.cloudWindSpeed = 250; wind.settings.cloudFormationKm = 18;
+        for (int i = 0; i < 32; ++i) { wind.timeSeconds = i / 60.0; renderer_->draw(wind, {}); }
+        wind.timeSeconds = 32 / 60.0; capture("taa-cloud-wind", wind);
+        std::ofstream report(opts_.captures / "temporal-validation.txt");
+        report << "renderer=" << (renderer_->isWarp() ? "WARP" : "hardware") << "\nfull_steps=" << steps[0]
+               << "\nchecker_steps=" << steps[1] << "\nquarter_steps=" << steps[2] << "\nscenarios=passed\n";
+        return 0;
+    }
+
     int captureClouds() {
         std::filesystem::create_directories(opts_.captures);
         const bool previousClouds = opts_.render.cloudsEnabled;
@@ -823,6 +1047,7 @@ private:
         SetWindowPos(window_, nullptr, 0, 0, opts_.warp ? 960 : 1280, opts_.warp ? 720 : 900, SWP_NOMOVE | SWP_NOZORDER);
         renderer_->setClipmapLines({});
         Camera orbit = camera();
+        orbit.settings.taaEnabled = false;
         orbit.eye = Vec{0, -0.3, 2.5} * planetRadius;
         orbit.forward = unit(orbit.eye * -1);
         orbit.right = unit(cross(orbit.forward, {0, 1, 0}));
@@ -888,9 +1113,11 @@ private:
         // Keep the existing atmosphere/terrain reference suite independent of
         // the new cloud art direction. --capture-clouds validates clouds.
         opts_.render.cloudsEnabled = false;
+        opts_.render.taaEnabled = false;
         const auto referenceSettings = [] {
             RenderSettings settings;
             settings.cloudsEnabled = false;
+            settings.taaEnabled = false;
             return settings;
         };
         std::filesystem::create_directories(opts_.captures);
@@ -1195,6 +1422,8 @@ private:
                     world_.reset();
                     planet_ = std::move(next);
                     opts_.terrain = preset;
+                    const auto defaults = defaultRenderSettings(preset);
+                    for (const auto field : terrainRenderFields) opts_.render.*field = defaults.*field;
                     freeView_ = false;
                     rebuild();
                 }
@@ -1203,9 +1432,10 @@ private:
             if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) world_->setLod0Radius(lod0Radius_);
         } else if (command == GraphicsSettings) {
             auto next = opts_.render;
-            if (editRenderSettings(window_, next)) {
+            if (editRenderSettings(window_, next, defaultRenderSettings(opts_.terrain))) {
                 try {
                     renderer_->setShadowResolution(next.shadowResolution);
+                    renderer_->resetTemporalHistory();
                     opts_.render = next;
                 } catch (const std::exception& error) {
                     const auto message = std::string("Could not apply the requested shadow-map size.\n") + error.what();
