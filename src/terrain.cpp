@@ -264,40 +264,60 @@ namespace {
 
 int floorTo(int value, int step) { return value - ((value % step + step) % step); }
 
-float interpolateBoundary(const Planet& planet, const Layout& layout, Key grid, int coarsest);
+class BoundarySampler {
+public:
+    BoundarySampler(const Planet& planet, const Layout& layout)
+        : planet_(planet), layout_(layout), finestSpacing_(gridChunkSize(layoutDensityShift(layout)) / fineCells),
+          generation_(++cache_.generation) {}
 
-float boundaryValue(const Planet& planet, const Layout& layout, Key grid, int level) {
-    int coarsest = level;
-    const double finestSpacing = gridChunkSize(layoutDensityShift(layout)) / fineCells;
-    const Vec world = asVec(grid) * finestSpacing;
-    for (int i = 0; i < 8; ++i) {
-        const Vec probe = world + Vec{(i & 1) ? 1e-4 : -1e-4, (i & 2) ? 1e-4 : -1e-4, (i & 4) ? 1e-4 : -1e-4};
-        const auto neighbor = leafAt(layout, probe);
-        if (neighbor) coarsest = std::max(coarsest, layout.at(*neighbor));
+    float value(Key grid, int level) {
+        // Neighboring fine face samples interpolate the same coarse lattice
+        // points. Their values and owner lookups are immutable within a build.
+        const auto hash = std::uint32_t(grid.x) * 0x9e3779b9U ^ std::uint32_t(grid.y) * 0x85ebca77U ^
+                          std::uint32_t(grid.z) * 0xc2b2ae3dU ^ std::uint32_t(level) * 0x27d4eb2dU;
+        auto& entry = cache_.entries[(hash ^ (hash >> 16)) & (cache_.entries.size() - 1)];
+        if (entry.generation == generation_ && entry.grid == grid && entry.level == level) return entry.value;
+        int coarsest = level;
+        const Vec world = asVec(grid) * finestSpacing_;
+        for (int i = 0; i < 8; ++i) {
+            const Vec probe = world + Vec{(i & 1) ? 1e-4 : -1e-4, (i & 2) ? 1e-4 : -1e-4, (i & 4) ? 1e-4 : -1e-4};
+            const auto neighbor = leafAt(layout_, probe);
+            if (neighbor) coarsest = std::max(coarsest, layout_.at(*neighbor));
+        }
+        const float result = interpolate(grid, coarsest);
+        entry = {grid, level, result, generation_};
+        return result;
     }
-    return interpolateBoundary(planet, layout, grid, coarsest);
-}
 
-float interpolateBoundary(const Planet& planet, const Layout& layout, Key grid, int coarsest) {
-    const double finestSpacing = gridChunkSize(layoutDensityShift(layout)) / fineCells;
-    const int stride = 1 << coarsest;
-    const Key base{floorTo(grid.x, stride), floorTo(grid.y, stride), floorTo(grid.z, stride)};
-    const Vec fraction = (asVec(grid) - asVec(base)) / stride;
-    if (fraction.x == 0 && fraction.y == 0 && fraction.z == 0) {
-        return planet.sdf(asVec(grid) * finestSpacing);
+    float interpolate(Key grid, int coarsest) {
+        const int stride = 1 << coarsest;
+        const Key base{floorTo(grid.x, stride), floorTo(grid.y, stride), floorTo(grid.z, stride)};
+        const Vec fraction = (asVec(grid) - asVec(base)) / stride;
+        if (fraction.x == 0 && fraction.y == 0 && fraction.z == 0)
+            return planet_.sdf(asVec(grid) * finestSpacing_);
+        double interpolated = 0;
+        for (int i = 0; i < 8; ++i) {
+            const double weight = ((i & 1) ? fraction.x : 1 - fraction.x)
+                                * ((i & 2) ? fraction.y : 1 - fraction.y)
+                                * ((i & 4) ? fraction.z : 1 - fraction.z);
+            if (weight == 0) continue;
+            const Key point{base.x + (i & 1) * stride, base.y + ((i >> 1) & 1) * stride,
+                            base.z + (i >> 2) * stride};
+            interpolated += weight * value(point, coarsest);
+        }
+        return float(interpolated);
     }
-    double value = 0;
-    for (int i = 0; i < 8; ++i) {
-        const double weight = ((i & 1) ? fraction.x : 1 - fraction.x)
-                            * ((i & 2) ? fraction.y : 1 - fraction.y)
-                            * ((i & 4) ? fraction.z : 1 - fraction.z);
-        if (weight == 0) continue;
-        const Key point{base.x + (i & 1) * stride, base.y + ((i >> 1) & 1) * stride,
-                        base.z + (i >> 2) * stride};
-        value += weight * boundaryValue(planet, layout, point, coarsest);
-    }
-    return float(value);
-}
+private:
+    struct Entry { Key grid; int level{}; float value{}; std::uint64_t generation{}; };
+    struct Cache { std::array<Entry, 4096> entries{}; std::uint64_t generation{}; };
+    static thread_local Cache cache_;
+    const Planet& planet_;
+    const Layout& layout_;
+    double finestSpacing_;
+    std::uint64_t generation_;
+};
+
+thread_local BoundarySampler::Cache BoundarySampler::cache_{};
 
 int boundaryLod(const Chunk& chunk, int x, int y, int z) {
     const int samples[3]{x, y, z};
@@ -314,7 +334,32 @@ int boundaryLod(const Chunk& chunk, int x, int y, int z) {
     return lod;
 }
 
-void stitchHierarchicalFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
+bool certifyUniform(const Planet& planet, Vec center, double radius, double sign, double margin,
+                    int subdivisions, double& closest) {
+    const double distance = sign * planet.sdf(center);
+    if (distance <= margin) return false;
+    // The sum of the directional relief-gradient bounds for Mars and Volcanic
+    // is below 12 m/m on the reference sphere. Along a segment inside this box,
+    // normalization can amplify that bound by at most R / minRadius.
+    const double minimumRadius = length(center) - radius;
+    if (minimumRadius <= 0) return false;
+    const double variation = radius * (1 + 12 * planetRadius / minimumRadius) + 0.01;
+    if (distance - variation > margin) {
+        closest = std::min(closest, distance - variation);
+        return true;
+    }
+    if (!subdivisions) return false;
+    constexpr double inverseSqrt3 = 0.5773502691896258;
+    const double offset = radius * (0.5 * inverseSqrt3);
+    for (int child = 0; child < 8; ++child) {
+        const Vec direction{child & 1 ? 1.0 : -1.0, child & 2 ? 1.0 : -1.0, child & 4 ? 1.0 : -1.0};
+        if (!certifyUniform(planet, center + direction * offset, radius * 0.5, sign, margin, subdivisions - 1, closest))
+            return false;
+    }
+    return true;
+}
+
+void stitchHierarchicalFaces(Chunk& chunk, BoundarySampler& boundary, const Layout& layout) {
     using Segment = std::array<Vec, 2>;
     using Face = std::tuple<int, int, int, int, int>;
     std::map<Face, std::vector<Segment>> contours;
@@ -344,7 +389,7 @@ void stitchHierarchicalFaces(Chunk& chunk, const Planet& planet, const Layout& l
                 Chunk coarse{Key{}, lod, 1, {origin, origin + splat(spacing)}, spacing, {}, {}, {}, {}, {}};
                 std::vector<float> samples;
                 for (int i = 0; i < 8; ++i)
-                    samples.push_back(boundaryValue(planet, layout, {grid.x + (i & 1) * step,
+                    samples.push_back(boundary.value({grid.x + (i & 1) * step,
                         grid.y + ((i >> 1) & 1) * step, grid.z + (i >> 2) * step}, lod));
                 coarse.field = makeStorage(Method::Grid, 2, samples, false, spacing, origin);
                 meshChunk(coarse, false);
@@ -384,9 +429,9 @@ void stitchHierarchicalFaces(Chunk& chunk, const Planet& planet, const Layout& l
     }), chunk.mesh.end());
 }
 
-void stitchFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
+void stitchFaces(Chunk& chunk, BoundarySampler& boundary, const Layout& layout) {
     if (!layout.empty() && layout.rbegin()->first.level > 0) {
-        stitchHierarchicalFaces(chunk, planet, layout);
+        stitchHierarchicalFaces(chunk, boundary, layout);
         return;
     }
     // Collapse the fine contour onto each unambiguous straight coarse face segment.
@@ -413,7 +458,7 @@ void stitchFaces(Chunk& chunk, const Planet& planet, const Layout& layout) {
                 key[u] += (i + offsets[c][0]) * step;
                 key[v] += (j + offsets[c][1]) * step;
                 points[c] = asVec(key) * (gridChunkSize(chunk.key.densityShift) / fineCells);
-                values[c] = boundaryValue(planet, layout, key, level);
+                values[c] = boundary.value(key, level);
             }
             std::array<Vec, 4> crossings;
             int n = 0;
@@ -505,7 +550,7 @@ void meshChunk(Chunk& chunk, bool indexField) {
 }
 
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
-                                  Method method, bool morton, BuildStats& stats) {
+                                  Method method, bool morton, BuildStats& stats, const Chunk* previous) {
     const int lod = layout.at(key);
     const int cells = fineCells >> std::min(lod, 3);
     const int count = cells + 1;
@@ -527,27 +572,69 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
         storeUniform(length(box.center()) < planetRadius ? -background : background);
         return chunk;
     }
+    const int stride = 1 << lod;
+    BoundarySampler boundary(planet, layout);
+    const bool hasCoarserEdge = *std::max_element(chunk->neighborhood.begin(), chunk->neighborhood.end()) > lod;
+    const auto sampleBoundary = [&](int x, int y, int z, int coarsest) {
+        const Key grid{key.x * fineCells + x * stride, key.y * fineCells + y * stride,
+                       key.z * fineCells + z * stride};
+        return boundary.interpolate(grid, coarsest);
+    };
+    const bool compact = planet.preset() != TerrainPreset::Classic;
+    const double margin = std::max(16.0, 2 * chunk->spacing);
+    if (compact) {
+        const auto center = box.center();
+        const double prior = previous && previous->key == key ? previous->certifiedDistance : 0;
+        const bool reuseProof = std::abs(prior) > margin;
+        const double sign = (reuseProof ? prior : planet.sdf(center)) < 0 ? -1.0 : 1.0;
+        double closest = reuseProof ? std::abs(prior) : std::numeric_limits<double>::infinity();
+        const int depth = cells >= 16 ? 3 : cells >= 8 ? 2 : 1;
+        bool uniform = reuseProof || certifyUniform(planet, center, length(box.hi - center), sign, margin, depth, closest);
+        if (uniform) chunk->certifiedDistance = sign * closest;
+        if (uniform && hasCoarserEdge) {
+            // A coarse seam overrides analytical boundary samples. Check that
+            // they also stay on the certified side of the zero surface.
+            for (int axis = 0; axis < 3 && uniform; ++axis) for (int face : {0, cells}) {
+                for (int i = 0; i <= cells && uniform; ++i) for (int j = 0; j <= cells && uniform; ++j) {
+                    Key p;
+                    p[axis] = face; p[(axis + 1) % 3] = i; p[(axis + 2) % 3] = j;
+                    const int coarsest = boundaryLod(*chunk, p.x, p.y, p.z);
+                    if (coarsest == lod) continue;
+                    closest = std::min(closest, sign * sampleBoundary(p.x, p.y, p.z, coarsest));
+                    uniform = closest > margin;
+                }
+            }
+        }
+        if (uniform) {
+            stats.sampleMs += milliseconds(start);
+            start = Clock::now();
+            storeUniform(float(sign * closest));
+            return chunk;
+        }
+    }
+    // Only immutable, full fields may supply old samples. OpenVDB's live
+    // accessor caches traversal state and is used by collision on the main thread.
+    const int priorStride = previous && previous->key == key && previous->field && previous->surfaceBounds && method != Method::Vdb
+                         ? 1 << previous->lod : 0;
     std::vector<float> samples;
     samples.reserve(std::size_t(count) * count * count);
     for (int z = 0; z < count; ++z) for (int y = 0; y < count; ++y) {
         for (int x = 0; x < count; ++x) {
-            const bool boundary = x == 0 || y == 0 || z == 0 || x == cells || y == cells || z == cells;
-            const int stride = 1 << lod;
-            const Key grid{key.x * fineCells + x * stride, key.y * fineCells + y * stride,
-                           key.z * fineCells + z * stride};
-            const Vec point = box.lo + Vec{double(x), double(y), double(z)} * chunk->spacing;
-            const int coarsest = boundary ? boundaryLod(*chunk, x, y, z) : lod;
-            samples.push_back(coarsest == lod ? planet.sdf(point) : interpolateBoundary(planet, layout, grid, coarsest));
+            const bool onBoundary = x == 0 || y == 0 || z == 0 || x == cells || y == cells || z == cells;
+            const int coarsest = onBoundary && hasCoarserEdge ? boundaryLod(*chunk, x, y, z) : lod;
+            if (coarsest != lod) samples.push_back(sampleBoundary(x, y, z, coarsest));
+            else if (!onBoundary && priorStride && ((x * stride | y * stride | z * stride) & (priorStride - 1)) == 0)
+                samples.push_back(previous->field->get(x * stride / priorStride, y * stride / priorStride, z * stride / priorStride));
+            else samples.push_back(planet.sdf(box.lo + Vec{double(x), double(y), double(z)} * chunk->spacing));
         }
     }
     stats.sampleMs += milliseconds(start);
     start = Clock::now();
-    if (planet.preset() != TerrainPreset::Classic) {
+    if (compact) {
         // Test the final samples, including the coarser boundary interpolation.
         // Trilinear cells cannot cross zero when all corners are on one side.
         // Keep signed distances in the band used by contact and seam queries.
         const auto [lowest, highest] = std::minmax_element(samples.begin(), samples.end());
-        const double margin = std::max(16.0, 2 * chunk->spacing);
         if (*lowest > margin || *highest < -margin) {
             storeUniform(*lowest > margin ? *lowest : *highest);
             return chunk;
@@ -557,7 +644,7 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     stats.storageMs += milliseconds(start);
     start = Clock::now();
     meshChunk(*chunk, method != Method::Mesh);
-    stitchFaces(*chunk, planet, layout);
+    if (hasCoarserEdge) stitchFaces(*chunk, boundary, layout);
     stats.meshMs += milliseconds(start);
     if (method == Method::Mesh) chunk->field.reset();
     ++stats.built;

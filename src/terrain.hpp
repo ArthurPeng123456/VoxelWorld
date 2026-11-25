@@ -182,6 +182,7 @@ struct Chunk {
     std::optional<Box> surfaceBounds;
     std::vector<CellRow> rows;
     std::size_t fieldBytes{};
+    double certifiedDistance{};
     const CellRow& row(int y, int z) const { return rows[std::size_t(z) * cells + y]; }
     Cell cell(Key index) const;
     Cell cellAt(Vec p) const;
@@ -211,7 +212,7 @@ std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
 Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift = 0);
 std::array<int, 27> neighborhood(const Layout& layout, Key key);
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
-                                  Method method, bool morton, BuildStats& stats);
+                                  Method method, bool morton, BuildStats& stats, const Chunk* previous = nullptr);
 void meshChunk(Chunk& chunk, bool indexField = true);
 
 }  // namespace voxel

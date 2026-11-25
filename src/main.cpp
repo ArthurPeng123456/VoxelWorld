@@ -562,6 +562,30 @@ void selfTestGlobalTerrain() {
             }
             check(phased.layout() == settled.layout(), "outer batches converge to the complete balanced layout");
         }
+        {
+            Clipmap predicted(-3);
+            const Vec up = unit(start);
+            const auto axes = frameAt(up);
+            const Vec travel = unit(axes[0] + axes[1] * 0.35);
+            predicted.update({start, other}, true, visits);
+            const Vec movedOther = other + frameAt(unit(other))[0] * 1100;
+            for (int i = 1; i <= 24; ++i) {
+                const int distance = i <= 16 ? i * 144 : (32 - i) * 144;
+                const Vec live = planet.surface(unit(start + travel * distance));
+                const ClipmapForecast forecast{{travel * (i <= 16 ? 360 : -360), {}}, 0};
+                const auto prior = predicted.windows();
+                check(prior.front().box.contains(live), "prediction covers a fast Invoker before the next batch publishes");
+                predicted.update({live, movedOther}, true, visits, defaultLod0Radius, true, forecast);
+                const auto windows = predicted.windows();
+                if (i == 1) check(length(windows.front().box.center() - prior.front().box.center()) > 0,
+                                  "the primary fine window rolls first when another Invoker needs to recenter");
+                int moved = 0;
+                for (std::size_t w = 0; w < windows.size(); ++w)
+                    moved += length(windows[w].box.center() - prior[w].box.center()) > 0;
+                check(moved <= 1 && predicted.layout().at(keyAt(live, -3)) == 0,
+                      "fast movement and reversal preserve LOD0 while one window rolls per batch");
+            }
+        }
         for (Vec p : {edge + Vec{730, 150, 30}, edge + Vec{-300, 30, 50}, start}) {
             rolling.update({p, other}, true, visits);
             compareFull();

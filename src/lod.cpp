@@ -138,12 +138,26 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
         std::set<Key> reset;
         for (Key key : idealChanges) {
             const auto box = bounds(key);
+            if (!key.level) {
+                // Base cells cannot contain smaller leaves. Only the leaf
+                // owning the center can overlap this cell's interior.
+                if (const auto leaf = leafAt(ideal, box.center())) reset.insert(*leaf);
+                continue;
+            }
             for (Key leaf : intersectingLeaves(ideal, box))
                 if (overlapsInterior(bounds(leaf), box)) reset.insert(leaf);
         }
         std::set<Key> removed;
         for (Key key : reset) {
             const auto box = bounds(key);
+            if (!key.level) {
+                const auto actual = leafAt(balanced, box.center());
+                if (actual && removed.insert(*actual).second) {
+                    const auto neighbors = intersectingLeaves(balanced, bounds(*actual));
+                    relax.insert(neighbors.begin(), neighbors.end());
+                }
+                continue;
+            }
             for (Key actual : intersectingLeaves(balanced, box)) {
                 const auto actualBox = bounds(actual);
                 if (!overlapsInterior(actualBox, box) || !removed.insert(actual).second) continue;

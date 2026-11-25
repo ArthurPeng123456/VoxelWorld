@@ -15,6 +15,11 @@ struct WorldStats {
     bool windowsChanged{};
 };
 
+struct ClipmapForecast {
+    std::vector<Vec> displacement;
+    std::size_t primary{};
+};
+
 class Clipmap {
 public:
     Clipmap() = default;
@@ -23,7 +28,8 @@ public:
     void setDensityShift(int shift) { densityShift_ = shift; }
     int densityShift() const { return densityShift_; }
     std::set<Key> update(const std::vector<Vec>& invokers, bool global, std::size_t& visits,
-                         std::uint32_t lod0Radius = defaultLod0Radius, bool rolling = false);
+                         std::uint32_t lod0Radius = defaultLod0Radius, bool rolling = false,
+                         const ClipmapForecast& forecast = {});
     std::vector<ClipmapWindow> windows() const;
     const Layout& layout() const { return layout_; }
     std::uint32_t lod0Radius() const { return lod0Radius_; }
@@ -60,7 +66,8 @@ public:
     std::uint32_t lod0Radius() const { return publishedLod0Radius_; }
     bool hasFinestLod(Vec point) const;
     WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {});
-    bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling = false);
+    bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling = false,
+                       ClipmapForecast forecast = {});
     std::optional<WorldStats> pollUpdate(const std::function<bool()>& uploadReady = {});
     std::array<int, lodCount> lodCounts() const;
     TerrainMemory terrainMemory() const;
@@ -78,10 +85,10 @@ private:
         std::map<Key, Physics::Terrain> colliders;
     };
     Batch prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                        std::uint32_t lod0Radius, Clock::time_point start, bool rolling);
+                        std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast);
     Batch planUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                     std::uint32_t lod0Radius, Clock::time_point start, bool rolling);
-    static void build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton);
+                     std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast);
+    void build(Batch& batch, const Layout& layout);
     WorldStats publish(Batch batch);
     const Planet& planet_;
     Method method_;

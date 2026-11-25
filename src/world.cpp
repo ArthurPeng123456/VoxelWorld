@@ -1,5 +1,6 @@
 #include "world.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -19,6 +20,8 @@ double lodAnchorStep(double radius, int lod, int densityShift) {
     const double chunkStride = std::ldexp(gridChunkSize(densityShift), lod - 3);
     return std::min(std::max(128.0, radius / 2), chunkStride);
 }
+
+double maxComponent(Vec v) { return std::max({v.x, v.y, v.z}); }
 
 bool hasVolume(Box box) {
     return box.lo.x < box.hi.x && box.lo.y < box.hi.y && box.lo.z < box.hi.z;
@@ -86,7 +89,7 @@ constexpr std::size_t chunkMetadata = sizeof(Chunk) + sizeof(Chunks::value_type)
 }  // namespace
 
 std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std::size_t& visits,
-                             std::uint32_t lod0Radius, bool rolling) {
+                             std::uint32_t lod0Radius, bool rolling, const ClipmapForecast& forecast) {
     std::set<Key> changed;
     if (global) {
         const bool rebuild = !global_ || layoutDensityShift(layout_) != densityShift_;
@@ -99,41 +102,69 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         const bool sameRadius = lod0Radius_ == lod0Radius;
         const std::size_t noRoll = invokers.size() * windowCount;
         const bool phased = rolling && !rebuild && sameRadius && noRoll == globalWindows_.size();
-        double nearOverdue = 0, outerOverdue = 0;
-        std::size_t nearWindow = noRoll, outerWindow = noRoll;
+        double nearOverdue = 0, outerOverdue = 0, fineRisk = 0;
+        std::size_t nearWindow = noRoll, outerWindow = noRoll, fineWindow = noRoll;
         bool fineBuffer = true;
         for (std::size_t i = 0; i < invokers.size(); ++i) for (int lod = 0; lod < windowCount; ++lod) {
             const auto index = next.size();
             const double radius = std::ldexp(double(lod0Radius), lod);
             const double step = lodAnchorStep(radius, lod, densityShift_);
             const double margin = step / 8;
+            const Vec position = invokers[i];
+            const bool tracksMotion = phased && i < forecast.displacement.size();
+            const bool primary = tracksMotion && i == forecast.primary;
+            const Vec displacement = tracksMotion ? forecast.displacement[i] : Vec{};
+            const double lead = maxComponent(abs(displacement));
+            const bool predicting = lead >= std::min(8.0, radius / 8);
+            const double leadFraction = primary && lod == 0 ? 0.78 : 0.65;
+            const Vec target = predicting ? position + displacement * std::min(1.0, leadFraction * radius / lead) : position;
+            const double guard = tracksMotion ? std::max(step / 2 + margin, 0.33 * radius) : step / 2 + margin;
+            const double liveOffset = phased ? maxComponent(abs(position - globalWindows_[index].box.center())) : 0;
             double overdue = 0;
             int mostOverdueAxis = 0;
             Vec origin;
             for (int axis = 0; axis < 3; ++axis) {
-                const double position = invokers[i][axis];
-                origin[axis] = std::floor(position / step) * step;
+                origin[axis] = std::floor(target[axis] / step) * step;
                 if (!sameRadius || index >= globalAnchors_.size() || globalAnchors_[index].step != step) continue;
                 const double previous = globalAnchors_[index].origin[axis];
-                if (position >= previous - margin && position < previous + step + margin) origin[axis] = previous;
+                const double center = previous + step / 2;
+                if (target[axis] >= center - guard && target[axis] < center + guard) origin[axis] = previous;
                 else {
-                    const double distance = std::abs(position - (previous + step / 2));
+                    const double distance = std::abs(target[axis] - center);
                     if (distance > overdue) { overdue = distance; mostOverdueAxis = axis; }
                 }
             }
-            // During continuous movement, publish one entering and one leaving
-            // slab. A jump beyond the nominal radius recenters its window.
-            if (phased && overdue > 0 && overdue < radius) {
+            // Recover a small overrun in the same slab-sized increments as
+            // normal movement. Larger jumps can recenter in a single batch.
+            const double rollLimit = predicting ? (lod == 0 ? 1.40 * radius : std::numeric_limits<double>::infinity()) : radius;
+            if (phased && overdue > 0 && (tracksMotion ? liveOffset < rollLimit : overdue < radius)) {
                 const auto previous = globalAnchors_[index].origin;
                 const double delta = origin[mostOverdueAxis] - previous[mostOverdueAxis];
+                const double chunkSpan = std::ldexp(gridChunkSize(densityShift_), std::max(0, lod - 3));
+                const double maxRoll = tracksMotion ? std::max(step, std::floor(std::min(0.48 * radius, chunkSpan) / step) * step)
+                                                    : step;
                 origin = previous;
-                origin[mostOverdueAxis] += std::clamp(delta, -step, step);
+                origin[mostOverdueAxis] += std::clamp(delta, -maxRoll, maxRoll);
             }
             next.push_back({origin, step});
             const auto box = Box{origin, origin + splat(step)}.expanded(splat(radius + margin));
             windows.push_back({i, lod, box});
             if (!phased) continue;
             const double urgency = overdue / radius;
+            if (lod == 0 && overdue > 0) {
+                const Vec future = position + displacement;
+                const double risk = maxComponent(abs(future - globalWindows_[index].box.center())) / radius;
+                const bool primaryCovers = tracksMotion && !primary && forecast.primary < invokers.size() &&
+                    globalWindows_[forecast.primary * windowCount].box.contains(position) &&
+                    globalWindows_[forecast.primary * windowCount].box.expanded(splat(-0.12 * radius)).contains(future);
+                if (!primaryCovers && (liveOffset >= radius || (predicting && risk >= (primary ? 0.57 : 0.64)))) {
+                    const double priority = (liveOffset >= radius ? 4.0 : 0.0) + liveOffset / radius + risk * 0.45;
+                    // A following camera can have greater displacement than the
+                    // player. Serve it once the player's fine coverage has slack.
+                    const bool primaryChosen = fineWindow != noRoll && tracksMotion && fineWindow / windowCount == forecast.primary;
+                    if (primary || (!primaryChosen && priority > fineRisk)) { fineRisk = priority; fineWindow = index; }
+                }
+            }
             if (lod < nearLevels) {
                 if (urgency > nearOverdue) { nearOverdue = urgency; nearWindow = index; }
             } else if (urgency > outerOverdue) { outerOverdue = urgency; outerWindow = index; }
@@ -143,8 +174,9 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         // Prioritize the near field. Give a waiting outer window a turn when
         // frequent near rolls still leave every invoker well inside its LOD0.
         const bool doNear = nearWindow != noRoll && (outerWindow == noRoll || nearRolls_ < 3 || !fineBuffer);
-        const auto activeWindow = doNear ? nearWindow : outerWindow;
-        nearRolls_ = phased && doNear && outerWindow != noRoll ? std::min(nearRolls_ + 1, 3) : 0;
+        const auto activeWindow = fineWindow != noRoll ? fineWindow : (doNear ? nearWindow : outerWindow);
+        nearRolls_ = phased && activeWindow != noRoll && activeWindow % windowCount < nearLevels && outerWindow != noRoll
+                     ? std::min(nearRolls_ + 1, 3) : 0;
         for (std::size_t i = 0; i < windows.size(); ++i) {
             if (phased && i != activeWindow) {
                 next[i] = globalAnchors_[i];
@@ -272,14 +304,14 @@ void World::setLod0Radius(std::uint32_t radius) {
 }
 
 World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                                  std::uint32_t lod0Radius, Clock::time_point start, bool rolling) {
+                                  std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
     try {
         // Destruction of VDB trees and mesh BVHs can be expensive. Detach them
         // at publication and free them before the next background build.
         retiredColliders_.clear();
         retiredChunks_.clear();
-        auto batch = planUpdate(sources, global, densityShift, lod0Radius, start, rolling);
-        build(batch, planet_, clipmap_.layout(), method_, morton_);
+        auto batch = planUpdate(sources, global, densityShift, lod0Radius, start, rolling, forecast);
+        build(batch, clipmap_.layout());
         if (prepareTerrain_) prepareTerrain_(chunks, batch.staged, batch.remove);
         recoverPlan_ = false;
         return batch;
@@ -291,26 +323,36 @@ World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, 
 }
 
 World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                              std::uint32_t lod0Radius, Clock::time_point start, bool rolling) {
+                              std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
     Batch batch{};
     batch.start = start;
     clipmap_.setDensityShift(densityShift);
     const auto windowRevision = clipmap_.windowRevision();
-    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits, lod0Radius, rolling);
+    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits, lod0Radius, rolling, forecast);
     batch.stats.windowsChanged = clipmap_.windowRevision() != windowRevision || recoverPlan_;
     const auto& layout = clipmap_.layout();
     const auto& published = chunks;
     batch.stats.changedOwners = changed.size();
     auto dirty = changed;
     if (recoverPlan_) for (const auto& entry : published) dirty.insert(entry.first);
+    std::set<Key> neighborProbes;
     if (!published.empty()) for (const Key key : changed) {
         if (global) {
-            for (Key neighbor : intersectingLeaves(layout, bounds(key).expanded(splat(1e-4)))) dirty.insert(neighbor);
+            if (!key.level && key.densityShift == densityShift) {
+                // Every leaf touching a base chunk owns one of these sectors.
+                // Neighboring changed chunks share probes, so resolve each once.
+                visitBox(window(key, 0), [&](Key probe) { neighborProbes.insert(probe); });
+            } else for (Key neighbor : intersectingLeaves(layout, bounds(key).expanded(splat(1e-4)))) {
+                dirty.insert(neighbor);
+            }
         } else {
             visitBox(window(key, 0), [&](Key neighbor) {
                 if (layout.find(neighbor) != layout.end()) dirty.insert(neighbor);
             });
         }
+    }
+    for (const auto probe : neighborProbes) {
+        if (const auto neighbor = leafAt(layout, bounds(probe).center())) dirty.insert(*neighbor);
     }
     for (const Key key : dirty) {
         const auto desired = layout.find(key);
@@ -327,7 +369,7 @@ World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int
     return batch;
 }
 
-void World::build(Batch& batch, const Planet& planet, const Layout& layout, Method method, bool morton) {
+void World::build(Batch& batch, const Layout& layout) {
     if (batch.build.empty()) return;
     struct BuiltChunk { std::unique_ptr<Chunk> chunk; BuildStats stats; Physics::Terrain collider; };
     std::vector<BuiltChunk> built(batch.build.size());
@@ -335,8 +377,11 @@ void World::build(Batch& batch, const Planet& planet, const Layout& layout, Meth
     arena.execute([&] {
         tbb::parallel_for(tbb::blocked_range<std::size_t>(0, built.size(), 4), [&](const auto& range) {
             for (auto i = range.begin(); i != range.end(); ++i) {
-                built[i].chunk = buildChunk(planet, layout, batch.build[i], method, morton, built[i].stats);
-                built[i].collider = Physics::prepareTerrain(*built[i].chunk, method);
+                const auto key = batch.build[i];
+                const auto previous = chunks.find(key);
+                built[i].chunk = buildChunk(planet_, layout, key, method_, morton_, built[i].stats,
+                                            previous == chunks.end() ? nullptr : previous->second.get());
+                built[i].collider = Physics::prepareTerrain(*built[i].chunk, method_);
             }
         });
     });
@@ -388,10 +433,10 @@ WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::opt
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
-    return publish(prepareUpdate(sources, global, densityShift_, lod0Radius_, start, false));
+    return publish(prepareUpdate(sources, global, densityShift_, lod0Radius_, start, false, {}));
 }
 
-bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling) {
+bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling, ClipmapForecast forecast) {
     if (building_.valid() || ready_) return false;
     const auto start = Clock::now();
     auto sources = invokers;
@@ -399,8 +444,8 @@ bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec cam
     // Published chunks are read-only until this worker finishes. Only the worker
     // touches the planner; queries and physics continue using the published chunks.
     building_ = std::async(std::launch::async, [this, densityShift = densityShift_, lod0Radius = lod0Radius_,
-            global, start, rolling, sources = std::move(sources)] {
-        return prepareUpdate(sources, global, densityShift, lod0Radius, start, rolling);
+            global, start, rolling, sources = std::move(sources), forecast = std::move(forecast)] {
+        return prepareUpdate(sources, global, densityShift, lod0Radius, start, rolling, forecast);
     });
     return true;
 }

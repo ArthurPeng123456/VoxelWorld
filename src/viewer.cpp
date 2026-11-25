@@ -11,6 +11,7 @@
 #include <tbb/task_arena.h>
 
 #include <fstream>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -298,12 +299,15 @@ public:
         if (!opts_.captures.empty()) return captureAll();
         std::ofstream profile;
         int profileFrame = 0;
+        double profileSeconds = 0;
         if (!opts_.streamProfile.empty()) {
             profile.open(opts_.streamProfile);
             profile.exceptions(std::ios::badbit | std::ios::failbit);
-            profile << "frame,frame_ms,physics_ms,publication_ms,terrain_ms,status_ms,draw_ms,built_chunks\n";
+            profile << "frame,frame_ms,physics_ms,publication_ms,terrain_ms,status_ms,draw_ms,built_chunks,"
+                       "lod0_covered,lod_update_ms,plan_ms,sample_cpu_ms,lod0_headroom_m,rolled_invoker,rolled_lod\n";
             selectCameraTarget(1);
         }
+        std::vector<ClipmapWindow> profiledWindows;
         MSG message{};
         auto previous = Clock::now();
         double accumulator = 0, statsElapsed = 0, streamElapsed = 0;
@@ -330,7 +334,7 @@ public:
             const double elapsed = std::clamp(std::chrono::duration<double>(now - previous).count(), 0.0, 0.1);
             previous = now;
             const auto physicsStart = Clock::now();
-            if (profile.is_open()) moveInvoker(1, 0.25, 0.02, true);
+            if (profile.is_open()) moveInvoker(1, 0.25, elapsed, true);
             else moveControlled(elapsed);
             if (!paused_) {
                 accumulator += elapsed;
@@ -352,8 +356,11 @@ public:
             const double publicationMs = milliseconds(publishStart) - uploadMs;
             const auto terrainStart = Clock::now();
             if (published) applyTerrain(*published, false);
+            const Camera frameCamera = camera();
+            trackClipmapMotion(frameCamera.eye, elapsed);
             streamElapsed += elapsed;
-            if ((streamElapsed >= dt || profile.is_open()) && world_->requestUpdate(invokers_, true, camera().eye, true)) {
+            if ((streamElapsed >= dt || profile.is_open()) &&
+                world_->requestUpdate(invokers_, true, frameCamera.eye, true, clipmapForecast_)) {
                 streamElapsed = 0;
             }
             const double terrainMs = milliseconds(terrainStart) + uploadMs;
@@ -367,12 +374,32 @@ public:
             const double statusMs = milliseconds(statusStart);
             buildObjects();
             const auto drawStart = Clock::now();
-            renderer_->draw(camera(), objects_);
+            renderer_->draw(frameCamera, objects_);
             if (profile.is_open()) {
-                profile << profileFrame << ',' << milliseconds(frameStart) << ',' << physicsMs << ',' << publicationMs << ','
+                const auto& windows = world_->clipmapWindows();
+                const auto point = invokers_[selected_];
+                int rolledInvoker = -1, rolledLod = -1;
+                double headroom = 0;
+                for (std::size_t i = 0; i < windows.size(); ++i) {
+                    const auto& w = windows[i];
+                    if (w.invoker == selected_ && w.lod == 0) {
+                        const auto gap = min(point - w.box.lo, w.box.hi - point);
+                        headroom = std::min({gap.x, gap.y, gap.z});
+                    }
+                    if (published && windows.size() == profiledWindows.size() &&
+                        length(w.box.center() - profiledWindows[i].box.center()) > 0) {
+                        rolledInvoker = int(w.invoker);
+                        rolledLod = w.lod;
+                    }
+                }
+                if (published || profiledWindows.empty()) profiledWindows = windows;
+                profile << profileFrame++ << ',' << milliseconds(frameStart) << ',' << physicsMs << ',' << publicationMs << ','
                         << terrainMs << ',' << statusMs << ',' << milliseconds(drawStart) << ','
-                        << (published ? published->build.built : 0) << '\n';
-                if (++profileFrame == 360) return 0;
+                        << (published ? published->build.built : 0) << ',' << world_->hasFinestLod(invokers_[selected_]) << ','
+                        << (published ? published->updateMs : 0) << ',' << (published ? published->selectMs : 0) << ','
+                        << (published ? published->build.sampleMs : 0) << ',' << headroom << ',' << rolledInvoker << ',' << rolledLod << '\n';
+                profileSeconds += elapsed;
+                if (profileSeconds >= 8) return 0;
             }
         }
         return 0;
@@ -466,6 +493,8 @@ private:
 
     void rebuild() {
         world_.reset();
+        clipmapPositions_.clear();
+        clipmapForecast_ = {};
         preparedTerrain_.clear();
         terrainPages_.clear();
         nextTerrainUpload_ = 0;
@@ -547,6 +576,27 @@ private:
         position = moveOnPlanet(planet_, position, direction, invokerSpeed * elapsed * (faster ? 3 : 1));
     }
 
+    void trackClipmapMotion(Vec cameraEye, double elapsed) {
+        const std::size_t count = invokers_.size() + 1;
+        clipmapForecast_.primary = controlling_ ? selected_ : count - 1;
+        const auto positionAt = [&](std::size_t i) { return i < invokers_.size() ? invokers_[i] : cameraEye; };
+        if (clipmapPositions_.size() != count || elapsed <= 0) {
+            clipmapPositions_.resize(count);
+            for (std::size_t i = 0; i < count; ++i) clipmapPositions_[i] = positionAt(i);
+            clipmapForecast_.displacement.assign(count, {});
+            return;
+        }
+        const double blend = std::min(1.0, elapsed / 0.10);
+        const double lookAhead = std::clamp(0.70 + streamMs_ * 0.0006, 0.70, 1.00);
+        const double jump = 2.0 * world_->lod0Radius();
+        for (std::size_t i = 0; i < count; ++i) {
+            const Vec current = positionAt(i), delta = current - clipmapPositions_[i];
+            clipmapPositions_[i] = current;
+            auto& forecast = clipmapForecast_.displacement[i];
+            forecast = length(delta) > jump ? Vec{} : forecast * (1 - blend) + delta * (lookAhead * blend / elapsed);
+        }
+    }
+
     void updateTerrain(bool force) {
         fullTerrainBuild_ = force;
         const auto stats = world_->update(invokers_, true, camera().eye);
@@ -597,11 +647,24 @@ private:
         prepared.vertices.reserve(page.triangles * 3);
         const bool classic = planet_.preset() == TerrainPreset::Classic;
         const double geologyHalfRange = planet_.preset() == TerrainPreset::Mars ? 4700 : 4500;
+        struct CachedVertex { const Chunk* chunk{}; Vec position; GpuVertex vertex; };
+        std::array<CachedVertex, 256> cache{};
         for (const auto key : page.chunks) {
             const Chunk& chunk = chunkAt(key);
             const double t = std::clamp((chunk.spacing - 400.0) / 1200.0, 0.0, 1.0);
             const double reliefDetail = 1 - t * t * (3 - 2 * t);
             for (const auto& triangle : chunk.mesh) for (const Vec point : triangle.vertices) {
+                std::uint64_t bits[3];
+                static_assert(sizeof(point) == sizeof(bits));
+                std::memcpy(bits, &point, sizeof(bits));
+                const auto hash = bits[0] * 0x9e3779b97f4a7c15ULL ^ bits[1] * 0xbf58476d1ce4e5b9ULL ^
+                                  bits[2] * 0x94d049bb133111ebULL;
+                auto& cached = cache[(hash ^ (hash >> 32)) & (cache.size() - 1)];
+                if (cached.chunk == &chunk && cached.position.x == point.x && cached.position.y == point.y &&
+                    cached.position.z == point.z) {
+                    prepared.vertices.push_back(cached.vertex);
+                    continue;
+                }
                 prepared.bounds.lo = min(prepared.bounds.lo, point);
                 prepared.bounds.hi = max(prepared.bounds.hi, point);
                 const Vec up = unit(point);
@@ -616,7 +679,8 @@ private:
                 const double height = std::clamp(classic ? (elevation + 660) / 850 :
                     (elevation + geologyHalfRange) / (2 * geologyHalfRange), 0.0, 1.0);
                 const double rock = std::clamp(2.4 * (1 - dot(normal, up)), 0.0, 1.0);
-                prepared.vertices.push_back(packVertex(vertex(point, normal, color({height, rock, craterMaterial}, chunk.lod))));
+                cached = {&chunk, point, packVertex(vertex(point, normal, color({height, rock, craterMaterial}, chunk.lod)))};
+                prepared.vertices.push_back(cached.vertex);
             }
         }
     }
@@ -1384,6 +1448,8 @@ private:
     std::unique_ptr<Dx12Renderer> renderer_;
     std::unique_ptr<World> world_;
     std::vector<Vec> invokers_;
+    std::vector<Vec> clipmapPositions_;
+    ClipmapForecast clipmapForecast_;
     std::array<bool, maxInvokers> returning_{};
     std::uint32_t lod0Radius_{defaultLod0Radius};
     std::vector<VisibleBody> shapes_;
