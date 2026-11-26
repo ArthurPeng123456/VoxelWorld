@@ -64,18 +64,23 @@ std::vector<Key> intersectingLeaves(const Layout& layout, Box box) {
 
 std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vector<ClipmapWindow>& windows,
                                  const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits,
-                                 TerrainElevationRange range) {
+                                 TerrainElevationRange range, const Planet* planet) {
     visits = 0;
     if (!rebuild && dirty.empty()) return {};
     std::array<std::vector<Box>, lodCount - 1> levels;
-    for (const auto& window : windows) if (window.lod < int(levels.size())) levels[window.lod].push_back(window.box);
+    int fallbackLod = gridRootLevel(densityShift);
+    if (!windows.empty()) fallbackLod = 0;
+    for (const auto& window : windows) if (window.lod < int(levels.size())) {
+        levels[window.lod].push_back(window.box);
+        fallbackLod = std::max(fallbackLod, window.lod + 1);
+    }
     const auto requestedLod = [&](Box box, bool surface) {
         // Subdividing a uniformly solid or empty node adds no SDF information.
         if (!surface) return lodCount - 1;
         for (int lod = 0; lod < int(levels.size()); ++lod) {
             for (Box window : levels[lod]) if (overlaps(box, window)) return lod;
         }
-        return lodCount - 1;
+        return fallbackLod;
     };
 
     std::set<Key> idealChanges;
@@ -89,14 +94,13 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
         // A change at this node's own resolution or coarser cannot split it
         // or undo an existing split: either decision depends on finer levels.
         if (!force && std::none_of(dirty.begin(), dirty.end(), [&](const ClipmapSlab& slab) {
-                return slab.lod < key.level + 3 && overlaps(box, slab.box);
+                return slab.lod <= key.level && overlaps(box, slab.box);
             })) return;
         ++visits;
-        const bool surface = intersectsPlanetShell(key, range);
+        const bool surface = intersectsPlanetShell(key, range) && (!planet || planet->mayContainSurface(box));
         const int requested = requestedLod(box, surface);
         const auto previous = ideal.find(key);
-        if (key.level && (key.level + 3 > requested ||
-                         (key.level > coarsestSurfaceLevel - densityShift && surface))) {
+        if (key.level && key.level > requested) {
             const bool wasLeaf = previous != ideal.end();
             if (wasLeaf) {
                 ideal.erase(previous);
@@ -105,7 +109,7 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
             children(key, [&](Key child) { self(self, child, force || wasLeaf); });
             return;
         }
-        const int lod = key.level ? key.level + 3 : std::min(requested, 3);
+        const int lod = key.level;
         if (previous != ideal.end() && previous->second == lod) return;
         if (previous == ideal.end() && key.level && !force) {
             children(key, [&](Key child) { eraseSubtree(eraseSubtree, child); });
@@ -184,8 +188,7 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
             balanced.erase(found);
             children(key, [&](Key child) {
                 remember(child);
-                balanced.emplace(child, child.level ? child.level + 3 :
-                    std::min(requestedLod(bounds(child), intersectsPlanetShell(child, range)), 3));
+                balanced.emplace(child, child.level);
                 ++visits;
             });
             children(key, enqueueNeighbors);
@@ -206,16 +209,6 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
         const Box box = bounds(key);
         const auto owner = leafAt(ideal, box.center());
         if (!owner || found->second >= ideal.at(*owner)) continue;
-        if (!key.level) {
-            int target = std::min(ideal.at(*owner), 3);
-            const auto neighbors = intersectingLeaves(balanced, box);
-            for (Key neighbor : neighbors) if (!(neighbor == key)) target = std::min(target, balanced.at(neighbor) + 1);
-            if (target > found->second) {
-                remember(key);
-                found->second = target;
-                relax.insert(neighbors.begin(), neighbors.end());
-            }
-        }
         if (key.level >= owner->level) continue;
         const int parentSpan = 1 << (key.level + 1);
         const Key parent{floorTo(key.x, parentSpan), floorTo(key.y, parentSpan), floorTo(key.z, parentSpan),
@@ -225,7 +218,7 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
         if (!allChildren) continue;
         const Box parentBox = bounds(parent);
         const auto neighbors = intersectingLeaves(balanced, parentBox);
-        const int parentLod = parent.level + 3;
+        const int parentLod = parent.level;
         if (std::any_of(neighbors.begin(), neighbors.end(), [&](Key neighbor) {
                 return !overlapsInterior(bounds(neighbor), parentBox) && balanced.at(neighbor) < parentLod - 1;
             })) continue;
@@ -244,11 +237,11 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
     return changed;
 }
 
-Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits, int densityShift, std::uint32_t lod0Radius) {
+Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits, int densityShift, std::uint32_t lod0Cells) {
     std::vector<ClipmapWindow> windows;
-    const int windowCount = lodWindowCount(lod0Radius);
+    const int windowCount = lodWindowCount(lod0Cells, densityShift);
     for (std::size_t i = 0; i < invokers.size(); ++i) for (int lod = 0; lod < windowCount; ++lod) {
-        const auto extent = splat(std::ldexp(double(lod0Radius), lod));
+        const auto extent = splat(lodSideLength(lod0Cells, densityShift, lod) / 2);
         windows.push_back({i, lod, {invokers[i] - extent, invokers[i] + extent}});
     }
     Layout ideal, layout;

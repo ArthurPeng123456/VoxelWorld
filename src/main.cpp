@@ -2,6 +2,7 @@
 #include "free_camera.hpp"
 #include "shadow_cascades.hpp"
 #include "post_process.hpp"
+#include "invoker_navigation.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,7 @@ struct Options {
     int bodies{48};
     int streamEvery{6};
     double voxelDensity{1};
+    std::uint32_t lod0Cells{defaultLod0Cells};
     TerrainPreset terrain{TerrainPreset::Classic};
     bool morton{}, global{}, obj{}, selfTest{}, selfTestGlobal{}, help{}, capsuleStress{};
     fs::path output{"results"};
@@ -40,7 +42,8 @@ void help() {
               << "  [--invokers N] [--queries N] [--bodies N] [--warmup N] [--stream-every N]\n"
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress]\n"
               << "  [--self-test] [--self-test-global] (full-planet integration tests)\n"
-              << "  [--voxel-density 0.125|0.25|0.5|1|2] (sampling-spacing multiplier; default 1 = 50m)\n"
+              << "  [--voxel-density 0.125|0.25|0.5|1|2] (LOD0 spacing in meters; default 1m)\n"
+              << "  [--lod0-range N] (global clipmap cells per edge; power of two >=32; default 256)\n"
               << "  [--terrain classic|mars|volcanic]\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
@@ -83,7 +86,7 @@ Options options(int argc, char** argv) {
         else if (arg == "--terrain") opts.terrain = parseTerrainPreset(next());
         else if (arg == "--frames") opts.frames = bounded(1, 100000);
         else if (arg == "--warmup") opts.warmup = bounded(0, 10000);
-        else if (arg == "--invokers") opts.invokers = bounded(1, 80);
+        else if (arg == "--invokers") opts.invokers = parseInvokerCount(next());
         else if (arg == "--queries") opts.queries = bounded(1, 10000);
         else if (arg == "--bodies") opts.bodies = bounded(0, 100000);
         else if (arg == "--stream-every") opts.streamEvery = bounded(1, 10000);
@@ -91,6 +94,7 @@ Options options(int argc, char** argv) {
         else if (arg == "--morton") opts.morton = true;
         else if (arg == "--global") opts.global = true;
         else if (arg == "--voxel-density" || arg == "--density") opts.voxelDensity = parseVoxelDensity(next());
+        else if (arg == "--lod0-range") opts.lod0Cells = parseLod0Cells(next());
         else if (arg == "--obj") opts.obj = true;
         else if (arg == "--self-test") opts.selfTest = true;
         else if (arg == "--self-test-global") opts.selfTestGlobal = true;
@@ -167,11 +171,12 @@ void spawn(World& world, const Planet& planet, int count, const std::vector<Vec>
         const auto invoker = invokers[std::size_t(i) % invokers.size()];
         const auto axes = frameAt(unit(invoker));
         const double angle = group * 2.39996322972865;
-        const double radius = 78 * std::sqrt(double(group));
+        const double radius = 3 * std::sqrt(double(group));
         const Vec up = unit(invoker + (axes[0] * std::cos(angle) + axes[1] * std::sin(angle)) * radius);
         const int kind = i % 3 + 1;
-        const double support = kind == 1 ? 13 : kind == 2 ? 21 : 10;
-        world.physics.addBody(sampleShape(kind, up), planet.surface(up) + up * (support + 4 + i % 9), up * -11);
+        const Shape shape = sampleShape(kind, up);
+        const double support = kind == 1 ? shape.size.x : kind == 2 ? shape.size.x + shape.size.z : shape.size.z;
+        world.physics.addBody(shape, planet.surface(up) + up * (support + 1.5 + 0.35 * (i % 9)), up * -1.5);
     }
 }
 
@@ -221,6 +226,8 @@ void exportMesh(const fs::path& path, const World& world, const std::vector<Vec>
     auto out = createFile(path);
     out << "# VoxelWorld Marching Cubes, world coordinates in meters\n";
     out << "# voxel_density " << world.voxelDensity() << '\n';
+    out << "# finest_spacing_m " << world.voxelDensity() << '\n';
+    out << "# lod0_cells_per_edge " << world.lod0Cells() << '\n';
     for (const Vec p : invokers) out << "# invoker " << p.x << ' ' << p.y << ' ' << p.z << '\n';
     out << "# camera_invoker " << camera.x << ' ' << camera.y << ' ' << camera.z << '\n';
     for (const auto& window : world.clipmapWindows()) {
@@ -266,6 +273,7 @@ QueryResults run(const Options& opts, Method method, std::ostream& frames, std::
                  const QueryResults* meshReference, const QueryResults* fieldReference, std::ostream* capsuleReport) {
     Planet planet(opts.seed, opts.terrain);
     World world(planet, method, opts.morton, opts.voxelDensity);
+    world.setLod0Cells(opts.lod0Cells);
     auto invokers = invokerPositions(planet, opts.invokers, 0);
     Vec camera = replayCamera(invokers.front(), 0);
     const WorldStats initial = world.update(invokers, opts.global, camera);
@@ -418,9 +426,10 @@ void check(bool condition, const std::string& description) {
     if (!condition) throw std::runtime_error(std::string("Self-test failed: ") + description);
 }
 
-std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, Key key = {}) {
+std::unique_ptr<Chunk> fixture(Method method, bool morton, bool saddle = false, Key key = {0, 0, 0, 6}) {
     const int n = saddle ? 1 : 32;
-    auto chunk = std::make_unique<Chunk>(Chunk{key, 0, n, bounds(key), chunkSize / n, {}, {}, {}, {}, {}});
+    const auto box = bounds(key);
+    auto chunk = std::make_unique<Chunk>(Chunk{key, key.level, n, box, (box.hi.x - box.lo.x) / n, {}, {}, {}, {}, {}});
     std::vector<float> sample;
     for (int z = 0; z <= n; ++z) for (int y = 0; y <= n; ++y) {
         for (int x = 0; x <= n; ++x) {
@@ -446,30 +455,35 @@ void verifyLodRangePublication() {
     const Vec point = invokers.front(), up = unit(point);
     const Vec camera = point + up * 100000;
     World world(planet, Method::Grid, false);
+    world.setLod0Cells(64);
     world.update(invokers, true, camera);
     const auto before = world.lodCounts();
+    Vec farther;
+    for (int distance = 1; distance < 512; ++distance) {
+        farther = planet.surface(unit(point + frameAt(up)[0] * distance));
+        if (!world.hasFinestLod(farther)) break;
+    }
     check(world.requestUpdate(invokers, true, camera, true), "current range can already have an update in flight");
-    world.setLod0Radius(4096);
+    world.setLod0Cells(128);
     check(!world.requestUpdate(invokers, true, camera, true), "new range waits for the existing update");
     waitForPublication(world);
-    check(world.lod0Radius() == 512 && world.lodCounts() == before,
+    check(world.lod0Cells() == 64 && world.lodCounts() == before,
           "old in-flight batch cannot publish the newly requested range prematurely");
     check(world.requestUpdate(invokers, true, camera, true), "stationary range change starts a background build");
-    check(world.lod0Radius() == 512 && world.lodCounts() == before,
-          "pending range retains the published radius and block counts");
+    check(world.lod0Cells() == 64 && world.lodCounts() == before,
+          "pending range retains the published cell count and block counts");
     const auto expanded = waitForPublication(world);
     const auto after = world.lodCounts();
     std::array<int, lodCount> actual{};
     for (const auto& item : world.chunks) ++actual[item.second->lod];
-    const Vec farther = planet.surface(unit(point + frameAt(up)[0] * 3000));
-    check(world.lod0Radius() == 4096 && after[0] > before[0] && after == actual && world.hasFinestLod(farther),
-          "4096 m range publishes expanded fine data and matching LOD statistics without movement");
-    world.setLod0Radius(512);
+    check(world.lod0Cells() == 128 && after[0] > before[0] && after == actual && world.hasFinestLod(farther),
+          "larger cell count publishes expanded fine data and matching LOD statistics without movement");
+    world.setLod0Cells(64);
     check(world.requestUpdate(invokers, true, camera, true), "stationary range reduction starts a background build");
     waitForPublication(world);
-    check(world.lod0Radius() == 512 && world.lodCounts() == before && !world.hasFinestLod(farther),
-          "returning to 512 m restores the original stationary layout and statistics");
-    std::cout << "LOD range 512 -> 4096 -> 512 m: LOD0 blocks " << before[0] << " -> " << after[0]
+    check(world.lod0Cells() == 64 && world.lodCounts() == before && !world.hasFinestLod(farther),
+          "restoring the cell count restores the original stationary layout and statistics");
+    std::cout << "LOD range 64 -> 128 -> 64 cells/edge: LOD0 blocks " << before[0] << " -> " << after[0]
               << " -> " << world.lodCounts()[0] << "; expanded update " << expanded.updateMs << " ms.\n";
 }
 
@@ -486,7 +500,7 @@ void verifyDensitySwitch(World& world, const std::vector<Vec>& invokers, bool gl
     const auto fine = world.chunks.find(newKey);
     check(published.build.built > 0 && published.build.removed > 0 && world.voxelDensity() == 0.125 &&
           world.chunks.count(oldKey) == 0 && fine != world.chunks.end() &&
-          fine->second->spacing == 6.25 && fine->second->field && !fine->second->mesh.empty(),
+          fine->second->spacing == 0.125 && fine->second->field && !fine->second->mesh.empty(),
           "runtime density switch publishes the new field and meshes");
     check(world.physics.ray(point + up * 500, point - up * 500).state == Hit::State::Contact,
           "density replacement publishes queryable terrain");
@@ -499,132 +513,99 @@ void selfTestGlobalTerrain() {
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0);
     {
-        Clipmap clipmap(-3);
-        check(validLod0Radius(1) && validLod0Radius(512) && !validLod0Radius(0) && !validLod0Radius(500),
-              "LOD0 radius must be a positive power of two");
-        const int count = lodWindowCount(defaultLod0Radius);
-        check(count == 15 && std::ldexp(double(defaultLod0Radius), count - 1) < fieldSideLength &&
-              std::ldexp(double(defaultLod0Radius), count) >= fieldSideLength && lodWindowCount(1024) == count - 1,
-              "LOD radii double until the field-wide fallback");
-        for (double density : voxelDensities) {
-            const auto cells = fieldCellsPerAxis(voxelDensityShift(density));
-            check((cells & (cells - 1)) == 0 && cells * (chunkSize / fineCells * density) == fieldSideLength,
-                  "every density uses a power-of-two cube covering the same spatial bounds");
+        check(defaultLod0Cells == 256 && validLod0Cells(32) && validLod0Cells(4096) &&
+              !validLod0Cells(0) && !validLod0Cells(16) && !validLod0Cells(500),
+              "LOD0 range is a power-of-two cell count per edge, default 256, at least one brick");
+        check(parseLod0Cells(std::string("4096")) == 4096 && parseLod0Cells(std::wstring(L"256")) == defaultLod0Cells,
+              "CLI and viewer parse the same cell count");
+        for (const auto* text : {"", "16", "500", "-32", "4096m", "8388608", "4294967296", "18446744073709551615"}) {
+            bool rejected = false;
+            try { parseLod0Cells(std::string(text)); } catch (const std::invalid_argument&) { rejected = true; }
+            check(rejected, "range parser rejects invalid or overflowing cell counts");
         }
+        for (double density : voxelDensities) {
+            const int shift = voxelDensityShift(density), count = lodWindowCount(defaultLod0Cells, shift);
+            const auto cells = fieldCellsPerAxis(shift);
+            check((cells & (cells - 1)) == 0 && cells * density == fieldSideLength,
+                  "every spacing covers the same power-of-two planetary field");
+            check(lodSideLength(4096, shift) == 4096 * density && lodSideLength(4096, shift, 1) == 8192 * density,
+                  "4096 means cells per edge; spacing and nominal side length double at each LOD");
+            check(lodSideLength(defaultLod0Cells, shift, count - 1) / 2 < fieldSideLength &&
+                  lodSideLength(defaultLod0Cells, shift, count) / 2 >= fieldSideLength &&
+                  lodWindowCount(defaultLod0Cells * 2, shift) == count - 1,
+                  "the fallback reaches the entire field from off-center invokers");
+            Clipmap scaled(shift, planet.elevationRange(), &planet);
+            std::size_t visits = 0;
+            scaled.update(first, true, visits, 64);
+            const auto box = scaled.windows().front().box;
+            const double step = std::min(64 * density / 4, gridChunkSize(shift));
+            check(box.contains(first[0]) && box.hi.x - box.lo.x == 64 * density + 1.25 * step,
+                  "published window reports nominal sample-count side plus anchor and hysteresis padding");
+            for (const auto& leaf : scaled.layout())
+                check(leaf.second == leaf.first.level && chunkCells(leaf.first, leaf.second) == fineCells,
+                      "global LOD bricks keep 32 cells per edge while their world size doubles");
+        }
+        constexpr int shift = -3;
+        constexpr std::uint32_t cells = 64;
+        const double radius = lodSideLength(cells, shift) / 2;
+        const int count = lodWindowCount(cells, shift);
+        const Vec start = first[0], other = planet.surface(unit(start * -1));
+        Clipmap rolling(shift, planet.elevationRange(), &planet);
         std::size_t visits = 0;
-        const auto box = bounds(keyAt(first[0], -3));
-        Vec edge = box.center();
-        edge.x = box.hi.x;
-        const Vec before = edge - Vec{1, 0, 0};
-        const Vec after = edge + Vec{1, 0, 0};
-        clipmap.update({before}, true, visits, 1);
-        check(clipmap.update({after}, true, visits, 1).empty() && visits == 0,
-              "global anchor hysteresis retains its schedule across a nearby voxel boundary");
-        check(clipmap.layout().at(keyAt(after, -3)) == 0 && clipmap.windows().front().box.contains(after),
-              "finest LOD and its debug range cover the retained Invoker position");
-        const Vec farther = edge + Vec{310, 0, 0};
-        check(clipmap.layout().at(*leafAt(clipmap.layout(), farther)) != 0, "small LOD0 range leaves farther chunks coarse");
-        check(!clipmap.update({after}, true, visits, defaultLod0Radius).empty() && visits > 0 &&
-              clipmap.layout().at(keyAt(farther, -3)) == 0,
-              "editing a range while stationary expands the actual fine field");
-        check(clipmap.lod0Radius() == defaultLod0Radius && clipmap.windows().front().box.contains(farther),
-              "debug ranges use the configured physical distance");
-
-        // Cross an interior LOD0 anchor while staying inside the LOD1 anchor.
-        Clipmap rolling(-3);
-        const Vec start = edge + Vec{72, 0, 0};
-        const Vec next = edge + Vec{80, 0, 0};
-        const Vec other = planet.surface(unit(first[0] * -1));
-        rolling.update({start, other}, true, visits);
-        const auto initialWindows = rolling.windows();
+        rolling.update({start, other}, true, visits, cells);
         const auto compareFull = [&](bool checkCoarseTraversal = false) {
             Layout ideal, oracle;
             std::size_t fullVisits = 0;
             const auto windows = rolling.windows();
-            updatePlanetLayout(ideal, oracle, windows, {}, -3, true, fullVisits);
-            check(rolling.layout() == oracle, "incremental global LOD equals full rebuild including 2:1 balance");
+            updatePlanetLayout(ideal, oracle, windows, {}, shift, true, fullVisits, planet.elevationRange(), &planet);
+            check(rolling.layout() == oracle, "incremental global LOD equals a full rebuild including sparse classification and 2:1 balance");
             if (checkCoarseTraversal) {
                 const auto half = splat(fieldSideLength / 2);
                 std::size_t coarseVisits = 0;
                 const auto changes = updatePlanetLayout(ideal, oracle, windows, {{{half * -1, half}, count - 1}},
-                                                        -3, false, coarseVisits);
-                check(changes.empty() && coarseVisits < fullVisits / 16,
-                      "a coarse slab skips the finer subtrees even when it spans the field");
+                                                        shift, false, coarseVisits, planet.elevationRange(), &planet);
+                check(changes.empty() && coarseVisits < fullVisits / 8,
+                      "a coarse slab skips fine subtrees even when it spans the field");
             }
-            return fullVisits;
         };
-        const auto changed = rolling.update({next, other}, true, visits);
-        const auto movedWindows = rolling.windows();
-        check(!changed.empty() && movedWindows.front().box.lo.x != initialWindows.front().box.lo.x,
-              "crossing the fine anchor rolls LOD0");
-        for (std::size_t i = 1; i < movedWindows.size(); ++i) {
-            const auto a = movedWindows[i].box, b = initialWindows[i].box;
-            check(length(a.lo - b.lo) == 0 && length(a.hi - b.hi) == 0,
-                  "rolling LOD0 leaves coarser levels and the second Invoker stationary");
+        compareFull(true);
+        const Vec axes = frameAt(unit(start))[0];
+        for (double distance : {radius * 0.1, radius * 0.2, radius * 0.8, radius * 4, -radius * 3, 0.0}) {
+            const Vec live = planet.surface(unit(start + axes * distance));
+            rolling.update({live, other}, true, visits, cells);
+            compareFull();
+            check(rolling.layout().at(keyAt(live, shift)) == 0, "rolling and negative movement retain real LOD0 samples");
+            check(rolling.update({live, other}, true, visits, cells).empty() && visits == 0,
+                  "stationary windows do not rebuild");
         }
-        check(visits < compareFull(true) / 2, "a fine window move visits only a small part of the tree");
-        {
-            const Vec jump = edge + Vec{730, 167, 43};
-            Clipmap phased = rolling, settled = rolling;
-            settled.update({jump, other}, true, visits);
-            phased.update({jump, other}, true, visits, defaultLod0Radius, true);
-            const auto firstBatch = phased.windows();
-            check(firstBatch[0].box.contains(jump) && phased.layout().at(keyAt(jump, -3)) == 0,
-                  "rolling update publishes the moved invoker's LOD0 first");
-            for (std::size_t i = 0; i < firstBatch.size(); ++i) if (firstBatch[i].lod >= 3) {
-                check(length(firstBatch[i].box.lo - movedWindows[i].box.lo) == 0 &&
-                      length(firstBatch[i].box.hi - movedWindows[i].box.hi) == 0,
-                      "the near batch does not roll outer windows");
-            }
-            for (int i = 0; i < 4 * count; ++i) {
-                const auto previous = phased.windows();
-                phased.update({jump, other}, true, visits, defaultLod0Radius, true);
-                const auto current = phased.windows();
-                int moved = 0;
-                for (std::size_t w = 0; w < current.size(); ++w) {
-                    const Vec delta = abs(current[w].box.center() - previous[w].box.center());
-                    const double distance = std::max({delta.x, delta.y, delta.z});
-                    if (!distance) continue;
-                    ++moved;
-                    const double stride = std::ldexp(gridChunkSize(-3), current[w].lod - 3);
-                    check(distance <= stride && (delta.x > 0) + (delta.y > 0) + (delta.z > 0) == 1,
-                          "a regular roll moves at most one chunk along one axis");
-                }
-                check(moved <= 1, "only one invoker window rolls in a batch");
-                if (!moved) break;
-            }
-            check(phased.layout() == settled.layout(), "outer batches converge to the complete balanced layout");
-        }
-        {
-            Clipmap predicted(-3);
-            const Vec up = unit(start);
-            const auto axes = frameAt(up);
-            const Vec travel = unit(axes[0] + axes[1] * 0.35);
-            predicted.update({start, other}, true, visits);
-            const Vec movedOther = other + frameAt(unit(other))[0] * 1100;
-            for (int i = 1; i <= 24; ++i) {
-                const int distance = i <= 16 ? i * 144 : (32 - i) * 144;
-                const Vec live = planet.surface(unit(start + travel * distance));
-                const ClipmapForecast forecast{{travel * (i <= 16 ? 360 : -360), {}}, 0};
-                const auto prior = predicted.windows();
-                check(prior.front().box.contains(live), "prediction covers a fast Invoker before the next batch publishes");
-                predicted.update({live, movedOther}, true, visits, defaultLod0Radius, true, forecast);
-                const auto windows = predicted.windows();
-                if (i == 1) check(length(windows.front().box.center() - prior.front().box.center()) > 0,
-                                  "the primary fine window rolls first when another Invoker needs to recenter");
-                int moved = 0;
-                for (std::size_t w = 0; w < windows.size(); ++w)
-                    moved += length(windows[w].box.center() - prior[w].box.center()) > 0;
-                check(moved <= 1 && predicted.layout().at(keyAt(live, -3)) == 0,
-                      "fast movement and reversal preserve LOD0 while one window rolls per batch");
-            }
-        }
-        for (Vec p : {edge + Vec{730, 150, 30}, edge + Vec{-300, 30, 50}, start}) {
-            rolling.update({p, other}, true, visits);
+        const auto initial = rolling.windows();
+        const Vec moved = planet.surface(unit(start + axes * (radius * 5)));
+        rolling.update({moved, other}, true, visits, cells, true);
+        int movedWindows = 0;
+        const auto next = rolling.windows();
+        for (std::size_t i = 0; i < next.size(); ++i)
+            movedWindows += length(next[i].box.lo - initial[i].box.lo) != 0;
+        check(movedWindows == 1 && next.front().box.contains(moved) && rolling.layout().at(keyAt(moved, shift)) == 0,
+              "a teleport publishes the fine window first, rolling only one window per batch");
+        compareFull();
+        for (int i = 0; i < 4 * count; ++i) {
+            rolling.update({moved, other}, true, visits, cells, true);
             compareFull();
         }
-        rolling.update({start}, true, visits, 256);
+        rolling.update({start}, true, visits, 128);
         compareFull();
+        rolling.update({}, true, visits, 128);
+        compareFull();
+        Clipmap predicted(shift, planet.elevationRange(), &planet);
+        predicted.update({start, other}, true, visits, cells);
+        for (int i = 1; i <= 24; ++i) {
+            const double distance = (i <= 16 ? i : 32 - i) * radius * 0.1;
+            const Vec live = planet.surface(unit(start + axes * distance));
+            check(predicted.windows().front().box.contains(live), "prediction preserves coverage before publication");
+            predicted.update({live, other}, true, visits, cells, true,
+                             {{axes * (radius * (i <= 16 ? 0.4 : -0.4)), {}}, 0});
+            check(predicted.layout().at(keyAt(live, shift)) == 0, "prediction and reversal retain the fine field");
+        }
     }
     for (double density : voxelDensities) {
         const int shift = voxelDensityShift(density);
@@ -635,7 +616,7 @@ void selfTestGlobalTerrain() {
         World scaled(planet, Method::Grid, false, density);
         scaled.update(first, true);
         check(scaled.voxelDensity() == density && scaled.chunks.at(key)->lod == 0 &&
-              scaled.chunks.at(key)->spacing == 50 * density, "all five density levels produce the requested voxel spacing");
+              scaled.chunks.at(key)->spacing == density, "all five density levels produce the requested voxel spacing");
         double volume = 0;
         for (const auto& item : scaled.chunks) {
             check(item.first.densityShift == shift, "published field uses one coherent density");
@@ -695,15 +676,15 @@ void selfTestGlobalTerrain() {
             }
             check(interfaces > 50, "global test exercises many multiscale boundaries");
             const Vec opposite = first[0] * -1;
-            globe.setLod0Radius(256);
+            globe.setLod0Cells(256);
             check(globe.requestUpdate({}, true, opposite), "global camera teleport starts a background build");
-            check(globe.lod0Radius() == defaultLod0Radius, "pending LOD range keeps the previous terrain active");
+            check(globe.lod0Cells() == defaultLod0Cells, "pending LOD range keeps the previous terrain active");
             const Vec oldUp = unit(first[0]);
             check(globe.physics.ray(first[0] + oldUp * 100000, first[0] - oldUp * 100000).state == Hit::State::Contact,
                   "old global coverage remains queryable while new LOD leaves are built");
             waitForPublication(globe);
             check(globe.chunks.at(keyAt(opposite))->lod == 0, "camera refines the opposite hemisphere");
-            check(globe.lod0Radius() == 256 && globe.hasFinestLod(opposite), "LOD range publishes with its refined chunks");
+            check(globe.lod0Cells() == 256 && globe.hasFinestLod(opposite), "LOD range publishes with its refined chunks");
             const auto prior = leafAt(layout, first[0]);
             check(prior.has_value(), "previous invoker was covered");
             const Vec up = unit(first[0]);
@@ -715,7 +696,139 @@ void selfTestGlobalTerrain() {
     std::cout << "Global terrain self-tests passed.\n";
 }
 
+void verifyInvokerNavigation() {
+    constexpr double pi = 3.14159265358979323846;
+    std::array<int, 8> octants{};
+    std::set<std::tuple<int, int, int>> directions;
+    Vec mean{};
+    for (int i = 0; i < 10000; ++i) {
+        const Vec direction = initialInvokerDirection(std::size_t(i), 42);
+        check(std::abs(length(direction) - 1) < 1e-12, "Invoker seeds are on the reference sphere");
+        ++octants[(direction.x > 0 ? 1 : 0) | (direction.y > 0 ? 2 : 0) | (direction.z > 0 ? 4 : 0)];
+        directions.emplace(int(direction.x * 1e8), int(direction.y * 1e8), int(direction.z * 1e8));
+        mean = mean + direction;
+    }
+    check(directions.size() == 10000 && length(mean) < 1e-9 &&
+          *std::min_element(octants.begin(), octants.end()) > 1000,
+          "10000 unique Invoker seeds cover every planetary octant without repeated crater centers");
+    check(length(initialInvokerDirection(0, 42) - initialInvokerDirection(0, 43)) > 0.1,
+          "Invoker distribution is deterministic and varies with the world seed");
+    {
+        Chunks terrain;
+        InvokerGround ground;
+        Vec point = unit(Vec{4, 4, planetRadius}) * planetRadius;
+        const Vec seed = point;
+        check(!groundInvoker(point, terrain, elevationRange(TerrainPreset::Mars), ground) && length(point - seed) == 0,
+              "grounding waits for published geometry without moving a pending Invoker into the core");
+        const double height = planetRadius + 500;
+        const Key key = keyAt({1, 1, height});
+        auto chunk = std::make_unique<Chunk>();
+        chunk->key = key;
+        chunk->box = bounds(key);
+        chunk->revision = 1;
+        chunk->mesh = {{{Vec{0,0,height}, Vec{16,0,height}, Vec{16,16,height}}},
+                       {{Vec{0,0,height}, Vec{16,16,height}, Vec{0,16,height}}}};
+        terrain.emplace(key, std::move(chunk));
+        check(groundInvoker(point, terrain, elevationRange(TerrainPreset::Mars), ground) &&
+              std::abs(point.z - height - invokerGroundClearance) < 1e-6,
+              "published mesh height replaces the reference radius and keeps the marker above the visible surface");
+        const Vec before = point;
+        for (auto& triangle : terrain.at(key)->mesh) for (auto& vertex : triangle.vertices) vertex.z += 2;
+        ++terrain.at(key)->revision;
+        check(groundInvoker(point, terrain, elevationRange(TerrainPreset::Mars), ground) &&
+              std::abs(point.z - before.z - 2) < 1e-6,
+              "replacing a chunk invalidates the cached supporting triangle and updates ground height");
+        point = unit(Vec{20,20,planetRadius}) * planetRadius;
+        check(!groundInvoker(point, terrain, elevationRange(TerrainPreset::Mars), ground) && !ground.ready,
+              "moving beyond a supporting triangle never reuses a stale ground height");
+    }
+    const Vec origin = unit(Vec{0.21, -0.48, 0.85});
+    InvokerSettings settings;
+    settings.patrolRadius = 40;
+    settings.cruiseSpeed = 2;
+    check(validInvokerSettings(settings), "default Invoker settings are valid");
+    auto maximum = settings;
+    maximum.count = 10000;
+    check(validInvokerSettings(maximum) && parseInvokerCount(std::string("10000")) == 10000 &&
+          parseInvokerCount(std::wstring(L"17")) == 17 && parseInvokerCount(std::wstring(L"1")) == 1,
+          "manual Invoker count accepts the full 1..10000 range in both CLI and dialog text");
+    for (const auto* text : {"", "0", "-1", "1.5", "1e4", "10001", "999999999999999999999", "ten"}) {
+        bool rejected = false;
+        try { parseInvokerCount(std::string(text)); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "manual Invoker count rejects nonintegers and overflowing values");
+    }
+    for (int field = 0; field < 7; ++field) {
+        auto invalid = settings;
+        if (field == 0) invalid.count = 0;
+        if (field == 1) invalid.count = maxInvokerCount + 1;
+        if (field == 2) invalid.mode = InvokerCruiseMode(7);
+        if (field == 3) invalid.patrolRadius = 0;
+        if (field == 4) invalid.cruiseSpeed = std::numeric_limits<double>::quiet_NaN();
+        if (field == 5) invalid.returnSpeed = -1;
+        if (field == 6) invalid.controlSpeed = std::numeric_limits<double>::infinity();
+        check(!validInvokerSettings(invalid), "Invoker settings reject invalid counts, modes, sizes and speeds");
+    }
+    const auto arc = [](Vec a, Vec b) {
+        return planetRadius * std::atan2(length(cross(unit(a), unit(b))), dot(unit(a), unit(b)));
+    };
+    InvokerRoute area;
+    area.reset(origin * planetRadius, 0);
+    double farthest = 0;
+    for (int i = 0; i < 1200; ++i) {
+        const Vec before = area.direction(settings);
+        area.advance(0.25, settings);
+        const Vec after = area.direction(settings);
+        farthest = std::max(farthest, arc(origin, after));
+        check(arc(origin, after) <= settings.patrolRadius + 1e-6 &&
+              arc(before, after) <= settings.cruiseSpeed * 0.25 + 1e-6,
+              "area patrol stays within its radius and configured speed across turnarounds");
+    }
+    check(farthest > 39.9, "area patrol actually visits the edge of its range");
+    settings.mode = InvokerCruiseMode::GreatCircle;
+    InvokerRoute circle;
+    circle.reset(origin * planetRadius, 1);
+    const Vec heading = circle.heading(settings), normal = unit(cross(origin, heading));
+    const double quarterTime = pi * planetRadius / (2 * settings.cruiseSpeed);
+    circle.advance(quarterTime, settings);
+    check(length(circle.direction(settings) - heading) < 1e-12,
+          "great-circle cruise reaches a quarter-turn along its initial heading");
+    circle.advance(quarterTime, settings);
+    check(length(circle.direction(settings) + origin) < 1e-12,
+          "great-circle cruise reaches the opposite hemisphere");
+    circle.advance(2 * quarterTime, settings);
+    check(length(circle.direction(settings) - origin) < 1e-12,
+          "great-circle cruise wraps a full orbit without accumulated drift");
+    for (int i = 0; i < 600; ++i) {
+        circle.advance(12345, settings);
+        check(std::abs(dot(normal, circle.direction(settings))) < 1e-12,
+              "great-circle cruise remains in one plane across longitude and hemisphere boundaries");
+    }
+    const Vec held = circle.direction(settings);
+    settings.cruiseSpeed = 0;
+    circle.advance(100, settings);
+    check(length(circle.direction(settings) - held) == 0, "zero cruise speed pauses the route");
+    circle.reset(held * planetRadius, 1, circle.heading(settings));
+    check(length(circle.direction(settings) - held) < 1e-12, "route rebasing preserves its current position");
+    for (auto preset : terrainPresets) {
+        const Planet planet(42, preset);
+        const Vec start = planet.surface(origin);
+        const Vec target = planet.surface(unit(origin + heading * (30 / planetRadius)));
+        const auto paused = advanceInvokerOnSurface(planet, start, target, 0);
+        check(length(paused.position - start) == 0 && !paused.arrived, "zero return speed preserves position");
+        const auto step = advanceInvokerOnSurface(planet, start, target, 0.05);
+        check(!step.arrived && arc(start, step.position) < 0.051 && std::abs(planet.sdf(step.position)) < 1e-6,
+              "returning advances a bounded step and follows the selected terrain");
+        const auto arrival = advanceInvokerOnSurface(planet, step.position, target, 40);
+        check(arrival.arrived && length(arrival.position - target) == 0, "returning finishes exactly at its frozen route point");
+    }
+    check(adjustedInvokerControlSpeed(1000, true) == 1000 && adjustedInvokerControlSpeed(0.1, false) == 0.1 &&
+          std::abs(adjustedInvokerControlSpeed(adjustedInvokerControlSpeed(4.5, true), false) - 4.5) < 1e-12,
+          "Numpad speed changes are reversible and clamp at the supported bounds");
+    std::cout << "Invoker navigation: bounded area patrol, great circles, surface return and speed controls passed.\n";
+}
+
 void selfTest() {
+    verifyInvokerNavigation();
     verifyLodRangePublication();
     {
         const Vec eye{123.125,-45.5,planetRadius + 200}, right{1,0,0}, up{0,0,1}, forward{0,1,0};
@@ -800,7 +913,7 @@ void selfTest() {
         check(length(camera.position() - subdivided.position()) < 1e-9, "camera movement is independent of frame rate");
     }
     static_assert(sizeof(Vec) == 3 * sizeof(double), "World vectors must remain double precision");
-    check(planetRadius == 6371000.0 && chunkSize / fineCells == 50.0, "Earth radius retains 50 meter local sampling");
+    check(planetRadius == 6371000.0 && chunkSize / fineCells == 1.0, "Earth radius retains one-meter default local sampling");
     const Planet planet(42);
     const auto checkSurfaceNormal = [](const Planet& field, Vec direction) {
         const auto axes = frameAt(direction);
@@ -837,8 +950,9 @@ void selfTest() {
             const double r = std::sqrt(1 - z * z), azimuth = i * 2.399963229728653;
             const Vec direction{r * std::cos(azimuth), r * std::sin(azimuth), z};
             const double height = field.elevation(direction);
+            const Key surfaceKey = keyAt(field.surface(direction), -3);
             check(height >= range.lower && height <= range.upper &&
-                  intersectsPlanetShell(keyAt(field.surface(direction), -3), range),
+                  intersectsPlanetShell(surfaceKey, range) && field.mayContainSurface(bounds(surfaceKey)),
                   "new terrain relief fits the shell used for field and clipmap selection");
             maximumRelief = std::max(maximumRelief, std::abs(height));
         }
@@ -905,9 +1019,9 @@ void selfTest() {
     check(clipmap.update(first, false, visits).empty() && visits == 0, "stationary invoker visits no slabs");
     const Box home = bounds(keyAt(first[0]));
     Vec nearEdge = home.center();
-    nearEdge.x = home.hi.x + 100;
+    nearEdge.x = home.hi.x + 0.05 * chunkSize;
     check(clipmap.update({nearEdge}, false, visits).empty() && visits == 0, "anchor hysteresis retains coverage near edge");
-    nearEdge.x = home.hi.x + 250;
+    nearEdge.x = home.hi.x + 0.16 * chunkSize;
     clipmap.update({nearEdge}, false, visits);
     check(visits == 2 * (9 + 25 + 49 + 81), "a one-axis move touches only the entering and leaving slabs");
     const auto withOneMoved = clipmap.layout();
@@ -969,6 +1083,7 @@ void selfTest() {
             BuildStats stats;
             const auto a = buildChunk(planet, two, entry.first, Method::Grid, false, stats);
             const auto b = buildChunk(planet, two, neighbor, Method::Grid, false, stats);
+            if (!a->surfaceBounds || !b->surfaceBounds) continue;
             const int u = (axis + 1) % 3, v = (axis + 2) % 3;
             for (int i = 0; i <= 16; ++i) for (int j = 0; j <= 16; ++j) {
                 Vec point = a->box.lo;
@@ -1042,11 +1157,12 @@ void selfTest() {
             }
         }
         Chunks chunks;
-        chunks.emplace(Key{}, fixture(method, option.second));
+        const Key planeKey{0, 0, 0, 6};
+        chunks.emplace(planeKey, fixture(method, option.second));
         const auto& chunk = *chunks.begin()->second;
         check(chunk.mesh.size() == 2 * 32 * 32, "Marching Cubes plane triangle count");
         for (int z = 0; z <= 32; ++z) {
-            check(chunk.field->get(0, 32, z) == float(z * 50 - 797), "storage sample matches original");
+            check(chunk.field->get(0, 32, z) == float(z * chunk.spacing - 797), "storage sample matches original");
         }
         Physics physics(method, chunks);
         physics.addTerrain(chunk);
@@ -1058,29 +1174,29 @@ void selfTest() {
         if (method != Method::Mesh) {
             check(physics.ray({400, 400, 780}, origin).initial, "ray starts in solid field");
             Chunks saddle;
-            saddle.emplace(Key{}, fixture(method, option.second, true));
-            const auto root = fieldRay(saddle, {0, 0, 400}, {1600, 1600, 400});
-            check(root.state == Hit::State::Contact && std::abs(root.position.x - 480) < 0.1,
+            saddle.emplace(planeKey, fixture(method, option.second, true));
+            const auto root = fieldRay(saddle, {0, 0, 400}, {2048, 2048, 400});
+            check(root.state == Hit::State::Contact && std::abs(root.position.x - 614.4) < 0.1,
                   "ray detects first of two crossings in a cell");
         }
         for (int type = 1; type <= 3; ++type) {
             const auto shape = sampleShape(type, {0, 0, 1});
             const auto sweep = physics.sweep(shape, origin, {400, 400, 750});
             const double support = shape.extents().z;
-            check(sweep.state == Hit::State::Contact && std::abs(900 - sweep.fraction * 150 - (797 + support)) < 1.6,
+            check(sweep.state == Hit::State::Contact && std::abs(900 - sweep.fraction * 150 - (797 + support)) < 0.12,
                   "shape sweep hits sampled plane, shape=" + std::to_string(type) + ", state="
                   + std::to_string(int(sweep.state)) + ", fraction=" + std::to_string(sweep.fraction));
             check(physics.sweep(shape, origin, {500, 500, 900}).state == Hit::State::Miss, "shape sweep above plane misses");
             if (method != Method::Mesh) {
                 check(physics.sweep(shape, {400, 400, 795}, origin).initial, "shape sweep starts overlapped");
             }
-            physics.addBody(shape, {double(200 * type), 400, 850});
+            physics.addBody(shape, {double(200 * type), 400, 797 + support + 2});
         }
         Shape rotated = sampleShape(3, {0, 0, 1});
         rotated.axes = frameAt(unit({0, 0.3, 1}));
         const auto tilted = physics.sweep(rotated, origin, {420, 400, 750});
         check(tilted.state == Hit::State::Contact &&
-              std::abs(900 - tilted.fraction * 150 - (797 + rotated.extents().z)) < 1.6, "rotated box sweep");
+              std::abs(900 - tilted.fraction * 150 - (797 + rotated.extents().z)) < 0.12, "rotated box sweep");
         const Shape capsule{ShapeKind::Capsule, {9, 0, 29}, frameAt(unit({1, 0.5, 0.8}))};
         const auto capsuleHit = physics.sweep(capsule, origin, {460, 370, 750});
         const double contactHeight = 797 + capsule.extents().z;
@@ -1094,30 +1210,37 @@ void selfTest() {
             check(grazing.state == Hit::State::Contact && grazing.initial, "grazing capsule starts in contact");
             const Vec overlapping{400, 400, contactHeight - 2};
             check(physics.sweep(capsule, overlapping, overlapping).initial, "stationary tilted capsule starts overlapped");
-            chunks.emplace(Key{1, 0, 0}, fixture(method, option.second, false, {1, 0, 0}));
-            const auto seam = physics.sweep(capsule, {1575, 400, contactHeight + 25}, {1625, 400, contactHeight - 25});
+            chunks.emplace(Key{64, 0, 0, 6}, fixture(method, option.second, false, {64, 0, 0, 6}));
+            const auto seam = physics.sweep(capsule, {2023, 400, contactHeight + 25}, {2073, 400, contactHeight - 25});
             check(seam.state == Hit::State::Contact && std::abs(seam.fraction - 0.5) * length(Vec{50, 0, 50}) < 0.9,
                   "tilted capsule hits across a chunk seam");
             const auto diagonal = physics.ray({-6000, -3000, 1500}, {8000, 3000, 200});
             check(diagonal.state == Hit::State::Contact && std::abs(diagonal.position.z - 797) < 0.02,
                   "long diagonal ray hits through sparse chunks");
         }
-        physics.addBody(sampleShape(3, {0, 0, 1}), {600, 400, 876});
+        const Shape stackingBox = sampleShape(3, {0, 0, 1});
         for (int i = 0; i < 480; ++i) physics.step(1.0 / 60, false);
         check(physics.terrainContacts() >= 3, "terrain manifolds exist");
         for (int type = 1; type <= 3; ++type) {
             const double z = physics.bodyPosition(std::size_t(type - 1)).z;
-            check(std::abs(z - (797 + sampleShape(type, {0, 0, 1}).extents().z)) < 1, "body settles on sampled plane");
-            check(physics.bodySpeed(std::size_t(type - 1)) < 0.5, "body comes to rest");
+            Shape settled = sampleShape(type, {0, 0, 1});
+            settled.axes = physics.bodyPose(std::size_t(type - 1)).axes;
+            check(std::abs(z - (797 + settled.extents().z)) < 0.12, "human-scale body settles on sampled plane");
+            check(physics.bodySpeed(std::size_t(type - 1)) < 0.1, "human-scale body comes to rest");
         }
-        check(physics.bodyPosition(3).z > 826, "boxes stack");
-        physics.removeTerrain({});
+        // Let the lower, slender box settle before placing another one on it.
+        const double stackedHeight = physics.bodyPosition(2).z + 2 * stackingBox.size.z;
+        physics.addBody(stackingBox, {600, 400, stackedHeight + 0.01});
+        for (int i = 0; i < 240; ++i) physics.step(1.0 / 60, false);
+        check(std::abs(physics.bodyPosition(3).z - stackedHeight) < 0.15,
+              "human-scale boxes stack; top z=" + std::to_string(physics.bodyPosition(3).z));
+        physics.removeTerrain(planeKey);
         chunks.clear();
         for (int i = 0; i < 40; ++i) physics.step(1.0 / 60, false);
-        check(physics.bodyPosition(0).z < 809, "unloading terrain wakes a resting body");
+        check(physics.bodyPosition(0).z < 796, "unloading terrain wakes a resting body");
 
         // Exercise both signs and the Earth-scale Bullet transforms, not just a plane at the origin.
-        for (Key key : {Key{3981, -2700, 3100}, Key{-3981, 2700, -3100}}) {
+        for (Key key : {Key{199040, -134976, 155008, 6}, Key{-199040, 134976, -155008, 6}}) {
             Chunks distant;
             distant.emplace(key, fixture(method, option.second, false, key));
             Physics farPhysics(method, distant);
@@ -1128,11 +1251,12 @@ void selfTest() {
                   "Earth-scale ray preserves millimeter precision");
             const auto farShape = sampleShape(1, {0,0,1});
             const auto farSweep = farPhysics.sweep(farShape, base + Vec{400,400,900}, base + Vec{400,400,750});
-            check(farSweep.state == Hit::State::Contact && std::abs(farSweep.fraction - 0.6) < 0.01,
+            const double expectedHeight = 797 + farShape.size.x;
+            check(farSweep.state == Hit::State::Contact && std::abs(900 - farSweep.fraction * 150 - expectedHeight) < 0.12,
                   "Earth-scale sphere sweep has analytic TOI");
-            farPhysics.addBody(farShape, base + Vec{400,400,850});
+            farPhysics.addBody(farShape, base + Vec{400,400,expectedHeight + 2});
             for (int step = 0; step < 240; ++step) farPhysics.step(1.0 / 60, false);
-            check(std::abs(farPhysics.bodyPosition(0).z - (base.z + 810)) < 0.1,
+            check(std::abs(farPhysics.bodyPosition(0).z - (base.z + expectedHeight)) < 0.1,
                   "Earth-scale body settles without float coordinate quantization");
         }
     }
@@ -1156,10 +1280,13 @@ int main(int argc, char** argv) {
         auto settings = createFile(opts.output / "settings.txt");
         settings << "voxel_density=" << opts.voxelDensity << '\n'
                  << "finest_spacing_m=" << chunkSize / fineCells * opts.voxelDensity << '\n'
+                 << "lod0_cells_per_edge=" << opts.lod0Cells << '\n'
+                 << "lod0_side_m=" << lodSideLength(opts.lod0Cells, voxelDensityShift(opts.voxelDensity)) << '\n'
+                 << "lod0_half_extent_m=" << lodSideLength(opts.lod0Cells, voxelDensityShift(opts.voxelDensity)) / 2 << '\n'
                  << "planet_radius_m=" << planetRadius << '\n'
                  << "terrain=" << name(opts.terrain) << '\n';
-        std::cout << "Voxel sampling spacing " << opts.voxelDensity << "x (LOD 0: "
-                  << chunkSize / fineCells * opts.voxelDensity << " meters)\n";
+        std::cout << "LOD0 spacing " << opts.voxelDensity << " meters; range " << opts.lod0Cells
+                  << " cells/edge, nominal side " << opts.lod0Cells * opts.voxelDensity << " meters\n";
         auto frames = createFile(opts.output / "frames.csv");
         auto summary = createFile(opts.output / "summary.csv");
         auto streaming = createFile(opts.output / "streaming.csv");

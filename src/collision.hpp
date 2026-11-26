@@ -31,6 +31,8 @@ struct BodyPose {
 };
 
 using Chunks = std::map<Key, std::unique_ptr<Chunk>>;
+Hit triangleRay(const Triangle& triangle, Vec from, Vec to);
+Hit meshRay(const Chunks& chunks, Vec from, Vec to, Triangle* support = nullptr, Key* owner = nullptr);
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to);
 Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to);
 

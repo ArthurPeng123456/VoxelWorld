@@ -71,8 +71,8 @@ constexpr TerrainElevationRange elevationRange(TerrainPreset preset) {
 }
 const char* name(TerrainPreset preset);
 TerrainPreset parseTerrainPreset(std::string_view value);
-constexpr double chunkSize = 1600.0;
 constexpr int fineCells = 32;
+constexpr double chunkSize = double(fineCells); // 1x is one meter per LOD0 cell.
 constexpr int fieldRootLevel() {
     int level = 0;
     double extent = chunkSize;
@@ -80,24 +80,36 @@ constexpr int fieldRootLevel() {
     return level;
 }
 constexpr int rootLevel = fieldRootLevel();
-constexpr int coarsestSurfaceLevel = rootLevel > 3 ? rootLevel - 3 : 0;
-constexpr int lodCount = rootLevel + 7; // The 0.125x grid requires three additional levels.
+constexpr int lodCount = rootLevel + 7; // Includes the 0.125m grid and full-field fallback windows.
 constexpr double fieldSideLength = chunkSize * (1u << (rootLevel + 1));
 static_assert(planetRadius + elevationRange(TerrainPreset::Volcanic).upper < fieldSideLength / 2);
-constexpr std::uint32_t defaultLod0Radius = 512;
-constexpr bool validLod0Radius(std::uint32_t radius) {
-    return radius > 0 && (radius & (radius - 1)) == 0 && radius < fieldSideLength;
-}
-// The first doubled radius reaching the side length is the field-wide fallback.
-constexpr int lodWindowCount(std::uint32_t radius) {
-    if (!validLod0Radius(radius)) return 0;
-    int count = 0;
-    for (double extent = radius; extent < fieldSideLength; extent *= 2) ++count;
-    return count;
-}
 inline double gridChunkSize(int densityShift) { return std::ldexp(chunkSize, densityShift); }
+inline double gridSpacing(int densityShift) { return std::ldexp(1.0, densityShift); }
 constexpr int gridRootLevel(int densityShift) { return rootLevel - densityShift; }
 constexpr std::uint32_t fieldCellsPerAxis(int densityShift) { return fineCells * (1u << (gridRootLevel(densityShift) + 1)); }
+constexpr std::uint32_t defaultLod0Cells = 256;
+constexpr bool validLod0Cells(std::uint32_t cells) {
+    return cells >= fineCells && (cells & (cells - 1)) == 0 && cells < fieldCellsPerAxis(1);
+}
+template<class Text> std::uint32_t parseLod0Cells(const Text& text) {
+    try {
+        if (text.empty()) throw std::invalid_argument("empty range");
+        for (auto c : text) if (c < '0' || c > '9') throw std::invalid_argument("noninteger range");
+        const auto value = std::stoull(text);
+        if (value <= UINT32_MAX && validLod0Cells(std::uint32_t(value))) return std::uint32_t(value);
+    } catch (const std::exception&) {}
+    throw std::invalid_argument("--lod0-range requires a power-of-two cell count per edge, at least 32 and smaller than 8388608");
+}
+inline double lodSideLength(std::uint32_t cells, int densityShift, int lod = 0) {
+    return std::ldexp(double(cells) * gridSpacing(densityShift), lod);
+}
+// The fallback radius must reach the opposite edge even from an off-center invoker.
+inline int lodWindowCount(std::uint32_t cells, int densityShift = 0) {
+    if (!validLod0Cells(cells)) return 0;
+    int count = 0;
+    for (double radius = lodSideLength(cells, densityShift) / 2; radius < fieldSideLength; radius *= 2) ++count;
+    return count;
+}
 constexpr float background = 2400.0f;
 
 struct Key {
@@ -111,6 +123,9 @@ struct Key {
     bool operator<(Key b) const { return std::tie(densityShift, level, x, y, z) < std::tie(b.densityShift, b.level, b.x, b.y, b.z); }
 };
 inline Vec asVec(Key key) { return {double(key.x), double(key.y), double(key.z)}; }
+// Global bricks keep 32 cells per edge at every level. Local benchmark bricks
+// can still hold a lower-resolution field inside a fixed base-chunk box.
+inline int chunkCells(Key key, int lod) { return fineCells >> (lod - key.level); }
 Key keyAt(Vec p, int densityShift = 0);
 Box bounds(Key key);
 bool intersectsPlanetShell(Key key, TerrainElevationRange range = elevationRange(TerrainPreset::Classic));
@@ -125,6 +140,7 @@ public:
     double elevation(Vec direction) const;
     PlanetSurfaceSample sampleSurface(Vec direction, double spacing = 0, bool sampleNormal = true) const;
     float sdf(Vec p) const;
+    bool mayContainSurface(Box box) const;
     Vec surface(Vec direction) const { return direction * (planetRadius + elevation(direction)); }
     Vec invokerDirection(int index, double frame) const;
 private:
@@ -183,7 +199,8 @@ struct Chunk {
     std::vector<CellRow> rows;
     std::size_t fieldBytes{};
     double certifiedDistance{};
-    const CellRow& row(int y, int z) const { return rows[std::size_t(z) * cells + y]; }
+    std::uint64_t revision{}; // Published geometry generation for cached ground queries.
+    const CellRow& row(int y, int z) const { return rows[rows.size() == 1 ? 0 : std::size_t(z) * cells + y]; }
     Cell cell(Key index) const;
     Cell cellAt(Vec p) const;
     Key cellIndex(Vec p) const;
@@ -203,10 +220,10 @@ struct ClipmapWindow {
 struct ClipmapSlab { Box box; int lod; };
 inline int layoutDensityShift(const Layout& layout) { return layout.empty() ? 0 : layout.begin()->first.densityShift; }
 Layout planetLayout(const std::vector<Vec>& invokers, std::size_t* visits = nullptr, int densityShift = 0,
-                    std::uint32_t lod0Radius = defaultLod0Radius);
+                    std::uint32_t lod0Cells = defaultLod0Cells);
 std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vector<ClipmapWindow>& windows,
                                  const std::vector<ClipmapSlab>& dirty, int densityShift, bool rebuild, std::size_t& visits,
-                                 TerrainElevationRange range = elevationRange(TerrainPreset::Classic));
+                                 TerrainElevationRange range = elevationRange(TerrainPreset::Classic), const Planet* planet = nullptr);
 std::optional<Key> leafAt(const Layout& layout, Vec point);
 std::vector<Key> intersectingLeaves(const Layout& layout, Box box);
 Layout selectChunks(const std::vector<Vec>& invokers, bool global, int densityShift = 0);

@@ -620,6 +620,46 @@ struct SweepSearch {
 
 }  // namespace
 
+Hit triangleRay(const Triangle& triangle, Vec from, Vec to) {
+    Hit hit;
+    const Vec delta = to - from;
+    const double distance = length(delta);
+    if (distance <= 0) return hit;
+    const Vec direction = delta / distance;
+    const Vec a = triangle.vertices[0], e1 = triangle.vertices[1] - a, e2 = triangle.vertices[2] - a;
+    const Vec p = cross(direction, e2);
+    const double determinant = dot(e1, p);
+    if (std::abs(determinant) <= 1e-12 * length(e1) * length(e2)) return hit;
+    const Vec offset = from - a;
+    const double u = dot(offset, p) / determinant;
+    if (u < -1e-9 || u > 1 + 1e-9) return hit;
+    const Vec q = cross(offset, e1);
+    const double v = dot(direction, q) / determinant;
+    if (v < -1e-9 || u + v > 1 + 1e-9) return hit;
+    const double fraction = dot(e2, q) / (determinant * distance);
+    if (fraction < 0 || fraction > 1) return hit;
+    hit.state = Hit::State::Contact;
+    hit.fraction = fraction;
+    hit.position = from + delta * fraction;
+    hit.normal = unit(cross(e1, e2));
+    return hit;
+}
+
+Hit meshRay(const Chunks& chunks, Vec from, Vec to, Triangle* support, Key* owner) {
+    Hit hit;
+    forChunks(chunks, from, to, {}, [&](const Chunk& chunk) {
+        for (const auto& triangle : chunk.mesh) {
+            const auto candidate = triangleRay(triangle, from, to);
+            if (candidate.state != Hit::State::Contact ||
+                (hit.state == Hit::State::Contact && candidate.fraction >= hit.fraction)) continue;
+            hit = candidate;
+            if (support) *support = triangle;
+            if (owner) *owner = chunk.key;
+        }
+    });
+    return hit;
+}
+
 Hit fieldRay(const Chunks& chunks, Vec from, Vec to) {
     Hit hit;
     const Vec delta = to - from;
