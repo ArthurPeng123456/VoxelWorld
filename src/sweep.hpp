@@ -14,8 +14,11 @@ namespace voxel {
 // Command-line / toolbar knobs for the sweep (mesh vs field) comparison view.
 struct SweepOptions {
     bool enabled{false};
+    // Invoker count used only while sweep mode is on; the interactive mode
+    // keeps using the global Options::invokers count.
+    int invokers{2};
     int shapesPerInvoker{21};
-    int frames{1};
+    int frames{100};
     int frame{-1};       // Negative opens on the worst cast; >= 0 starts on that frame.
     int warmup{1};
     int budget{48000};

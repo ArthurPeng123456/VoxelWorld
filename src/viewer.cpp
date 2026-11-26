@@ -194,7 +194,11 @@ Options readOptions() {
             if (n < 1 || n > maxInvokers) throw std::invalid_argument("Invoker count must be from 1 to 16");
             result.invokers = int(n);
         } else if (option == L"--sweep") result.sweep.enabled = true;
-        else if (option == L"--shapes-per-invoker") result.sweep.shapesPerInvoker = bounded(1, 84);
+        else if (option == L"--sweep-invokers") {
+            const auto n = integer();
+            if (n < 1 || n > 1000) throw std::invalid_argument("Sweep invoker count must be from 1 to 1000");
+            result.sweep.invokers = int(n);
+        } else if (option == L"--shapes-per-invoker") result.sweep.shapesPerInvoker = bounded(1, 84);
         else if (option == L"--sweep-frames") result.sweep.frames = bounded(1, 400);
         else if (option == L"--sweep-warmup") result.sweep.warmup = bounded(0, 20);
         else if (option == L"--sweep-budget") result.sweep.budget = bounded(1, 10000000);
@@ -599,7 +603,8 @@ private:
         shapes_.clear();
         controlling_ = false;
         returning_.fill(false);
-        invokers_ = invokerPositions(planet_, opts_.invokers, 0);
+        const int sweepCount = sweepMode_ ? opts_.sweep.invokers : opts_.invokers;
+        invokers_ = invokerPositions(planet_, sweepCount, 0);
         refreshCameraTargets();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity,
             [this](const Chunks& live, const Chunks& staged, const std::vector<Key>& removed) {
