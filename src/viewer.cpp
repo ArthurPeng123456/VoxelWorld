@@ -24,14 +24,17 @@ constexpr double pi = 3.14159265358979323846;
 constexpr double dt = 1.0 / 60.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
+// Two contact points closer than this along the mesh normal count as the same
+// answer: the verdict then calls the cast OK instead of early or penetrating.
+constexpr double sweepContactSlack = 0.1;
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Sweep };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, Wireframe> toolbarButtons{{
+constexpr std::array<ToolbarButton, Sweep> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
-    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}
+    {L"Ranges [K]", 84}, {L"Wireframe [W]", 110}, {L"Sweep [S]", 88}
 }};
 
 struct Options {
@@ -124,6 +127,16 @@ std::uint32_t color(Vec rgb, int code) {
 
 Vertex vertex(Vec p, Vec normal, std::uint32_t material) {
     return {{float(p.x), float(p.y), float(p.z)}, {float(normal.x), float(normal.y), float(normal.z)}, material};
+}
+
+// How the backend's contact sits against the mesh surface, as the normal-projected
+// gap between the two points: EA means it stopped early and floats above the surface,
+// PT that it went through it, OK that the two answers agree to within the slack.
+const wchar_t* contactTag(Vec delta, Vec normal) {
+    const double gap = dot(delta, normal);
+    if (gap > sweepContactSlack) return L"EA";
+    if (gap < -sweepContactSlack) return L"PT";
+    return L"OK";
 }
 
 void flatTriangle(std::vector<Vertex>& batch, Vec a, Vec b, Vec c, Vec outward, std::uint32_t material) {
@@ -379,9 +392,12 @@ private:
     struct SweepTally {
         int meshContacts{}, backendContacts{}, meshMiss{}, backendMiss{};
         int meshUnresolved{}, backendUnresolved{}, initial{}, conflicts{}, refusals{}, paired{};
-        int negativeGap{}, beyond{};
+        // How the two contact points sit relative to the mesh surface: EA = the
+        // backend stopped early and floats above it, PT = it penetrated through it,
+        // OK = the two agree to within sweepContactSlack metres.
+        int early{}, penetrating{}, exact{};
         double meanError{}, maxError{}, medianError{}, p95Error{};
-        double meanPath{}, meanPoint{}, maxPoint{}, meanGap{};
+        double meanPath{}, meanPoint{}, maxPoint{};
         // Where the worst cast of the pass lives, so the window can open on it.
         int worstError{-1}, worstPoint{-1};
         std::vector<double> errors;
@@ -414,6 +430,26 @@ private:
         }
         updateFooter();
         repaintButtons();
+    }
+
+    // The toolbar's sweep switch: the same view --sweep builds at startup, turned
+    // on and off at run time. Both directions re-create the world, because sweep
+    // mode must run against a world with no rigid bodies in it (a body in the way
+    // would answer the cast) and the interactive mode needs them back. Entering
+    // pins the invokers to frame 0, builds the mesh reference, runs main.cpp's
+    // validate pass and opens on the cast that disagrees worst.
+    void setSweep(bool on) {
+        if (sweepMode_ == on) return;
+        sweepMode_ = on;
+        if (!on) {
+            sweepMesh_.reset();
+            focusValid_ = false;
+            surfaceDistance_ = 1950.0;
+        }
+        // Sweep mode has no rigid bodies, so the drop button would do nothing.
+        EnableWindow(buttons_[Drop - 1], on ? FALSE : TRUE);
+        SetWindowTextW(window_, on ? L"VoxelWorld  |  Sweep: mesh vs field" : L"VoxelWorld  |  Planet collision viewer");
+        rebuild();
     }
 
     void spawn(int index) {
@@ -526,18 +562,14 @@ private:
             }
         }
 
-        // The backend pass is the one that is timed, exactly like main's timePass.
-        const auto timer = Clock::now();
-        for (SweepCast& cast : sweepCasts_) cast.hit = world_->physics.sweep(cast.shape, cast.from, cast.to);
-        sweepUs_ = milliseconds(timer) * 1000;
-
-        // The untimed pass issues both backends on every cast of every frame.
+        // One pass issues both backends on every cast of every frame.
         for (SweepCast& cast : sweepCasts_) {
+            const Hit otherHit = world_->physics.sweep(cast.shape, cast.from, cast.to);
+            cast.hit = otherHit;
             cast.hasMesh = sweepMesh_ != nullptr;
             if (!cast.hasMesh) continue;
             cast.meshHit = sweepMesh_->physics.sweep(cast.shape, cast.from, cast.to);
             const Hit& meshHit = cast.meshHit;
-            const Hit& otherHit = cast.hit;
             const double span = length(cast.to - cast.from);
             tally_.meshContacts += meshHit.state == Hit::State::Contact;
             tally_.backendContacts += otherHit.state == Hit::State::Contact;
@@ -559,7 +591,6 @@ private:
                 }
                 const double path = tally_.errors.back();
                 const double point = length(otherHit.position - meshHit.position);
-                const double gap = dot(otherHit.position - meshHit.position, meshHit.normal);
                 ++tally_.paired;
                 if (point > tally_.maxPoint) {
                     tally_.maxPoint = point;
@@ -567,9 +598,10 @@ private:
                 }
                 tally_.meanPath += path;
                 tally_.meanPoint += point;
-                tally_.meanGap += gap;
-                tally_.negativeGap += gap < 0;
-                tally_.beyond += std::abs(gap) > sweepToleranceMeters();
+                const std::wstring tag = contactTag(otherHit.position - meshHit.position, meshHit.normal);
+                if (tag == L"EA") ++tally_.early;
+                else if (tag == L"PT") ++tally_.penetrating;
+                else ++tally_.exact;
             }
         }
         std::sort(tally_.errors.begin(), tally_.errors.end());
@@ -589,7 +621,6 @@ private:
         }
         tally_.meanPath /= double(paired);
         tally_.meanPoint /= double(paired);
-        tally_.meanGap /= double(paired);
     }
 
     // Point the camera at the cast under inspection, close enough that the path,
@@ -880,6 +911,9 @@ private:
             refreshLines();
         }
         else if (command == Pause) paused_ = !paused_;
+        // The sweep comparison is a whole different world: rebuild on the way in
+        // and on the way out.
+        else if (command == Sweep) setSweep(!sweepMode_);
         // Sweep mode has no rigid bodies to drop.
         else if (command == Drop && !sweepMode_) {
             surface_ = true;
@@ -911,6 +945,7 @@ private:
         else if (code == 'L') action(Tint);
         else if (code == 'K') action(Ranges);
         else if (code == 'W') action(Wireframe);
+        else if (code == 'S') action(Sweep);
         else if (code == 'N' && sweepMode_) {
             // Jump to the first cast of the next frame in the validated set.
             const int perFrame = int(invokers_.size()) * opts_.shapesPerInvoker;
@@ -1057,7 +1092,7 @@ private:
                 const SweepCast& cast = sweepCasts_[std::size_t(castIndex_)];
                 const double span = length(cast.to - cast.from);
                 sweep << L"start (" << std::llround(cast.from.x) << L' ' << std::llround(cast.from.y) << L' '
-                      << std::llround(cast.from.z) << L") sweep " << std::setprecision(0) << span << L" m   |   ";
+                      << std::llround(cast.from.z) << L") length " << std::setprecision(0) << span << L" m   |   ";
                 if (cast.hasMesh) {
                     const auto& hit = cast.meshHit;
                     if (hit.state == Hit::State::Contact) {
@@ -1070,19 +1105,17 @@ private:
                     sweep << L"S (" << std::llround(hit.position.x) << L' ' << std::llround(hit.position.y) << L' '
                           << std::llround(hit.position.z) << L") f " << std::setprecision(3) << hit.fraction << L"   |   ";
                     if (cast.hasMesh && cast.meshHit.state == Hit::State::Contact) {
-                        // Same three numbers as main's --sweep-last row.
-                        sweep << L"path " << std::abs(hit.fraction - cast.meshHit.fraction) * span << L" point "
-                              << length(hit.position - cast.meshHit.position) << L" gap "
-                              << dot(hit.position - cast.meshHit.position, cast.meshHit.normal) << L" m   |   ";
+                        sweep << L"toi " << std::abs(hit.fraction - cast.meshHit.fraction) * span << L"  point "
+                              << length(hit.position - cast.meshHit.position) << L" m   |   "
+                              << contactTag(hit.position - cast.meshHit.position, cast.meshHit.normal);
                     }
-                } else sweep << L"S miss   |   ";
+                } else sweep << L"S miss";
             }
-            sweep << std::setprecision(0) << sweepUs_ << L" us   |   L/R step   /   N next frame   /   C next mismatch   /   E worst toi   /   O worst point   /   V revalidate";
             controls = sweep.str();
         } else if (lodTint_ || showRanges_) {
             controls = L"LOD 0 Cyan 50 m   /   LOD 1 Green 100 m   /   LOD 2 Gold 200 m   /   LOD 3 Violet 400 m";
         } else {
-            controls = L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies";
+            controls = L"Drag to orbit   /   Wheel to zoom   /   Tab to select Invoker   /   Space to pause   /   B to drop bodies   /   S to sweep vs mesh";
         }
         DrawTextW(dc, controls.c_str(), -1, &row, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         if (sweepMode_) {
@@ -1093,17 +1126,16 @@ private:
             std::wostringstream totals;
             totals << std::fixed;
             if (sweepMesh_) {
-                // The same verdict main.cpp prints: contacts per backend, refusals
-                // kept apart from conflicts, the toi error distribution, and the
-                // space metrics of the --sweep-last dump.
+                // The same verdict main.cpp prints, minus the timing block: contacts
+                // per backend, refusals kept apart from conflicts, the worst toi
+                // error, the mean path and point deltas, and how the two contact
+                // points sit against the mesh surface.
                 totals << L"all " << sweepCasts_.size() << L" | contacts mesh/backend " << tally_.meshContacts << L'/'
                        << tally_.backendContacts << L", conf " << tally_.conflicts << L", refuse " << tally_.refusals
-                       << L", init " << tally_.initial << L", paired " << tally_.paired << L" | toi err mean/med/p95/max "
-                       << std::setprecision(2) << tally_.meanError << L'/' << tally_.medianError << L'/' << tally_.p95Error
-                       << L'/' << tally_.maxError << L" m | path/point/gap " << std::setprecision(3) << tally_.meanPath
-                       << L'/' << tally_.meanPoint << L'/' << tally_.meanGap << L" (pt max " << tally_.maxPoint << L", "
-                       << tally_.negativeGap << L" in, " << tally_.beyond << L" >" << std::setprecision(2)
-                       << sweepToleranceMeters() << L")";
+                       << L", init " << tally_.initial << L", paired " << tally_.paired << L" | toi max "
+                       << std::setprecision(3) << tally_.maxError << L" m | mean path/point " << tally_.meanPath << L'/'
+                       << tally_.meanPoint << L" m | EA " << tally_.early << L"  PT " << tally_.penetrating << L"  OK "
+                       << tally_.exact;
             } else {
                 totals << L"all " << sweepCasts_.size() << L": the active backend is the mesh, nothing to compare";
             }
@@ -1116,7 +1148,8 @@ private:
         const int button = int(item.CtlID);
         const bool active = button == method_ + Mesh || (button == View && surface_) ||
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
-                            (button == Wireframe && wireframe_) || (button == Pause && paused_);
+                            (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
+                            (button == Sweep && sweepMode_);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -1233,7 +1266,7 @@ private:
     std::wstring status_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
     POINT mouse_{};
-    double simulationTime_{}, streamMs_{}, fps_{}, sweepUs_{};
+    double simulationTime_{}, streamMs_{}, fps_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{64100}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
 };
 
