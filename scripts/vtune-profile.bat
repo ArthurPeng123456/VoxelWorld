@@ -45,7 +45,7 @@ vtune -collect hotspots ^
     -result-dir="%RESULT_DIR%" ^
     -search-dir="%WORK_DIR%" ^
     -search-dir="%PROJECT%\out\build\x64-Release" ^
-    -- "%EXE_PATH%" --trajectory --scheme grid --invokers 6 --frames 600 --spawn-every 10 --stream-every 6 --obj --out traj_mesh600
+    -- "%EXE_PATH%"
 if errorlevel 1 (
     echo Collection failed.
     pause

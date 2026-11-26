@@ -462,32 +462,246 @@ bool touchesAtStart(const Shape& shape, const std::array<Vec, 3>& triangle, Vec 
     return false;
 }
 
-// One triangle of the cell against the same moving convex shape Physics::sweep casts,
-// through the same Bullet primitive btCollisionWorld::convexSweepTest ends up running
-// per triangle of a concave shape: a btContinuousConvexCollision (GJK cast plus a
-// penetration depth solver for the touching case) against a btTriangleShape.
-bool castTriangle(const Shape& shape, const btConvexShape& convex, const std::array<Vec, 3>& triangle,
-                  Vec from, Vec to, double& fraction, Vec& point, Vec& normal) {
-    const btTriangleShape local(bullet(triangle[0]), bullet(triangle[1]), bullet(triangle[2]));
-    const btTriangleShape triangleShape = [&] {
-        btTriangleShape shape = local;
-        // Same margin the mesh backend's per-triangle callback sets, so the two
-        // paths measure the same expanded triangle.
-        shape.setMargin(btScalar(contactMargin));
-        return shape;
-    }();
-    btVoronoiSimplexSolver simplex;
-    btGjkEpaPenetrationDepthSolver penetration;
-    btContinuousConvexCollision cast(&convex, &triangleShape, &simplex, &penetration);
-    btConvexCast::CastResult result;
-    result.m_fraction = btScalar(1.0);
-    const btTransform start = pose(shape, from), end = pose(shape, to);
-    btTransform fixed;
-    fixed.setIdentity();
-    if (!cast.calcTimeOfImpact(start, end, fixed, fixed, result)) return false;
-    fraction = double(result.m_fraction);
-    point = voxelVec(result.m_hitPoint);
-    normal = voxelVec(result.m_normal);
+// ---------------------------------------------------------------------------
+// Closed-form triangle sweep.
+//
+// The field answers on the cell's marching cubes triangles, so a cast here is the
+// same problem the mesh backend solves: one convex shape translated along a
+// segment against one static triangle. This solves that problem in closed form
+// instead of handing it to Bullet.
+//
+// The shape's centre travels p(t) = from + (to - from) t, so a contact exists
+// exactly when p(t) reaches the boundary of the Minkowski sum T (+) -A. For a box
+// that sum is a polytope, and a segment test against its half spaces is exact:
+// every facet normal of T (+) box is a box axis, the triangle normal, or a cross
+// product of a triangle edge with a box axis. For a sphere or a capsule the sum is
+// the triangle -- swept along the capsule's cylindrical segment -- with each face
+// offset outward by r, each edge swept into a cylinder of radius r and each corner
+// swept into a ball of radius r. Every candidate is one quadratic and one
+// containment test, so the answer is the exact contact: no iteration, no
+// tolerance, no margin.
+Vec closestOnTriangle(const std::array<Vec, 3>& triangle, Vec point) {
+    const Vec& a = triangle[0];
+    const Vec& b = triangle[1];
+    const Vec& c = triangle[2];
+    const Vec ab = b - a, ac = c - a, ap = point - a;
+    const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) return a;
+    const Vec bp = point - b;
+    const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) return b;
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) return a + ab * (d1 / (d1 - d3));
+    const Vec cp = point - c;
+    const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return c;
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return a + ac * (d2 / (d2 - d6));
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    const double denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+// Is the in-plane point inside the convex face polygon? The winding is not trusted,
+// so every edge is checked against the polygon's own centroid instead.
+bool insideFace(const Vec& point, const Vec* vertices, int count, const Vec& normal) {
+    Vec center{};
+    for (int i = 0; i < count; ++i) center = center + vertices[i];
+    center = center * (1.0 / double(count));
+    for (int i = 0; i < count; ++i) {
+        const Vec& a = vertices[i];
+        const Vec& b = vertices[(i + 1) % count];
+        const Vec edge = b - a;
+        const double scale = length(edge);
+        if (scale <= 0) continue;
+        const double here = dot(cross(edge, point - a), normal);
+        const double reference = dot(cross(edge, center - a), normal);
+        const double slack = 1e-7 * scale;
+        if (reference > 0 ? here < -slack : here > slack) return false;
+    }
+    return true;
+}
+
+// Smallest t in [0, 1] with the shape's centre at from + (to - from) t touching
+// this triangle, plus the contact point and the outward normal there.
+bool triangleSweep(const Shape& shape, const std::array<Vec, 3>& triangle, Vec from, Vec to, double& fraction,
+                   Vec& point, Vec& normal) {
+    const Vec d = to - from;
+    const double dd = dot(d, d);
+    if (dd <= 1e-18) return false;
+
+    double best = 2.0;
+    Vec bestNormal{};
+    auto report = [&](double t, Vec direction) {
+        if (!(t >= 0 && t <= 1) || t >= best) return;
+        const Vec facing = unit(direction, {});
+        if (length(facing) <= 0) return;
+        best = t;
+        bestNormal = facing;
+    };
+
+    if (shape.kind == ShapeKind::Box) {
+        std::array<Vec, 26> planes{};
+        std::array<double, 26> offsets{};
+        int count = 0;
+        auto addAxis = [&](Vec direction) {
+            const Vec n = unit(direction, {});
+            if (length(n) <= 0) return;
+            for (int flipped = 0; flipped < 2; ++flipped) {
+                const Vec m = flipped == 0 ? n : n * -1;
+                double reach = -std::numeric_limits<double>::infinity();
+                for (const Vec& v : triangle) reach = std::max(reach, dot(m, v));
+                // h_T(m) + h_{-A}(m): the sum holds every tau - alpha, tau on the
+                // triangle, alpha in the shape.
+                planes[std::size_t(count)] = m;
+                offsets[std::size_t(count)] = reach + dot(m * -1, support(shape, m * -1));
+                ++count;
+            }
+        };
+        for (const Vec& axis : shape.axes) addAxis(axis);
+        addAxis(cross(triangle[1] - triangle[0], triangle[2] - triangle[0]));
+        for (int i = 0; i < 3; ++i) {
+            const Vec edge = triangle[std::size_t((i + 1) % 3)] - triangle[std::size_t(i)];
+            for (const Vec& axis : shape.axes) addAxis(cross(edge, axis));
+        }
+        double entry = -std::numeric_limits<double>::infinity();
+        int limiting = -1;
+        for (int i = 0; i < count; ++i) {
+            // A plane m.x = h is crossed into the body while m.d < 0, so those are the
+            // only candidates for the entry time, and the entry is the latest of them.
+            const double slope = dot(planes[std::size_t(i)], d);
+            if (slope >= -1e-12) continue;
+            const double t = (offsets[std::size_t(i)] - dot(planes[std::size_t(i)], from)) / slope;
+            if (t > entry) {
+                entry = t;
+                limiting = i;
+            }
+        }
+        if (limiting < 0 || entry < 0 || entry > 1) return false;
+        const Vec position = from + d * entry;
+        for (int i = 0; i < count; ++i) {
+            const double offset = offsets[std::size_t(i)];
+            if (dot(planes[std::size_t(i)], position) > offset + 1e-9 * std::max(1.0, std::abs(offset))) return false;
+        }
+        report(entry, planes[std::size_t(limiting)]);
+    } else {
+        const double radius = shape.size.x;
+        std::array<Vec, 6> vertices{};
+        std::array<std::array<int, 2>, 9> edges{};
+        struct Face { std::array<Vec, 4> corners; int count; Vec normal; };
+        std::array<Face, 5> faces{};
+        int vertexCount = 0, edgeCount = 0, faceCount = 0;
+        auto addFace = [&](const Vec* corners, int corner_count, Vec facing) {
+            const Vec n = unit(facing, {});
+            if (length(n) <= 0 || faceCount >= int(faces.size())) return;
+            Face& face = faces[std::size_t(faceCount)];
+            face.count = corner_count;
+            face.normal = n;
+            for (int i = 0; i < corner_count; ++i) face.corners[std::size_t(i)] = corners[i];
+            ++faceCount;
+        };
+
+        if (shape.kind == ShapeKind::Sphere) {
+            for (const Vec& v : triangle) vertices[std::size_t(vertexCount++)] = v;
+            for (int i = 0; i < 3; ++i) edges[std::size_t(edgeCount++)] = {i, (i + 1) % 3};
+            const Vec facing = unit(cross(triangle[1] - triangle[0], triangle[2] - triangle[0]), {});
+            if (length(facing) > 0) {
+                addFace(triangle.data(), 3, facing);
+                addFace(triangle.data(), 3, facing * -1);
+            }
+        } else {
+            // Capsule: the triangle swept along the cylindrical segment, rounded by r.
+            const Vec shift = shape.axes[2] * shape.size.z;
+            for (int i = 0; i < 3; ++i) {
+                vertices[std::size_t(vertexCount++)] = triangle[std::size_t(i)] - shift;
+                vertices[std::size_t(vertexCount++)] = triangle[std::size_t(i)] + shift;
+            }
+            for (int i = 0; i < 3; ++i) {
+                const int next = (i + 1) % 3;
+                edges[std::size_t(edgeCount++)] = {2 * i, 2 * next};
+                edges[std::size_t(edgeCount++)] = {2 * i + 1, 2 * next + 1};
+                edges[std::size_t(edgeCount++)] = {2 * i, 2 * i + 1};
+            }
+            const Vec centroid = (triangle[0] + triangle[1] + triangle[2]) * (1.0 / 3.0);
+            const Vec axis = shape.axes[2];
+            Vec cap = unit(cross(triangle[1] - triangle[0], triangle[2] - triangle[0]), {});
+            if (dot(cap, axis) < 0) cap = cap * -1;
+            if (length(cap) > 0) {
+                const Vec bottom[3] = {vertices[0], vertices[2], vertices[4]};
+                const Vec top[3] = {vertices[1], vertices[3], vertices[5]};
+                addFace(bottom, 3, cap * -1);
+                addFace(top, 3, cap);
+            }
+            for (int i = 0; i < 3; ++i) {
+                const int next = (i + 1) % 3;
+                const Vec quad[4] = {vertices[std::size_t(2 * i)], vertices[std::size_t(2 * next)],
+                                     vertices[std::size_t(2 * next + 1)], vertices[std::size_t(2 * i + 1)]};
+                const Vec middle = (quad[0] + quad[1] + quad[2] + quad[3]) * 0.25;
+                Vec side = unit(cross(vertices[std::size_t(2 * next)] - vertices[std::size_t(2 * i)], axis), {});
+                if (dot(side, middle - centroid) < 0) side = side * -1;
+                if (length(side) > 0) addFace(quad, 4, side);
+            }
+        }
+
+        // Corners: balls of radius r.
+        for (int i = 0; i < vertexCount; ++i) {
+            const Vec offset = from - vertices[std::size_t(i)];
+            const double outside = dot(offset, offset) - radius * radius;
+            if (outside <= 0) continue;  // start already reaches this corner
+            const double linear = 2 * dot(offset, d);
+            const double discriminant = linear * linear - 4 * dd * outside;
+            if (discriminant < 0) continue;
+            const double t = (-linear - std::sqrt(discriminant)) / (2 * dd);
+            report(t, from + d * t - vertices[std::size_t(i)]);
+        }
+
+        // Edges: cylinders of radius r around each of the sum's edges.
+        for (int i = 0; i < edgeCount; ++i) {
+            const Vec a = vertices[std::size_t(edges[std::size_t(i)][0])];
+            const Vec b = vertices[std::size_t(edges[std::size_t(i)][1])];
+            const Vec u = b - a;
+            const double uu = dot(u, u);
+            if (uu <= 1e-12) continue;
+            const Vec m = from - a;
+            const double along = dot(m, u), slope = dot(d, u);
+            const double quadratic = dd * uu - slope * slope;
+            const double linear = 2 * (dot(m, d) * uu - along * slope);
+            const double constant = dot(m, m) * uu - along * along - radius * radius * uu;
+            if (constant <= 0) continue;  // start already inside this band
+            double t = -1;
+            if (quadratic > 1e-12 * dd * uu) {
+                const double discriminant = linear * linear - 4 * quadratic * constant;
+                if (discriminant < 0) continue;
+                t = (-linear - std::sqrt(discriminant)) / (2 * quadratic);
+            } else {
+                if (std::abs(linear) <= 1e-12) continue;
+                t = -constant / linear;
+            }
+            if (t < 0) continue;
+            const Vec x = from + d * t;
+            const double s = dot(x - a, u) / uu;
+            if (s < 0 || s > 1) continue;  // the corner balls answer past the ends
+            report(t, x - (a + u * s));
+        }
+
+        // Faces: the polygon offset outward by r.
+        for (int i = 0; i < faceCount; ++i) {
+            const Face& face = faces[std::size_t(i)];
+            const double slope = dot(face.normal, d);
+            if (slope >= 0) continue;  // moving out of that face
+            const double t = (dot(face.normal, face.corners[0]) + radius - dot(face.normal, from)) / slope;
+            if (!(t >= 0 && t <= 1)) continue;
+            const Vec x = from + d * t;
+            if (!insideFace(x - face.normal * radius, face.corners.data(), face.count, face.normal)) continue;
+            report(t, face.normal);
+        }
+    }
+
+    if (best > 1.5) return false;
+    fraction = best;
+    point = closestOnTriangle(triangle, from + d * best);
+    normal = bestNormal;
     return true;
 }
 
@@ -497,9 +711,6 @@ struct SweepSearch {
     const Shape& shape;
     Vec from, delta, extents;
     double speed;
-    // The same convex shape Physics::sweep hands to Bullet, so the per-triangle cast
-    // here measures the identical body.
-    std::unique_ptr<btConvexShape> convex;
     Hit hit;
     double unknown{std::numeric_limits<double>::infinity()};
     // A contact hidden in an unresolved interval can be no earlier than that
@@ -514,8 +725,7 @@ struct SweepSearch {
     int axisCount{};
 
     SweepSearch(const Shape& input, Vec start, Vec end)
-        : shape(input), from(start), delta(end - start), extents(input.extents()), speed(length(delta)),
-          convex(bulletShape(input)) {
+        : shape(input), from(start), delta(end - start), extents(input.extents()), speed(length(delta)) {
         constexpr Vec world[] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
         if (shape.kind == ShapeKind::Box) {
             for (const auto direction : shape.axes) {
@@ -684,11 +894,11 @@ struct SweepSearch {
     }
 
     // One cell, solved exactly: the eight samples become the cell's marching cubes
-    // triangles, and the moving shape is cast against each of them with Bullet's own
-    // per-triangle convex cast. No trilinear root, no support-plane interval and no
-    // pose sampling is left -- the answer is the exact triangle contact, on the same
-    // planar surface the BVH backend was built from. Pruning is only an AABB reject,
-    // which is conservative, so it cannot change the answer.
+    // triangles, and the moving shape is cast against each of them in closed form
+    // (triangleSweep). No trilinear root, no support-plane interval, no pose
+    // sampling and no iterative solver is left -- the answer is the exact triangle
+    // contact, on the same planar surface the BVH backend was built from. Pruning is
+    // only an AABB reject, which is conservative, so it cannot change the answer.
     void visit(const Cell& cell, double last) {
         LevelGuard guard{level};
         if (traceOn) {
@@ -727,7 +937,10 @@ struct SweepSearch {
             }
             double fraction = 1;
             Vec point{}, normal{};
-            if (!castTriangle(shape, *convex, triangle, from, end, fraction, point, normal)) continue;
+            if (!triangleSweep(shape, triangle, from, end, fraction, point, normal)) continue;
+            // The triangles carry no dependable winding, so the normal is oriented by
+            // the field gradient: that is the direction the surface really faces.
+            if (dot(normal, cell.gradient(point)) < 0) normal = normal * -1;
             const double time = std::clamp(fraction, 0.0, 1.0) * last;
             if (time >= hit.fraction) continue;
             hit = {Hit::State::Contact, time, point, unit(normal, surface), time <= 0};
@@ -1197,3 +1410,4 @@ std::size_t Physics::terrainBytes() const {
 }
 
 }  // namespace voxel
+

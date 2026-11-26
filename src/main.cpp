@@ -1396,8 +1396,8 @@ void compareSweepToMesh(const Options& opts, Method other) {
         return;
     }
 
-    //const double meshMicro = timePass(meshWorld);
-    //const double fieldMicro = timePass(otherWorld);
+    const double meshMicro = timePass(meshWorld);
+    const double fieldMicro = timePass(otherWorld);
     Verdict verdict = validate();
     const SweepDiagnostics stops = sweepDiagnostics();
 
@@ -1409,33 +1409,33 @@ void compareSweepToMesh(const Options& opts, Method other) {
         }
         return "?";
     };
-    //auto report = [&](double micro, const char* label) {
-    //    std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
-    //              << micro / sweeps << " us, " << (micro > 0 ? sweeps / (micro / 1e6) : 0) << " sweeps/s\n";
-    //};
-    //std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [sweep]: " << opts.invokers
-    //          << " static invokers x " << opts.shapesPerInvoker << " shapes x " << opts.frames << " frames = "
-    //          << std::size_t(opts.frames) * perFrame << " sweeps per backend (identical list)\n"
-    //          << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
-    //report(meshMicro, "mesh");
-    //report(fieldMicro, name(other));
-    //std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? fieldMicro / meshMicro : 0) << "x\n"
-    //          << "  contacts mesh " << verdict.meshContacts << ", " << name(other) << ' ' << verdict.otherContacts
-    //          << ", initial " << verdict.initial << ", conflicts " << verdict.conflicts
-    //          << ", refusals " << verdict.refusals << '\n'
-    //          << "  states mesh " << verdict.meshContacts << '/' << verdict.meshMiss << '/' << verdict.meshUnresolved
-    //          << ", " << name(other) << ' ' << verdict.otherContacts << '/' << verdict.otherMiss << '/'
-    //          << verdict.otherUnresolved << " (contact/miss/unresolved)\n"
-    //          << "  sweep stops: budget " << stops.budgetStops << " (limit " << sweepBudget() << "), tolerance "
-    //          << stops.toleranceStops << " (limit " << sweepToleranceMeters() << " m)\n";
-    //const int disagreements = verdict.conflicts + verdict.refusals;
-    //if (disagreements > 0) {
-    //    const int printed = int(verdict.samples.size());
-    //    std::cout << "  disagreeing casts " << disagreements;
-    //    if (printed < disagreements)
-    //        std::cout << " (first " << printed << " shown, raise --mismatch-samples to see more)";
-    //    std::cout << '\n';
-    //}
+    auto report = [&](double micro, const char* label) {
+        std::cout << std::fixed << std::setprecision(3) << "  " << label << ": total " << micro / 1000 << " ms, mean "
+                  << micro / sweeps << " us, " << (micro > 0 ? sweeps / (micro / 1e6) : 0) << " sweeps/s\n";
+    };
+    std::cout << std::fixed << std::setprecision(3) << name(other) << " vs mesh [sweep]: " << opts.invokers
+              << " static invokers x " << opts.shapesPerInvoker << " shapes x " << opts.frames << " frames = "
+              << std::size_t(opts.frames) * perFrame << " sweeps per backend (identical list)\n"
+              << "  build mesh " << meshBuild.updateMs << " ms, " << name(other) << ' ' << otherBuild.updateMs << " ms\n";
+    report(meshMicro, "mesh");
+    report(fieldMicro, name(other));
+    std::cout << "  ratio " << name(other) << "/mesh: " << (meshMicro > 0 ? fieldMicro / meshMicro : 0) << "x\n"
+              << "  contacts mesh " << verdict.meshContacts << ", " << name(other) << ' ' << verdict.otherContacts
+              << ", initial " << verdict.initial << ", conflicts " << verdict.conflicts
+              << ", refusals " << verdict.refusals << '\n'
+              << "  states mesh " << verdict.meshContacts << '/' << verdict.meshMiss << '/' << verdict.meshUnresolved
+              << ", " << name(other) << ' ' << verdict.otherContacts << '/' << verdict.otherMiss << '/'
+              << verdict.otherUnresolved << " (contact/miss/unresolved)\n"
+              << "  sweep stops: budget " << stops.budgetStops << " (limit " << sweepBudget() << "), tolerance "
+              << stops.toleranceStops << " (limit " << sweepToleranceMeters() << " m)\n";
+    const int disagreements = verdict.conflicts + verdict.refusals;
+    if (disagreements > 0) {
+        const int printed = int(verdict.samples.size());
+        std::cout << "  disagreeing casts " << disagreements;
+        if (printed < disagreements)
+            std::cout << " (first " << printed << " shown, raise --mismatch-samples to see more)";
+        std::cout << '\n';
+    }
     if (!verdict.errors.empty()) {
         std::cout << "  paired " << verdict.errors.size() << ", p95 TOI difference " << percentile(verdict.errors, 0.95)
                   << " m, max " << verdict.errors.back() << " m\n";
@@ -1834,9 +1834,9 @@ int main(int argc, char** argv) {
         // same 6720 sweeps per backend and the numbers stay comparable over time.
         opts.mode = QueryMode::Sweep;
         opts.compare = {Method::Grid};
-        opts.invokers = 16;
+        opts.invokers = 75;
         opts.shapesPerInvoker = 21;
-        opts.frames = 20;
+        opts.frames = 100;
         opts.warmup = 2;
         queryCompare(opts); return 0;
         //if (opts.help) { help(); return 0; }

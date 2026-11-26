@@ -40,7 +40,7 @@ constexpr std::array<ToolbarButton, Sweep> toolbarButtons{{
 struct Options {
     int method{1};
     std::uint64_t seed{42};
-    int invokers{2};
+    int invokers{75};
     bool warp{}, morton{};
     std::filesystem::path captures;
     // --sweep turns the window into the visual twin of main.cpp's --sweep
@@ -49,13 +49,13 @@ struct Options {
     int shapesPerInvoker{21};
     // --sweep-frames is main.cpp's --frames: the untimed validation pass walks
     // every frame's frame-seeded cast set, exactly like main's validate loop.
-    int sweepFrames{1};
+    int sweepFrames{100};
     // Negative means "start on the cast that went wrong worst", which is what a
     // comparison is usually opened for; a value >= 0 starts on that frame instead.
     int sweepFrame{-1};
     int sweepWarmup{1};
     int sweepBudget{48000};
-    double sweepTolerance{0.75};
+    double sweepTolerance{0.5};
 };
 
 Options readOptions() {
@@ -418,8 +418,8 @@ private:
         if (sweepMode_) {
             ensureSweepMesh();
             validateSweep();
-            // Open on the head of the walk order (the worst penetrating contact),
-            // unless --sweep-frame named a frame to start from.
+            // Open on the worst toi difference -- the number the footer reports and
+            // the first cast of the <-/-> walk -- unless --sweep-frame named a frame.
             if (opts_.sweepFrame >= 0) {
                 castIndex_ = std::clamp(opts_.sweepFrame * int(invokers_.size()) * opts_.shapesPerInvoker, 0,
                                         std::max(0, int(sweepCasts_.size()) - 1));
@@ -567,9 +567,6 @@ private:
 
         // One pass issues both backends on every cast of every frame.
         std::vector<double> pathByIndex(sweepCasts_.size(), -1.0);
-        // Verdict class per cast (0 = PT, 1 = EA, 2 = OK, -1 = no paired contact), so
-        // the walk can visit the penetrating cases first, then the early ones.
-        std::vector<int> classByIndex(sweepCasts_.size(), -1);
         for (SweepCast& cast : sweepCasts_) {
             const Hit otherHit = world_->physics.sweep(cast.shape, cast.from, cast.to);
             cast.hit = otherHit;
@@ -607,17 +604,9 @@ private:
                 tally_.meanPath += path;
                 tally_.meanPoint += point;
                 const std::wstring tag = contactTag(otherHit.position - meshHit.position, meshHit.normal);
-                const std::size_t at = std::size_t(&cast - sweepCasts_.data());
-                if (tag == L"EA") {
-                    ++tally_.early;
-                    classByIndex[at] = 1;
-                } else if (tag == L"PT") {
-                    ++tally_.penetrating;
-                    classByIndex[at] = 0;
-                } else {
-                    ++tally_.exact;
-                    classByIndex[at] = 2;
-                }
+                if (tag == L"EA") ++tally_.early;
+                else if (tag == L"PT") ++tally_.penetrating;
+                else ++tally_.exact;
             }
         }
         std::sort(tally_.errors.begin(), tally_.errors.end());
@@ -640,14 +629,16 @@ private:
         // Penetrating contacts first, then the early ones, then the agreeing ones;
         // inside each group the worst toi difference comes first. Casts without a
         // paired contact (class -1) fall to the end so a walk still visits everything.
+        // Worst toi difference first, so <-/-> walks the comparison from the biggest
+        // disagreement down to the smallest. Casts without a paired contact fall to
+        // the end so a walk still visits everything.
         tally_.byToi.resize(sweepCasts_.size());
         std::iota(tally_.byToi.begin(), tally_.byToi.end(), 0);
         std::sort(tally_.byToi.begin(), tally_.byToi.end(), [&](int a, int b) {
-            const int ka = classByIndex[std::size_t(a)] < 0 ? 3 : classByIndex[std::size_t(a)];
-            const int kb = classByIndex[std::size_t(b)] < 0 ? 3 : classByIndex[std::size_t(b)];
-            if (ka != kb) return ka < kb;
             const double ea = pathByIndex[std::size_t(a)], eb = pathByIndex[std::size_t(b)];
-            if (ea != eb) return ea > eb;
+            const bool pairedA = ea >= 0, pairedB = eb >= 0;
+            if (pairedA != pairedB) return pairedA;
+            if (pairedA && ea != eb) return ea > eb;
             return a < b;
         });
     }
