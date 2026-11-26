@@ -5,6 +5,13 @@
 #include <BulletCollision/CollisionDispatch/btManifoldResult.h>
 #include <BulletCollision/CollisionDispatch/btCollisionCreateFunc.h>
 #include <BulletCollision/BroadphaseCollision/btCollisionAlgorithm.h>
+#include <BulletCollision/CollisionShapes/btTriangleShape.h>
+#include <BulletCollision/NarrowPhaseCollision/btSubSimplexConvexCast.h>
+#include <BulletCollision/NarrowPhaseCollision/btVoronoiSimplexSolver.h>
+#include <BulletCollision/NarrowPhaseCollision/btContinuousConvexCollision.h>
+#include <BulletCollision/NarrowPhaseCollision/btGjkEpaPenetrationDepthSolver.h>
+
+#include "../third_party/marching_cases.hpp"
 
 #include <limits>
 #include <utility>
@@ -392,12 +399,107 @@ double supportRadius(const Shape& shape, Vec axis) {
     return shape.kind == ShapeKind::Capsule ? sphere + std::abs(dot(axis, shape.axes[2])) * shape.size.z : sphere;
 }
 
+btVector3 bullet(Vec v) { return {btScalar(v.x), btScalar(v.y), btScalar(v.z)}; }
+Vec voxelVec(const btVector3& v) { return {v.x(), v.y(), v.z()}; }
+
+constexpr double contactMargin = 0.04;
+
+btTransform pose(const Shape& shape, Vec position) {
+    btMatrix3x3 basis;
+    const auto x = bullet(shape.axes[0]), y = bullet(shape.axes[1]), z = bullet(shape.axes[2]);
+    basis.setValue(x.x(), y.x(), z.x(), x.y(), y.y(), z.y(), x.z(), y.z(), z.z());
+    return btTransform(basis, bullet(position));
+}
+
+std::unique_ptr<btConvexShape> bulletShape(const Shape& shape) {
+    if (shape.kind == ShapeKind::Sphere) return std::make_unique<btSphereShape>(btScalar(shape.size.x));
+    if (shape.kind == ShapeKind::Capsule) {
+        return std::make_unique<btCapsuleShapeZ>(btScalar(shape.size.x), btScalar(2 * shape.size.z));
+    }
+    auto box = std::make_unique<btBoxShape>(bullet(shape.size));
+    box->setMargin(btScalar(contactMargin));
+    return box;
+}
+
+// Marching cubes over one cell, byte for byte the triangles terrain.cpp's meshChunk
+// emits from the same eight samples: same corner relabelling, same edge table, same
+// linear root along the edge. A field backend that answers on these triangles answers
+// on exactly the surface the BVH backend was built from.
+int cellTriangles(const Cell& cell, std::array<std::array<Vec, 3>, 5>& out) {
+    constexpr int corners[8] = {0, 1, 3, 2, 4, 5, 7, 6};
+    constexpr int edges[12][2] = {{0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7},
+                                  {7, 6}, {6, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    int mask = 0;
+    for (int i = 0; i < 8; ++i) if (cell.values[corners[i]] < 0) mask |= 1 << i;
+    if (mask == 0 || mask == 255) return 0;
+    const auto& table = marchingCases[mask];
+    int count = 0;
+    for (int k = 0; table[k] >= 0 && count < 5; k += 3) {
+        std::array<Vec, 3> triangle{};
+        for (int i = 0; i < 3; ++i) {
+            const int a = edges[table[k + i]][0], b = edges[table[k + i]][1];
+            const Vec u{double(a & 1), double((a >> 1) & 1), double(a >> 2)};
+            const Vec v{double(b & 1), double((b >> 1) & 1), double(b >> 2)};
+            const double f = cell.values[a] / (double(cell.values[a]) - double(cell.values[b]));
+            triangle[i] = cell.origin + (u + (v - u) * f) * cell.spacing;
+        }
+        if (dot(cross(triangle[1] - triangle[0], triangle[2] - triangle[0]),
+                cross(triangle[1] - triangle[0], triangle[2] - triangle[0])) < 1e-16) continue;
+        out[count++] = triangle;
+    }
+    return count;
+}
+
+// Does the shape already sit on this triangle at the start pose? Bullet's subsimplex
+// cast is undefined when the two shapes overlap at t = 0, so that case has to be
+// answered as an initial contact instead of being cast.
+bool touchesAtStart(const Shape& shape, const std::array<Vec, 3>& triangle, Vec center) {
+    const Vec samples[7] = {triangle[0], triangle[1], triangle[2],
+                            (triangle[0] + triangle[1]) * 0.5, (triangle[1] + triangle[2]) * 0.5,
+                            (triangle[2] + triangle[0]) * 0.5,
+                            (triangle[0] + triangle[1] + triangle[2]) * (1.0 / 3.0)};
+    for (const Vec& point : samples) if (shape.distance(point - center) <= 0) return true;
+    return false;
+}
+
+// One triangle of the cell against the same moving convex shape Physics::sweep casts,
+// through the same Bullet primitive btCollisionWorld::convexSweepTest ends up running
+// per triangle of a concave shape: a btContinuousConvexCollision (GJK cast plus a
+// penetration depth solver for the touching case) against a btTriangleShape.
+bool castTriangle(const Shape& shape, const btConvexShape& convex, const std::array<Vec, 3>& triangle,
+                  Vec from, Vec to, double& fraction, Vec& point, Vec& normal) {
+    const btTriangleShape local(bullet(triangle[0]), bullet(triangle[1]), bullet(triangle[2]));
+    const btTriangleShape triangleShape = [&] {
+        btTriangleShape shape = local;
+        // Same margin the mesh backend's per-triangle callback sets, so the two
+        // paths measure the same expanded triangle.
+        shape.setMargin(btScalar(contactMargin));
+        return shape;
+    }();
+    btVoronoiSimplexSolver simplex;
+    btGjkEpaPenetrationDepthSolver penetration;
+    btContinuousConvexCollision cast(&convex, &triangleShape, &simplex, &penetration);
+    btConvexCast::CastResult result;
+    result.m_fraction = btScalar(1.0);
+    const btTransform start = pose(shape, from), end = pose(shape, to);
+    btTransform fixed;
+    fixed.setIdentity();
+    if (!cast.calcTimeOfImpact(start, end, fixed, fixed, result)) return false;
+    fraction = double(result.m_fraction);
+    point = voxelVec(result.m_hitPoint);
+    normal = voxelVec(result.m_normal);
+    return true;
+}
+
 struct SweepSearch {
     struct Axis { Vec direction, absolute; double start, slope, radius; };
 
     const Shape& shape;
     Vec from, delta, extents;
     double speed;
+    // The same convex shape Physics::sweep hands to Bullet, so the per-triangle cast
+    // here measures the identical body.
+    std::unique_ptr<btConvexShape> convex;
     Hit hit;
     double unknown{std::numeric_limits<double>::infinity()};
     // A contact hidden in an unresolved interval can be no earlier than that
@@ -412,7 +514,8 @@ struct SweepSearch {
     int axisCount{};
 
     SweepSearch(const Shape& input, Vec start, Vec end)
-        : shape(input), from(start), delta(end - start), extents(input.extents()), speed(length(delta)) {
+        : shape(input), from(start), delta(end - start), extents(input.extents()), speed(length(delta)),
+          convex(bulletShape(input)) {
         constexpr Vec world[] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
         if (shape.kind == ShapeKind::Box) {
             for (const auto direction : shape.axes) {
@@ -566,112 +669,68 @@ struct SweepSearch {
         hit = {Hit::State::Contact, time, point, n, time == 0};
     }
 
-    void visit(const Cell& cell, const Trilinear& curvature, Box box, double first, double last, bool seed = false) {
+    // The start pose only: does the shape already sit inside this cell's surface at
+    // t = 0? No triangle cast can answer that (Bullet's subsimplex cast is undefined
+    // when the two shapes start in overlap), so the trilinear sign test stays here.
+    void probeInitial(const Trilinear& field, Box box) {
+        const Vec local = field.local(box.center());
+        const Vec gradient = field.gradient(local);
+        const Vec deepest{gradient.x >= 0 ? box.lo.x : box.hi.x, gradient.y >= 0 ? box.lo.y : box.hi.y,
+                          gradient.z >= 0 ? box.lo.z : box.hi.z};
+        const Vec extreme = support(shape, gradient * -1);
+        sample(field, box, from + extreme, 0);
+        sample(field, box, deepest, 0);
+        sample(field, box, box.center(), 0);
+    }
+
+    // One cell, solved exactly: the eight samples become the cell's marching cubes
+    // triangles, and the moving shape is cast against each of them with Bullet's own
+    // per-triangle convex cast. No trilinear root, no support-plane interval and no
+    // pose sampling is left -- the answer is the exact triangle contact, on the same
+    // planar surface the BVH backend was built from. Pruning is only an AABB reject,
+    // which is conservative, so it cannot change the answer.
+    void visit(const Cell& cell, double last) {
         LevelGuard guard{level};
         if (traceOn) {
             ++traceRecord.visits;
             traceRecord.depth = std::max(traceRecord.depth, level);
         }
         last = std::min(last, cutoff());
-        if (first > last || hit.initial || !clip(box.expanded(extents), from, delta, first, last)) return;
-        const double priorSpan = last - first;
-        const Vec begin = from + delta * first, end = from + delta * last;
-        box.lo = max(box.lo, min(begin, end) - extents - splat(epsilon));
-        box.hi = min(box.hi, max(begin, end) + extents + splat(epsilon));
-        const Vec center = box.center();
-        const Vec dimensions = box.hi - box.lo;
-        const Vec half = dimensions * 0.5;
-        for (int i = 0; i < axisCount; ++i) if (!clipAxis(axes[i], center, half, first, last)) return;
-        if (!clipRounded(box, center, half, first, last)) return;
-        const Vec local = curvature.local(center);
-        const Vec gradient = curvature.gradient(local);
-        const double centerValue = curvature.value(local);
-        const double residual = curvature.lower(local, half);
-        if (centerValue - dot(abs(gradient), half) + residual > epsilon) return;
-        const Vec deepest{gradient.x >= 0 ? box.lo.x : box.hi.x, gradient.y >= 0 ? box.lo.y : box.hi.y,
-                          gradient.z >= 0 ? box.lo.z : box.hi.z};
-        // The residual from the tangent plane is trilinear and bounded at box corners.
-        // The shape's support point bounds the tangent plane over every pose on the path.
-        const Vec extreme = support(shape, gradient * -1);
-        const double threshold = dot(gradient, center) - centerValue - residual + epsilon;
-        if (!clipPlane(gradient, threshold, first, last) ||
-            !clipConstrainedPlane(gradient, threshold, box, extreme, first, last)) return;
-        if (budget-- <= 0) {
-            markUnknown(first);
-            ++budgetStops;
-            if (traceOn) {
-                ++traceRecord.budgetStops;
-                noteStop(first, last);
+        if (hit.initial || last <= 0) return;
+        std::array<std::array<Vec, 3>, 5> triangles{};
+        const int count = cellTriangles(cell, triangles);
+        if (count == 0) return;
+        const Vec end = from + delta * last;
+        const Box swept{min(from, end) - extents - splat(epsilon), max(from, end) + extents + splat(epsilon)};
+        for (int i = 0; i < count && !hit.initial; ++i) {
+            const auto& triangle = triangles[i];
+            Box area{triangle[0], triangle[0]};
+            for (const Vec& point : triangle) {
+                area.lo = min(area.lo, point);
+                area.hi = max(area.hi, point);
             }
-            return;
-        }
-        sample(curvature, box, from + delta * first + extreme, first);
-        sample(curvature, box, deepest, first);
-        sample(curvature, box, center, first);
-        if (hit.initial || hit.fraction <= first) return;
-        if (seed) {
-            // Cast a support point to get a confirmed upper bound early. The subdivision
-            // still searches for contacts elsewhere on the shape that may occur earlier.
-            double enter = first, exit = last;
-            const Vec point = from + extreme;
-            if (clip(box, point, delta, enter, exit)) {
-                const Vec a = point + delta * enter;
-                const double root = cell.value(a) <= 0 ? 0 : firstRoot(cell, a, point + delta * exit);
-                if (root >= 0) {
-                    const double time = enter + (exit - enter) * root;
-                    sample(curvature, box, point + delta * time, time);
-                }
+            bool reachable = true;
+            for (int axis = 0; axis < 3 && reachable; ++axis) {
+                reachable = area.hi[axis] >= swept.lo[axis] && area.lo[axis] <= swept.hi[axis];
             }
-        }
-        last = std::min(last, cutoff());
-        if (first > last || hit.initial) return;
-        const double midpoint = (first + last) * 0.5;
-        const double travel = speed * (last - first);
-        if (speed * priorSpan > 2 * sweepToleranceCurrent && last - first < priorSpan * 0.4) {
-            visit(cell, curvature, box, first, last);
-            return;
-        }
-        sample(curvature, box, from + delta * midpoint + extreme, midpoint);
-        sample(curvature, box, deepest, midpoint);
-        const int axis = dimensions.x >= dimensions.y && dimensions.x >= dimensions.z ? 0
-                       : dimensions.y >= dimensions.z ? 1 : 2;
-        if (travel <= sweepToleranceCurrent && dimensions[axis] <= sweepToleranceCurrent) {
-            sample(curvature, box, deepest, last);
-            sample(curvature, box, center, midpoint);
-            // A hidden contact cannot sit earlier than `first`, so this margin bounds
-            // the most the band can hide. Within the budget it is harmless and is
-            // dropped; beyond it the band would be dishonest to ignore, so spend
-            // geometry instead of honesty and split the cell further.
-            const bool harmless = hit.state == Hit::State::Contact &&
-                (hit.fraction - first) * speed <= 2 * sweepToleranceCurrent;
-            if (!harmless && refinements < sweepRefinementLimit) {
-                ++refinements;
-                Box low = box, high = box;
-                low.hi[axis] = high.lo[axis] = center[axis];
-                if (delta[axis] < 0) std::swap(low, high);
-                visit(cell, curvature, low, first, last);
-                visit(cell, curvature, high, first, last);
+            if (!reachable) continue;
+            if (budget-- <= 0) {
+                markUnknown(0);
+                ++budgetStops;
+                if (traceOn) ++traceRecord.budgetStops;
                 return;
             }
-            markUnknown(first);
-            ++toleranceStops;
-            if (traceOn) {
-                ++traceRecord.toleranceStops;
-                noteStop(first, last);
-                traceRecord.stopTravel = travel;
-                traceRecord.stopDimension = dimensions[axis];
+            const Vec surface = unit(cross(triangle[1] - triangle[0], triangle[2] - triangle[0]), unit(triangle[0]));
+            if (touchesAtStart(shape, triangle, from)) {
+                if (hit.fraction > 0) hit = {Hit::State::Contact, 0, triangle[0], surface, true};
+                return;
             }
-            return;
-        }
-        if (travel > sweepToleranceCurrent && travel >= dimensions[axis]) {
-            visit(cell, curvature, box, first, midpoint);
-            visit(cell, curvature, box, midpoint, last);
-        } else {
-            Box low = box, high = box;
-            low.hi[axis] = high.lo[axis] = center[axis];
-            if (delta[axis] < 0) std::swap(low, high);
-            visit(cell, curvature, low, first, last);
-            visit(cell, curvature, high, first, last);
+            double fraction = 1;
+            Vec point{}, normal{};
+            if (!castTriangle(shape, *convex, triangle, from, end, fraction, point, normal)) continue;
+            const double time = std::clamp(fraction, 0.0, 1.0) * last;
+            if (time >= hit.fraction) continue;
+            hit = {Hit::State::Contact, time, point, unit(normal, surface), time <= 0};
         }
     }
 };
@@ -724,16 +783,12 @@ Hit fieldRay(const Chunks& chunks, Vec from, Vec to) {
 
 Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
     SweepSearch search(shape, from, to);
-    // A ray through any point fixed on the shape supplies a verified upper bound.
-    // The interval search below still rules out earlier contacts elsewhere on the shape.
+    // Only the start pose is still answered by the ray: a shape that begins inside
+    // the field is an initial contact, which no triangle cast can express. Every
+    // contact after that comes from the cell triangles, so nothing below can leak a
+    // trilinear root into the answer.
     const Hit center = fieldRay(chunks, from, to);
     if (center.initial) return center;
-    if (center.state == Hit::State::Contact) {
-        const Vec offset = support(shape, center.normal * -1);
-        const Hit extreme = fieldRay(chunks, from + offset, to + offset);
-        search.hit = extreme.fraction < center.fraction ? extreme : center;
-        if (search.hit.initial) return search.hit;
-    }
     struct Candidate { Cell cell; Box box; double first, last; };
     std::vector<Candidate> candidates;
     const Box initial = Box{from, from}.expanded(search.extents);
@@ -745,7 +800,7 @@ Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
             forIndexedCells(chunk, initial, true, [&](Key key) {
                 if (search.hit.initial) return;
                 const auto cell = chunk.cell(key);
-                search.visit(cell, Trilinear(cell), {cell.origin, cell.origin + splat(cell.spacing)}, 0, 0);
+                search.probeInitial(Trilinear(cell), {cell.origin, cell.origin + splat(cell.spacing)});
             });
         }
         if (search.hit.initial || !chunk.surfaceBounds ||
@@ -763,7 +818,7 @@ Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
     });
     for (const auto& candidate : candidates) {
         if (search.hit.initial || candidate.first > search.cutoff()) break;
-        search.visit(candidate.cell, Trilinear(candidate.cell), candidate.box, candidate.first, candidate.last, true);
+        search.visit(candidate.cell, candidate.last);
     }
     if (traceOn && search.hit.state == Hit::State::Contact) traceRecord.provenFraction = search.hit.fraction;
     if (!search.hit.initial && std::isfinite(search.unknown)) {
@@ -780,29 +835,8 @@ Hit fieldSweep(const Chunks& chunks, const Shape& shape, Vec from, Vec to) {
 
 namespace {
 
-btVector3 bullet(Vec v) { return {btScalar(v.x), btScalar(v.y), btScalar(v.z)}; }
-Vec voxelVec(const btVector3& v) { return {v.x(), v.y(), v.z()}; }
-
 constexpr short terrainGroup = 1;
 constexpr short bodyGroup = 2;
-constexpr double contactMargin = 0.04;
-
-btTransform pose(const Shape& shape, Vec position) {
-    btMatrix3x3 basis;
-    const auto x = bullet(shape.axes[0]), y = bullet(shape.axes[1]), z = bullet(shape.axes[2]);
-    basis.setValue(x.x(), y.x(), z.x(), x.y(), y.y(), z.y(), x.z(), y.z(), z.z());
-    return btTransform(basis, bullet(position));
-}
-
-std::unique_ptr<btConvexShape> bulletShape(const Shape& shape) {
-    if (shape.kind == ShapeKind::Sphere) return std::make_unique<btSphereShape>(btScalar(shape.size.x));
-    if (shape.kind == ShapeKind::Capsule) {
-        return std::make_unique<btCapsuleShapeZ>(btScalar(shape.size.x), btScalar(2 * shape.size.z));
-    }
-    auto box = std::make_unique<btBoxShape>(bullet(shape.size));
-    box->setMargin(btScalar(contactMargin));
-    return box;
-}
 
 Shape readShape(const btCollisionShape& shape, const btTransform& transform) {
     Shape result{};

@@ -401,6 +401,10 @@ private:
         // Where the worst cast of the pass lives, so the window can open on it.
         int worstError{-1}, worstPoint{-1};
         std::vector<double> errors;
+        // Every cast in walk order: PT first, then EA, then OK, worst toi inside each
+        // group, so <-/-> walks the comparison from the most suspicious contact down
+        // to the ones both backends agree on.
+        std::vector<int> byToi;
         std::vector<int> mismatches;
     };
 
@@ -414,14 +418,13 @@ private:
         if (sweepMode_) {
             ensureSweepMesh();
             validateSweep();
-            // Open on the cast that disagrees worst, unless --sweep-frame named a
-            // frame to start from.
+            // Open on the head of the walk order (the worst penetrating contact),
+            // unless --sweep-frame named a frame to start from.
             if (opts_.sweepFrame >= 0) {
                 castIndex_ = std::clamp(opts_.sweepFrame * int(invokers_.size()) * opts_.shapesPerInvoker, 0,
                                         std::max(0, int(sweepCasts_.size()) - 1));
             } else {
-                castIndex_ = std::clamp(tally_.worstError >= 0 ? tally_.worstError : 0, 0,
-                                        std::max(0, int(sweepCasts_.size()) - 1));
+                castIndex_ = tally_.byToi.empty() ? 0 : tally_.byToi.front();
             }
             focusCurrent();
             refreshLines();
@@ -563,6 +566,10 @@ private:
         }
 
         // One pass issues both backends on every cast of every frame.
+        std::vector<double> pathByIndex(sweepCasts_.size(), -1.0);
+        // Verdict class per cast (0 = PT, 1 = EA, 2 = OK, -1 = no paired contact), so
+        // the walk can visit the penetrating cases first, then the early ones.
+        std::vector<int> classByIndex(sweepCasts_.size(), -1);
         for (SweepCast& cast : sweepCasts_) {
             const Hit otherHit = world_->physics.sweep(cast.shape, cast.from, cast.to);
             cast.hit = otherHit;
@@ -591,6 +598,7 @@ private:
                 }
                 const double path = tally_.errors.back();
                 const double point = length(otherHit.position - meshHit.position);
+                pathByIndex[std::size_t(&cast - sweepCasts_.data())] = path;
                 ++tally_.paired;
                 if (point > tally_.maxPoint) {
                     tally_.maxPoint = point;
@@ -599,9 +607,17 @@ private:
                 tally_.meanPath += path;
                 tally_.meanPoint += point;
                 const std::wstring tag = contactTag(otherHit.position - meshHit.position, meshHit.normal);
-                if (tag == L"EA") ++tally_.early;
-                else if (tag == L"PT") ++tally_.penetrating;
-                else ++tally_.exact;
+                const std::size_t at = std::size_t(&cast - sweepCasts_.data());
+                if (tag == L"EA") {
+                    ++tally_.early;
+                    classByIndex[at] = 1;
+                } else if (tag == L"PT") {
+                    ++tally_.penetrating;
+                    classByIndex[at] = 0;
+                } else {
+                    ++tally_.exact;
+                    classByIndex[at] = 2;
+                }
             }
         }
         std::sort(tally_.errors.begin(), tally_.errors.end());
@@ -621,6 +637,19 @@ private:
         }
         tally_.meanPath /= double(paired);
         tally_.meanPoint /= double(paired);
+        // Penetrating contacts first, then the early ones, then the agreeing ones;
+        // inside each group the worst toi difference comes first. Casts without a
+        // paired contact (class -1) fall to the end so a walk still visits everything.
+        tally_.byToi.resize(sweepCasts_.size());
+        std::iota(tally_.byToi.begin(), tally_.byToi.end(), 0);
+        std::sort(tally_.byToi.begin(), tally_.byToi.end(), [&](int a, int b) {
+            const int ka = classByIndex[std::size_t(a)] < 0 ? 3 : classByIndex[std::size_t(a)];
+            const int kb = classByIndex[std::size_t(b)] < 0 ? 3 : classByIndex[std::size_t(b)];
+            if (ka != kb) return ka < kb;
+            const double ea = pathByIndex[std::size_t(a)], eb = pathByIndex[std::size_t(b)];
+            if (ea != eb) return ea > eb;
+            return a < b;
+        });
     }
 
     // Point the camera at the cast under inspection, close enough that the path,
@@ -655,7 +684,22 @@ private:
     void stepCast(int delta) {
         if (!sweepMode_ || sweepCasts_.empty()) return;
         const int count = int(sweepCasts_.size());
-        castIndex_ = ((castIndex_ + delta) % count + count) % count;
+        if (int(tally_.byToi.size()) == count) {
+            // Walk the ranking, so -> starts at the worst toi and each press moves to
+            // the next smaller disagreement. The current cast may be anywhere in it
+            // (E/O/N/C jump by their own keys), so locate it first.
+            int at = 0;
+            for (int i = 0; i < count; ++i) {
+                if (tally_.byToi[std::size_t(i)] == castIndex_) {
+                    at = i;
+                    break;
+                }
+            }
+            at = ((at + delta) % count + count) % count;
+            castIndex_ = tally_.byToi[std::size_t(at)];
+        } else {
+            castIndex_ = ((castIndex_ + delta) % count + count) % count;
+        }
         focusCurrent();
         refreshLines();
         updateFooter();
@@ -1134,7 +1178,7 @@ private:
                        << tally_.backendContacts << L", conf " << tally_.conflicts << L", refuse " << tally_.refusals
                        << L", init " << tally_.initial << L", paired " << tally_.paired << L" | toi max "
                        << std::setprecision(3) << tally_.maxError << L" m | mean path/point " << tally_.meanPath << L'/'
-                       << tally_.meanPoint << L" m | EA " << tally_.early << L"  PT " << tally_.penetrating << L"  OK "
+                       << tally_.meanPoint << L" m | PT " << tally_.penetrating << L"  EA " << tally_.early << L"  OK "
                        << tally_.exact;
             } else {
                 totals << L"all " << sweepCasts_.size() << L": the active backend is the mesh, nothing to compare";
