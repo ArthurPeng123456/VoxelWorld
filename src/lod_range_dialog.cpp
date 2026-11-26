@@ -69,9 +69,11 @@ INT_PTR CALLBACK rangeDialog(HWND dialog, UINT message, WPARAM w, LPARAM l) {
         addControl(dialog, L"STATIC", L"", 0, summary, 10, 45, 252, 11);
         addControl(dialog, L"LISTBOX", L"", WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
                    preview, 10, 62, 252, 110);
-        addControl(dialog, L"BUTTON", L"Defaults", WS_TABSTOP | BS_PUSHBUTTON, resetRanges, 10, 183, 55, 15);
-        addControl(dialog, L"BUTTON", L"Apply", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 147, 183, 55, 15);
-        addControl(dialog, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL, 207, 183, 55, 15);
+        addControl(dialog, L"STATIC", L"Apply builds terrain in the background. Resident block counts change when the new data is ready.",
+                   0, -1, 10, 177, 252, 19);
+        addControl(dialog, L"BUTTON", L"Defaults", WS_TABSTOP | BS_PUSHBUTTON, resetRanges, 10, 199, 55, 15);
+        addControl(dialog, L"BUTTON", L"Apply", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 147, 199, 55, 15);
+        addControl(dialog, L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL, 207, 199, 55, 15);
         SendMessageW(dialog, DM_SETDEFID, IDOK, 0);
         SetDlgItemInt(dialog, radiusField, editor.radius, FALSE);
         refreshPreview(dialog);
@@ -97,7 +99,7 @@ bool editLodRanges(HWND owner, std::uint32_t& lod0Radius, int densityShift) {
         DLGTEMPLATE dialog;
         WORD menu, windowClass, title;
     } definition{{WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER,
-                   0, 0, 0, 0, 272, 207}, 0, 0, 0};
+                   0, 0, 0, 0, 272, 223}, 0, 0, 0};
     RangeEditor editor{lod0Radius, densityShift};
     const auto result = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &definition.dialog, owner,
                                                 rangeDialog, reinterpret_cast<LPARAM>(&editor));

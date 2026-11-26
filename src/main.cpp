@@ -440,6 +440,39 @@ WorldStats waitForPublication(World& world) {
     }
 }
 
+void verifyLodRangePublication() {
+    const Planet planet(42);
+    const auto invokers = invokerPositions(planet, 1, 0);
+    const Vec point = invokers.front(), up = unit(point);
+    const Vec camera = point + up * 100000;
+    World world(planet, Method::Grid, false);
+    world.update(invokers, true, camera);
+    const auto before = world.lodCounts();
+    check(world.requestUpdate(invokers, true, camera, true), "current range can already have an update in flight");
+    world.setLod0Radius(4096);
+    check(!world.requestUpdate(invokers, true, camera, true), "new range waits for the existing update");
+    waitForPublication(world);
+    check(world.lod0Radius() == 512 && world.lodCounts() == before,
+          "old in-flight batch cannot publish the newly requested range prematurely");
+    check(world.requestUpdate(invokers, true, camera, true), "stationary range change starts a background build");
+    check(world.lod0Radius() == 512 && world.lodCounts() == before,
+          "pending range retains the published radius and block counts");
+    const auto expanded = waitForPublication(world);
+    const auto after = world.lodCounts();
+    std::array<int, lodCount> actual{};
+    for (const auto& item : world.chunks) ++actual[item.second->lod];
+    const Vec farther = planet.surface(unit(point + frameAt(up)[0] * 3000));
+    check(world.lod0Radius() == 4096 && after[0] > before[0] && after == actual && world.hasFinestLod(farther),
+          "4096 m range publishes expanded fine data and matching LOD statistics without movement");
+    world.setLod0Radius(512);
+    check(world.requestUpdate(invokers, true, camera, true), "stationary range reduction starts a background build");
+    waitForPublication(world);
+    check(world.lod0Radius() == 512 && world.lodCounts() == before && !world.hasFinestLod(farther),
+          "returning to 512 m restores the original stationary layout and statistics");
+    std::cout << "LOD range 512 -> 4096 -> 512 m: LOD0 blocks " << before[0] << " -> " << after[0]
+              << " -> " << world.lodCounts()[0] << "; expanded update " << expanded.updateMs << " ms.\n";
+}
+
 void verifyDensitySwitch(World& world, const std::vector<Vec>& invokers, bool global, Vec point) {
     const Vec up = unit(point);
     const Key oldKey = keyAt(point), newKey = keyAt(point, voxelDensityShift(0.125));
@@ -683,6 +716,7 @@ void selfTestGlobalTerrain() {
 }
 
 void selfTest() {
+    verifyLodRangePublication();
     {
         const Vec eye{123.125,-45.5,planetRadius + 200}, right{1,0,0}, up{0,0,1}, forward{0,1,0};
         const auto csm = buildShadowCascades(eye, right, up, forward, 0.3, 10000000, 1.6, {0.45,0.25,0.86});

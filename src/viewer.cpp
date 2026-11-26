@@ -61,7 +61,7 @@ struct Options {
     int method{1};
     std::uint64_t seed{42};
     int invokers{2};
-    bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{};
+    bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{}, lodRangeCaptures{};
     bool cloudFlight{}, cloudFlightCaptures{};
     double voxelDensity{1};
     TerrainPreset terrain{TerrainPreset::Classic};
@@ -162,6 +162,7 @@ Options readOptions() {
         else if (option == L"--capture-stability") { result.captures = next(); result.stabilityCaptures = true; }
         else if (option == L"--replay-cloud-flight") result.cloudFlight = true;
         else if (option == L"--capture-cloud-flight") { result.captures = next(); result.cloudFlightCaptures = true; }
+        else if (option == L"--capture-lod-ranges") { result.captures = next(); result.lodRangeCaptures = true; }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--seed") result.seed = integer();
@@ -354,6 +355,7 @@ public:
     int run() {
         if (opts_.cloudFlightCaptures) return captureCloudFlight();
         if (opts_.cloudFlight) return replayCloudFlight();
+        if (opts_.lodRangeCaptures) return captureLodRanges();
         if (opts_.stabilityCaptures) return captureStability();
         if (opts_.temporalCaptures) return captureTemporal();
         if (opts_.cloudCaptures) return captureClouds();
@@ -971,6 +973,67 @@ private:
         return 0;
     }
 
+    void setLod0Radius(std::uint32_t radius) {
+        world_->setLod0Radius(radius);
+        lod0Radius_ = radius;
+        updateFooter();
+    }
+
+    int captureLodRanges() {
+        std::filesystem::create_directories(opts_.captures);
+        paused_ = true;
+        lodTint_ = true;
+        opts_.render.cloudsEnabled = opts_.render.atmosphereEnabled = opts_.render.shadowsEnabled = false;
+        opts_.render.taaEnabled = false;
+        buildObjects();
+        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-512.bmp", true);
+        const auto before = world_->lodCounts();
+        std::ofstream report(opts_.captures / "lod-range-validation.txt");
+        const auto record = [&](const char* stage) {
+            updateFooter();
+            report << stage << "_radius=" << world_->lod0Radius() << '\n' << stage << "_counts=";
+            for (const auto count : world_->lodCounts()) report << count << ',';
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, status_.data(), int(status_.size()), nullptr, 0, nullptr, nullptr);
+            std::string text(std::size_t(bytes), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, status_.data(), int(status_.size()), text.data(), bytes, nullptr, nullptr);
+            report << '\n' << stage << "_status=" << text << '\n';
+        };
+        record("before");
+        const auto replace = [&](std::uint32_t radius) {
+            setLod0Radius(radius);
+            if (!world_->requestUpdate(invokers_, true, camera().eye, true))
+                throw std::runtime_error("LOD range capture could not schedule the update");
+            if (radius == 4096) {
+                if (world_->lodCounts() != before || world_->lod0Radius() != 512)
+                    throw std::runtime_error("Pending LOD range was published before GPU upload");
+                record("pending");
+                renderer_->draw(camera(), objects_, opts_.captures / "lod-range-pending.bmp", true);
+            }
+            const auto start = Clock::now();
+            for (;;) {
+                if (const auto stats = world_->pollUpdate([&] { return stagePreparedTerrain(false); })) {
+                    applyTerrain(*stats, false);
+                    report << "update_" << radius << "_ms=" << stats->updateMs << '\n';
+                    break;
+                }
+                if (milliseconds(start) > 120000) throw std::runtime_error("LOD range publication timed out");
+                renderer_->draw(camera(), objects_); // Executes staged GPU copies, as in the interactive loop.
+            }
+            if (world_->lod0Radius() != radius || !renderer_->terrainUploadsReady())
+                throw std::runtime_error("LOD range did not publish together with its GPU meshes");
+        };
+        replace(4096);
+        if (world_->lodCounts()[0] <= before[0]) throw std::runtime_error("4096 m range did not expand resident LOD0 blocks");
+        record("expanded");
+        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-4096.bmp", true);
+        replace(512);
+        if (world_->lodCounts() != before) throw std::runtime_error("512 m range did not restore resident block counts");
+        record("restored");
+        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-restored.bmp", true);
+        report << "scenarios=passed\n";
+        return 0;
+    }
+
     int captureStability() {
         std::filesystem::create_directories(opts_.captures);
         SetWindowPos(window_, nullptr, 0, 0, 960, 720, SWP_NOMOVE | SWP_NOZORDER);
@@ -1541,7 +1604,9 @@ private:
                 }
             }
         } else if (command == RangeSettings) {
-            if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) world_->setLod0Radius(lod0Radius_);
+            if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) {
+                setLod0Radius(lod0Radius_);
+            }
         } else if (command == GraphicsSettings) {
             auto next = opts_.render;
             if (editRenderSettings(window_, next, defaultRenderSettings(opts_.terrain))) {
@@ -1671,7 +1736,14 @@ private:
         int coarse = 0;
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
         std::wostringstream info;
-        info << methodLabels[method_] << L"   |   " << terrainLabels[std::size_t(opts_.terrain)];
+        // Keep the applied/requested range and resident counts visible even
+        // when the remaining diagnostic text is ellipsized on narrow windows.
+        info << L"LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
+             << L" / " << counts[3] << L" / " << coarse
+             << L"   |   LOD0 radius " << world_->lod0Radius();
+        if (world_->lod0Radius() != lod0Radius_) info << L" -> " << lod0Radius_ << L" m (building)";
+        else info << L" m";
+        info << L"   |   " << methodLabels[method_] << L"   |   " << terrainLabels[std::size_t(opts_.terrain)];
         info << L"   |   Step " << world_->voxelDensity() << L"x ("
              << chunkSize / fineCells * world_->voxelDensity() << L" m)";
         if (world_->voxelDensity() != opts_.voxelDensity) info << L" -> " << opts_.voxelDensity << L"x building";
@@ -1679,8 +1751,6 @@ private:
         info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
              << (controlling_ ? L" (controlled)" : L"")
              << (world_->hasFinestLod(invokers_[selected_]) ? L"" : L" (LOD0 pending)")
-             << (world_->lod0Radius() == lod0Radius_ ? L"" : L"   |   Building new LOD ranges")
-             << L"   |   LOD 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2] << L" / " << counts[3] << L" / " << coarse
              << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
              << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update (" << streamBuilt_ << L" built)";
         if (fps_ > 0) info << L"   |   " << std::setprecision(0) << fps_ << L" FPS";
