@@ -18,6 +18,7 @@ struct WorldStats {
 struct ClipmapForecast {
     std::vector<Vec> displacement;
     std::size_t primary{};
+    std::vector<int> minimumLod; // Omitted sources request every level; coarse sources can refine later.
 };
 
 class Clipmap {
@@ -66,7 +67,8 @@ public:
     void setLod0Cells(std::uint32_t cells);
     std::uint32_t lod0Cells() const { return publishedLod0Cells_; }
     bool hasFinestLod(Vec point) const;
-    WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {});
+    WorldStats update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera = {}, ClipmapForecast forecast = {});
+    bool updatePending() const { return building_.valid() || ready_.has_value(); }
     bool requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling = false,
                        ClipmapForecast forecast = {});
     std::optional<WorldStats> pollUpdate(const std::function<bool()>& uploadReady = {});

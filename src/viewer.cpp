@@ -63,7 +63,7 @@ struct Options {
     std::uint64_t seed{42};
     InvokerSettings invoker;
     bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{}, lodRangeCaptures{};
-    bool cloudFlight{}, cloudFlightCaptures{}, invokerCaptures{}, clipmapCaptures{};
+    bool cloudFlight{}, cloudFlightCaptures{}, invokerCaptures{}, clipmapCaptures{}, clipmapLoadingCaptures{};
     int clipmapCaptureCount{};
     double voxelDensity{1};
     std::uint32_t lod0Cells{defaultLod0Cells};
@@ -168,6 +168,9 @@ Options readOptions() {
         else if (option == L"--capture-lod-ranges") { result.captures = next(); result.lodRangeCaptures = true; }
         else if (option == L"--capture-invokers") { result.captures = next(); result.invokerCaptures = true; }
         else if (option == L"--capture-clipmaps") { result.captures = next(); result.clipmapCaptures = true; }
+        else if (option == L"--capture-clipmap-loading") {
+            result.captures = next(); result.clipmapCaptures = result.clipmapLoadingCaptures = true;
+        }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
         else if (option == L"--lod0-range") result.lod0Cells = parseLod0Cells(next());
@@ -369,6 +372,7 @@ public:
     }
 
     int run() {
+        if (opts_.clipmapLoadingCaptures) return captureInvokerLoading();
         if (opts_.clipmapCaptures) return captureClipmaps();
         if (opts_.invokerCaptures) {
             const auto original = opts_.invoker;
@@ -455,7 +459,7 @@ public:
             trackClipmapMotion(frameCamera.eye, elapsed);
             streamElapsed += elapsed;
             if ((streamElapsed >= dt || profile.is_open()) &&
-                world_->requestUpdate(invokerLodSources_, true, frameCamera.eye, true, clipmapForecast_)) {
+                requestTerrainUpdate(frameCamera.eye)) {
                 streamElapsed = 0;
             }
             const double terrainMs = milliseconds(terrainStart) + uploadMs;
@@ -592,6 +596,7 @@ private:
         invokerLodSources_.resize(std::size_t(count));
         invokerGround_.resize(std::size_t(count));
         invokerTerrainWaiting_.resize(std::size_t(count), 1);
+        fineInvokerSources_.resize(std::size_t(count), 0);
         for (std::size_t i = previous; i < invokers_.size(); ++i) {
             const Vec direction = initialInvokerDirection(i, opts_.seed);
             invokers_[i] = direction * planetRadius;
@@ -637,6 +642,9 @@ private:
         invokerLodSources_.resize(invokers_.size());
         invokerGround_.assign(invokers_.size(), InvokerGround{});
         invokerTerrainWaiting_.assign(invokers_.size(), 1);
+        fineInvokerSources_.assign(invokers_.size(), 0);
+        for (std::size_t i = 0; i < std::min(std::size_t(2), invokers_.size()); ++i) fineInvokerSources_[i] = 1;
+        fineInvokerSources_[selected_] = 1;
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             const Vec direction = initialInvokerDirection(i, opts_.seed);
             invokers_[i] = direction * planetRadius;
@@ -745,11 +753,34 @@ private:
         }
     }
 
+    ClipmapForecast terrainForecast(bool admitOne) {
+        if (admitOne) {
+            // The selected target is served before the remaining background
+            // population. Every admitted source keeps all its requested rings.
+            if (controlling_ && !fineInvokerSources_[selected_]) fineInvokerSources_[selected_] = 1;
+            else {
+                const auto next = std::find(fineInvokerSources_.begin(), fineInvokerSources_.end(), 0);
+                if (next != fineInvokerSources_.end()) *next = 1;
+            }
+        }
+        auto forecast = clipmapForecast_;
+        forecast.minimumLod.assign(invokers_.size() + 1, 0);
+        const int coarse = std::max(0, gridRootLevel(voxelDensityShift(opts_.voxelDensity)) - 2);
+        for (std::size_t i = 0; i < invokers_.size(); ++i)
+            if (!fineInvokerSources_[i]) forecast.minimumLod[i] = coarse;
+        return forecast;
+    }
+
+    bool requestTerrainUpdate(Vec eye) {
+        if (world_->updatePending()) return false;
+        return world_->requestUpdate(invokerLodSources_, true, eye, true, terrainForecast(true));
+    }
+
     void updateTerrain(bool force) {
         fullTerrainBuild_ = force;
         for (std::size_t i = 0; i < invokers_.size(); ++i)
             invokerLodSources_[i] = planet_.surface(unit(invokers_[i]));
-        const auto stats = world_->update(invokerLodSources_, true, camera().eye);
+        const auto stats = world_->update(invokerLodSources_, true, camera().eye, terrainForecast(!force));
         fullTerrainBuild_ = false;
         finishTerrainUpdate(stats, force);
     }
@@ -1599,8 +1630,60 @@ private:
         return 0;
     }
 
+    int captureInvokerLoading() {
+        // Reproduce the actual control path, including an old update in flight:
+        // Classic -> Mars -> increase count -> follow 8, 9 and 12 in order.
+        selectCaptureItem(TerrainStyle, int(TerrainPreset::Mars));
+        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true, terrainForecast(false)))
+            throw std::runtime_error("Could not start the pre-existing terrain update");
+        auto settings = opts_.invoker;
+        settings.count = opts_.clipmapCaptureCount;
+        applyInvokerSettings(settings);
+        captureLoadingTargets("pending");
+        std::ofstream progress(opts_.captures / "loading-progress.csv");
+        progress << "target,elapsed_ms,admitted_invokers,published_lod0,working_set_mib,triangles\n";
+        const auto start = Clock::now();
+        for (int number : {8, 9, 12}) {
+            if (number > int(invokers_.size())) continue;
+            selectCaptureItem(CameraTarget, number);
+            const auto targetStart = Clock::now();
+            for (;;) {
+                tick();
+                if (const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(false); })) {
+                    applyTerrain(*published, false);
+                    PROCESS_MEMORY_COUNTERS memory{};
+                    GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory));
+                    progress << number << ',' << milliseconds(start) << ','
+                             << std::count(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1) << ','
+                             << world_->hasFinestLod(invokerLodSources_[selected_]) << ','
+                             << memory.WorkingSetSize / (1024.0 * 1024.0) << ',' << triangles_ << '\n';
+                    progress.flush();
+                }
+                const auto& windows = world_->clipmapWindows();
+                const bool ownFineWindow = std::any_of(windows.begin(), windows.end(), [&](const ClipmapWindow& window) {
+                    return window.invoker == selected_ && window.lod == 0;
+                });
+                if (ownFineWindow && world_->hasFinestLod(invokerLodSources_[selected_]) && !world_->updatePending()) break;
+                const auto view = camera();
+                trackClipmapMotion(view.eye, dt);
+                requestTerrainUpdate(view.eye);
+                renderer_->draw(view, {});
+                if (milliseconds(targetStart) > 180000)
+                    throw std::runtime_error("Following Invoker " + std::to_string(number) + " did not publish its clipmap within three minutes");
+            }
+        }
+        captureLoadingTargets("published");
+        for (int number : {8, 9, 12}) if (number <= int(invokers_.size())) {
+            const std::size_t index = std::size_t(number - 1);
+            if (!world_->hasFinestLod(invokerLodSources_[index]) || !invokerGround_[index].ready || invokerGround_[index].owner.level != 0)
+                throw std::runtime_error("A requested Invoker has no published fine ground after focus loading");
+        }
+        return 0;
+    }
+
     int captureClipmaps() {
         setInvokerCount(opts_.clipmapCaptureCount);
+        std::fill(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1);
         if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true))
             throw std::runtime_error("Could not request distributed Invoker terrain");
         const auto starting = invokers_;
@@ -1668,6 +1751,38 @@ private:
             renderer_->draw(view, {}, opts_.captures / ("invoker-" + std::to_string(i + 1) + "-wire.bmp"));
         }
         return 0;
+    }
+
+    void captureLoadingTargets(const char* stage) {
+        std::ofstream report(opts_.captures / (std::string(stage) + ".csv"));
+        report << "invoker,requested_count,terrain,finest_published,ground_lod,source_altitude,marker_altitude,camera_altitude,triangles\n";
+        for (int number : {8, 9, 12}) {
+            if (number > int(invokers_.size())) continue;
+            selectCaptureItem(CameraTarget, number);
+            auto view = camera();
+            for (int frame = 0; frame < 4; ++frame) renderer_->draw(view, {});
+            const auto stem = std::string(stage) + "-invoker-" + std::to_string(number);
+            renderer_->draw(view, {}, opts_.captures / (stem + "-actual.bmp"));
+            auto actualWire = view;
+            actualWire.lodTint = actualWire.wireframe = true;
+            renderer_->draw(actualWire, {}, opts_.captures / (stem + "-actual-wire.bmp"));
+            const auto& ground = invokerGround_[selected_];
+            report << number << ',' << invokers_.size() << ',' << name(planet_.preset()) << ','
+                   << world_->hasFinestLod(invokerLodSources_[selected_]) << ',' << (ground.ready ? ground.owner.level : -1) << ','
+                   << length(invokerLodSources_[selected_]) - planetRadius << ',' << length(invokers_[selected_]) - planetRadius << ','
+                   << length(view.eye) - planetRadius << ',' << triangles_ << '\n';
+            const Vec target = invokerLodSources_[selected_], up = unit(target);
+            view.eye = target + up * (lodSideLength(lod0Cells_, voxelDensityShift(opts_.voxelDensity)) * 3.5);
+            view.forward = up * -1;
+            view.right = frameAt(up)[0];
+            view.up = cross(view.right, view.forward);
+            view.nearPlane = 0.5;
+            view.sunDirection = unit(up + view.right * 0.4);
+            view.settings.atmosphereEnabled = view.settings.cloudsEnabled = view.settings.shadowsEnabled = view.settings.taaEnabled = false;
+            view.lodTint = view.wireframe = true;
+            renderer_->draw(view, {}, opts_.captures / (stem + "-wire.bmp"));
+            report.flush();
+        }
     }
 
     void captureRemoteMars() {
@@ -2022,10 +2137,14 @@ private:
         const auto counts = world_->lodCounts();
         int coarse = 0;
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
+        std::size_t fineReady = 0;
+        for (const Vec point : invokerLodSources_) fineReady += world_->hasFinestLod(point);
         std::wostringstream info;
         // Keep the applied/requested range and resident counts visible even
         // when the remaining diagnostic text is ellipsized on narrow windows.
-        info << L"LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
+        info << L"Invoker LOD0 " << fineReady << L"/" << invokers_.size();
+        if (fineReady < invokers_.size()) info << (world_->updatePending() ? L" loading" : L" queued");
+        info << L"   |   LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
              << L" / " << counts[3] << L" / " << coarse
              << L"   |   LOD0 " << world_->lod0Cells() << L" cells/edge ("
              << world_->lod0Cells() * world_->voxelDensity() << L" m side)";
@@ -2301,6 +2420,7 @@ private:
     std::vector<Vec> invokerLodSources_;
     std::vector<InvokerGround> invokerGround_;
     std::vector<std::uint8_t> invokerTerrainWaiting_;
+    std::vector<std::uint8_t> fineInvokerSources_;
     mutable InvokerGround cameraGround_;
     std::vector<Vec> clipmapPositions_;
     ClipmapForecast clipmapForecast_;

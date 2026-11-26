@@ -39,6 +39,37 @@ int main(int argc, char** argv) {
         sources.clear();
         for (int i = 0; i < count; ++i) sources.push_back(planet.surface(initialInvokerDirection(i, 42)));
         sources.push_back(camera);
+        if (count >= 12) {
+            Clipmap progressive(0, planet.elevationRange(), &planet);
+            ClipmapForecast forecast;
+            forecast.minimumLod.assign(sources.size(), gridRootLevel(0) - 2);
+            forecast.minimumLod[0] = forecast.minimumLod[1] = forecast.minimumLod.back() = 0;
+            progressive.update(sources, true, visits, cells, true, forecast);
+            if (leafAt(progressive.layout(), sources[7])->level == 0)
+                throw std::runtime_error("A queued source was unexpectedly admitted as a fine region");
+            for (std::size_t selected : {7u, 8u, 11u}) {
+                forecast.minimumLod[selected] = 0;
+                progressive.update(sources, true, visits, cells, true, forecast);
+                const auto point = leafAt(progressive.layout(), sources[selected]);
+                if (!point || point->level != 0)
+                    throw std::runtime_error("Activating a selected Invoker failed to publish its fine region");
+                Layout ideal, oracle;
+                updatePlanetLayout(ideal, oracle, progressive.windows(), {}, 0, true, visits, planet.elevationRange(), &planet);
+                if (oracle != progressive.layout())
+                    throw std::runtime_error("Progressive admission differs from a full balanced layout");
+            }
+            forecast.minimumLod[7] = gridRootLevel(0) - 2;
+            progressive.update(sources, true, visits, cells, true, forecast);
+            if (leafAt(progressive.layout(), sources[7])->level == 0)
+                throw std::runtime_error("Removing fine windows retained stale fine terrain");
+            forecast.minimumLod.assign(sources.size(), lodWindowCount(cells));
+            progressive.update(sources, true, visits, cells, true, forecast);
+            Layout ideal, oracle;
+            updatePlanetLayout(ideal, oracle, {}, {}, 0, true, visits, planet.elevationRange(), &planet);
+            if (!progressive.windows().empty() || progressive.layout() != oracle)
+                throw std::runtime_error("Disabling all source windows lost the full-field coarse fallback");
+            std::cout << "progressive_targets_8_9_12=passed" << std::endl;
+        }
         auto start = Clock::now();
         clipmap.update(sources, true, visits, cells, true);
         std::cout << "growth_ms=" << milliseconds(start) << " leaves=" << clipmap.layout().size()

@@ -99,8 +99,15 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         constexpr int nearLevels = 3;
         const int windowCount = lodWindowCount(lod0Cells, densityShift_);
         if (!windowCount) throw std::invalid_argument("Invalid LOD0 cell count");
-        const int fallback = invokers.empty() ? gridRootLevel(densityShift_) : windowCount;
-        const int oldFallback = globalWindows_.empty() ? gridRootLevel(densityShift_) : globalWindows_.back().lod + 1;
+        const auto minimumLod = [&](std::size_t i) {
+            return i < forecast.minimumLod.size() ? std::clamp(forecast.minimumLod[i], 0, windowCount) : 0;
+        };
+        bool anyEnabled = false;
+        for (std::size_t i = 0; i < invokers.size(); ++i) anyEnabled |= minimumLod(i) < windowCount;
+        const int fallback = anyEnabled ? windowCount : gridRootLevel(densityShift_);
+        int oldFallback = 0;
+        for (const auto& window : globalWindows_) if (window.enabled) oldFallback = std::max(oldFallback, window.lod + 1);
+        if (!oldFallback) oldFallback = gridRootLevel(densityShift_);
         if (!rebuild && fallback != oldFallback) {
             const auto half = splat(fieldSideLength / 2);
             dirty.push_back({{half * -1, half}, std::min(fallback, oldFallback)});
@@ -118,11 +125,13 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         else nearRolls_.resize(invokers.size(), 0);
         for (std::size_t i = 0; i < invokers.size(); ++i) for (int lod = 0; lod < windowCount; ++lod) {
             const auto index = next.size();
+            const bool enabled = lod >= minimumLod(i);
+            const bool windowPhased = phased && globalWindows_[index].enabled && enabled;
             const double radius = lodSideLength(lod0Cells, densityShift_, lod) / 2;
             const double step = lodAnchorStep(radius, lod, densityShift_);
             const double margin = step / 8;
             const Vec position = invokers[i];
-            const bool tracksMotion = phased && i < forecast.displacement.size();
+            const bool tracksMotion = windowPhased && i < forecast.displacement.size();
             const bool primary = tracksMotion && i == forecast.primary;
             const Vec displacement = tracksMotion ? forecast.displacement[i] : Vec{};
             const double lead = maxComponent(abs(displacement));
@@ -136,7 +145,8 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             Vec origin;
             for (int axis = 0; axis < 3; ++axis) {
                 origin[axis] = std::floor(target[axis] / step) * step;
-                if (!sameRange || index >= globalAnchors_.size() || globalAnchors_[index].step != step) continue;
+                if (!sameRange || index >= globalAnchors_.size() || globalAnchors_[index].step != step ||
+                    globalWindows_[index].enabled != enabled) continue;
                 const double previous = globalAnchors_[index].origin[axis];
                 const double center = previous + step / 2;
                 if (target[axis] >= center - guard && target[axis] < center + guard) origin[axis] = previous;
@@ -148,7 +158,7 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             // Recover a small overrun in the same slab-sized increments as
             // normal movement. Larger jumps can recenter in a single batch.
             const double rollLimit = predicting ? (lod == 0 ? 1.40 * radius : std::numeric_limits<double>::infinity()) : radius;
-            if (phased && overdue > 0 && (tracksMotion ? liveOffset < rollLimit : overdue < radius)) {
+            if (windowPhased && overdue > 0 && (tracksMotion ? liveOffset < rollLimit : overdue < radius)) {
                 const auto previous = globalAnchors_[index].origin;
                 const double delta = origin[mostOverdueAxis] - previous[mostOverdueAxis];
                 const double chunkSpan = std::ldexp(gridChunkSize(densityShift_), lod);
@@ -159,8 +169,8 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             }
             next.push_back({origin, step});
             const auto box = Box{origin, origin + splat(step)}.expanded(splat(radius + margin));
-            windows.push_back({i, lod, box});
-            if (!phased) continue;
+            windows.push_back({i, lod, box, enabled});
+            if (!windowPhased) continue;
             auto& choice = choices[i];
             const double urgency = overdue / radius;
             if (lod == 0 && overdue > 0) {
@@ -195,18 +205,22 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
                 ? std::min(nearRolls_[i] + 1, 3) : 0;
         }
         for (std::size_t i = 0; i < windows.size(); ++i) {
-            if (phased && !active[i]) {
+            const bool wasEnabled = i < globalWindows_.size() && globalWindows_[i].enabled;
+            if (phased && !active[i] && wasEnabled == windows[i].enabled) {
                 next[i] = globalAnchors_[i];
                 windows[i] = globalWindows_[i];
             } else if (!sameRange || i >= globalWindows_.size()) {
-                dirty.push_back({windows[i].box, windows[i].lod});
-            } else {
+                if (windows[i].enabled) dirty.push_back({windows[i].box, windows[i].lod});
+            } else if (wasEnabled != windows[i].enabled) {
+                if (wasEnabled) dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
+                if (windows[i].enabled) dirty.push_back({windows[i].box, windows[i].lod});
+            } else if (windows[i].enabled) {
                 appendDifference(windows[i], globalWindows_[i].box, dirty);
                 appendDifference(globalWindows_[i], windows[i].box, dirty);
             }
         }
         for (std::size_t i = sameRange ? windows.size() : 0; i < globalWindows_.size(); ++i)
-            dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
+            if (globalWindows_[i].enabled) dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
         changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits, elevationRange_, planet_);
         if (!dirty.empty() || rebuild) ++windowRevision_;
         globalAnchors_ = std::move(next);
@@ -287,6 +301,7 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
     if (global_) {
         const double limit = fieldSideLength / 2;
         for (const auto& w : globalWindows_) {
+            if (!w.enabled) continue;
             const Box box{max(splat(-limit), w.box.lo), min(splat(limit), w.box.hi)};
             if (hasVolume(box)) result.push_back({w.invoker, w.lod, box});
         }
@@ -448,12 +463,12 @@ WorldStats World::publish(Batch batch) {
     return batch.stats;
 }
 
-WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera) {
+WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera, ClipmapForecast forecast) {
     if (building_.valid() || ready_) throw std::logic_error("An asynchronous Clipmap update is pending");
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
-    return publish(prepareUpdate(sources, global, densityShift_, lod0Cells_, start, false, {}));
+    return publish(prepareUpdate(sources, global, densityShift_, lod0Cells_, start, false, forecast));
 }
 
 bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling, ClipmapForecast forecast) {

@@ -216,6 +216,7 @@ struct ClipmapWindow {
     std::size_t invoker;
     int lod;
     Box box;
+    bool enabled{true};
 };
 struct ClipmapSlab { Box box; int lod; };
 inline int layoutDensityShift(const Layout& layout) { return layout.empty() ? 0 : layout.begin()->first.densityShift; }

@@ -68,12 +68,12 @@ std::set<Key> updatePlanetLayout(Layout& ideal, Layout& balanced, const std::vec
     visits = 0;
     if (!rebuild && dirty.empty()) return {};
     std::array<std::vector<Box>, lodCount - 1> levels;
-    int fallbackLod = gridRootLevel(densityShift);
-    if (!windows.empty()) fallbackLod = 0;
-    for (const auto& window : windows) if (window.lod < int(levels.size())) {
+    int fallbackLod = 0;
+    for (const auto& window : windows) if (window.enabled && window.lod < int(levels.size())) {
         levels[window.lod].push_back(window.box);
         fallbackLod = std::max(fallbackLod, window.lod + 1);
     }
+    if (!fallbackLod) fallbackLod = gridRootLevel(densityShift);
     const auto requestedLod = [&](Box box, bool surface) {
         // Subdividing a uniformly solid or empty node adds no SDF information.
         if (!surface) return lodCount - 1;
