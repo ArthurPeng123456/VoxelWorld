@@ -1,11 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
+
+if(POLICY CMP0144)
+    cmake_policy(SET CMP0144 NEW)
+endif()
+
 project(VoxelWorld LANGUAGES CXX)
+
+# ========== Intel oneAPI 本地安装 oneTBB ==========
+set(TBB_OFFLINE_ROOT "C:/Program Files (x86)/Intel/oneAPI/tbb/latest" CACHE PATH "oneTBB安装根目录")
+list(APPEND CMAKE_PREFIX_PATH "${TBB_OFFLINE_ROOT}")
+find_package(TBB REQUIRED)
 
 # Bullet's ABI and every translation unit must agree on btScalar precision.
 add_compile_definitions(BT_USE_DOUBLE_PRECISION)
 
 option(VOXEL_SYSTEM_BULLET "Use an installed Bullet SDK instead of the pinned Bullet3 source" OFF)
 set(VOXEL_BULLET_ARCHIVE "" CACHE FILEPATH "Optional local copy of the pinned Bullet3 archive")
+option(VOXEL_ENABLE_ITT "Enable Intel VTune ITT task markers" OFF)
+set(VOXEL_ITT_ROOT "$ENV{VTUNE_PROFILER_DIR}" CACHE PATH "Intel VTune installation root")
+
 if(VOXEL_SYSTEM_BULLET)
     find_package(Bullet REQUIRED)
 else()
@@ -37,36 +50,30 @@ else()
     set(BULLET_INCLUDE_DIRS "${bullet_SOURCE_DIR}/src")
     set(BULLET_LIBRARIES BulletDynamics BulletCollision LinearMath)
 endif()
-find_package(TBB REQUIRED)
-find_package(Threads REQUIRED)
-set(VOXEL_OPENVDB_DEBUG_LIBRARY "" CACHE FILEPATH "Matching MSVC Debug library for the bundled OpenVDB")
-if(NOT (MSVC AND VOXEL_OPENVDB_DEBUG_LIBRARY))
-    find_package(OpenVDB CONFIG QUIET)
+
+# ��ֹvcpkg��OpenVDB�Զ���������
+set(VCPKG_HOOK_OPENPACKAGE_OpenVDB OFF CACHE INTERNAL "")
+set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
+
+# ========== �Զ�ѡ�� Debug / Release OpenVDB ·�� ==========
+set(VOXEL_OPENVDB_INSTALL_ROOT "D:/UE/openvdb-14.0.0/out/install" CACHE PATH "OpenVDB installation root containing x64-Debug and x64-Release")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_voxel_openvdb_default_root "${VOXEL_OPENVDB_INSTALL_ROOT}/x64-Debug")
+else()
+    set(_voxel_openvdb_default_root "${VOXEL_OPENVDB_INSTALL_ROOT}/x64-Release")
 endif()
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_MODULE_DIR FindOpenVDB.cmake PATH_SUFFIXES share/openvdb lib/cmake/OpenVDB)
-    if(OPENVDB_MODULE_DIR)
-        list(APPEND CMAKE_MODULE_PATH "${OPENVDB_MODULE_DIR}")
-        find_package(OpenVDB MODULE REQUIRED)
-    endif()
+set(VOXEL_OPENVDB_ROOT "${_voxel_openvdb_default_root}" CACHE PATH "OpenVDB installation prefix")
+set(OPENVDB_ROOT "${VOXEL_OPENVDB_ROOT}")
+
+if(NOT EXISTS "${OPENVDB_ROOT}/lib/cmake/OpenVDB/OpenVDBConfig.cmake")
+    message(FATAL_ERROR
+        "OpenVDB CMake package not found: ${OPENVDB_ROOT}/lib/cmake/OpenVDB/OpenVDBConfig.cmake\n"
+        "Build and install OpenVDB, or set -DOPENVDB_ROOT=<install-prefix> / -DVOXEL_OPENVDB_INSTALL_ROOT=<root>.")
 endif()
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_INCLUDE_DIR openvdb/openvdb.h REQUIRED)
-    find_library(OPENVDB_LIBRARY openvdb REQUIRED)
-    find_package(Imath CONFIG QUIET)
-    add_library(OpenVDB::openvdb UNKNOWN IMPORTED)
-    set_target_properties(OpenVDB::openvdb PROPERTIES
-        IMPORTED_LOCATION "${OPENVDB_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${OPENVDB_INCLUDE_DIR}")
-    if(TARGET Imath::Imath)
-        target_link_libraries(OpenVDB::openvdb INTERFACE Imath::Imath)
-    else()
-        find_library(ILMBASE_HALF_LIBRARY Half)
-        if(ILMBASE_HALF_LIBRARY)
-            target_link_libraries(OpenVDB::openvdb INTERFACE "${ILMBASE_HALF_LIBRARY}")
-        endif()
-    endif()
-endif()
+
+list(PREPEND CMAKE_PREFIX_PATH "${OPENVDB_ROOT}")
+find_package(OpenVDB CONFIG REQUIRED)
+# ==========================================================
 
 if(MSVC AND VOXEL_OPENVDB_DEBUG_LIBRARY)
     # OpenVDB's Find module exposes only one library location on Windows.
@@ -92,11 +99,27 @@ if(MSVC)
 else()
     target_include_directories(voxel_core SYSTEM PRIVATE ${BULLET_INCLUDE_DIRS})
 endif()
-target_link_libraries(voxel_core PRIVATE ${BULLET_LIBRARIES} OpenVDB::openvdb TBB::tbb Threads::Threads)
+# 链接 TBB（world.cpp 使用了 parallel_for / task_arena）
+target_link_libraries(voxel_core PRIVATE ${BULLET_LIBRARIES} OpenVDB::openvdb TBB::tbb)
+
+if(VOXEL_ENABLE_ITT)
+    if(WIN32 AND EXISTS "${VOXEL_ITT_ROOT}/sdk/include/ittnotify.h")
+        target_include_directories(voxel_core PRIVATE "${VOXEL_ITT_ROOT}/sdk/include")
+        target_compile_definitions(voxel_core PRIVATE VOXEL_ENABLE_ITT=1)
+        target_link_libraries(voxel_core PRIVATE "${VOXEL_ITT_ROOT}/sdk/lib64/libittnotify.lib")
+    else()
+        message(FATAL_ERROR "VOXEL_ENABLE_ITT requires Intel VTune; set VOXEL_ITT_ROOT to the VTune installation root")
+    endif()
+endif()
+
 voxel_warnings(voxel_core)
 
 add_executable(voxel_world src/main.cpp)
 target_link_libraries(voxel_world PRIVATE voxel_core)
+if(VOXEL_ENABLE_ITT)
+    target_include_directories(voxel_world PRIVATE "${VOXEL_ITT_ROOT}/sdk/include")
+    target_compile_definitions(voxel_world PRIVATE VOXEL_ENABLE_ITT=1)
+endif()
 voxel_warnings(voxel_world)
 install(TARGETS voxel_world RUNTIME DESTINATION .)
 
@@ -116,23 +139,27 @@ if(WIN32)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_precision.hlsl" VOXEL_TEST_SHADER)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tests/gpu_precision.hlsl)
     configure_file(tests/precision_test_shader.hpp.in generated/precision_test_shader.hpp @ONLY)
+
     add_executable(voxel_gpu_precision tests/gpu_precision.cpp src/cloud_noise.cpp)
     target_compile_features(voxel_gpu_precision PRIVATE cxx_std_17)
     target_compile_definitions(voxel_gpu_precision PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(voxel_gpu_precision PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(voxel_gpu_precision PRIVATE d3d11 d3dcompiler)
     voxel_warnings(voxel_gpu_precision)
+
     target_compile_definitions(voxel_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
     add_executable(VoxelWorldViewer WIN32 src/viewer.cpp src/dx12_renderer.cpp src/cloud_noise.cpp src/lod_range_dialog.cpp src/render_settings_dialog.cpp)
     target_include_directories(VoxelWorldViewer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(VoxelWorldViewer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(VoxelWorldViewer PRIVATE voxel_core TBB::tbb d3d12 dxgi d3dcompiler gdi32 user32 shell32 psapi comctl32)
+    target_link_libraries(VoxelWorldViewer PRIVATE voxel_core d3d12 dxgi d3dcompiler gdi32 user32 shell32 psapi comctl32 TBB::tbb)
     if(MINGW)
         target_link_options(VoxelWorldViewer PRIVATE -municode)
     endif()
     voxel_warnings(VoxelWorldViewer)
     set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT VoxelWorldViewer)
     install(TARGETS VoxelWorldViewer RUNTIME DESTINATION .)
+
     if(MSVC)
         install(FILES "$<TARGET_PDB_FILE:voxel_world>" "$<TARGET_PDB_FILE:VoxelWorldViewer>"
             DESTINATION . CONFIGURATIONS Debug)
@@ -154,3 +181,45 @@ endif()
 if(WIN32)
     add_test(NAME voxel_gpu_precision COMMAND voxel_gpu_precision)
 endif()
+
+# ���Ƶ�ǰ���ö�Ӧ�� OpenVDB dll���Ѿ�ɾ�� TBB_DLLS��
+set(OPENVDB_BIN "${OPENVDB_ROOT}/bin")
+file(GLOB OPENVDB_DLLS "${OPENVDB_BIN}/*.dll")
+
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${OPENVDB_DLLS}
+    $<TARGET_FILE_DIR:voxel_world>
+)
+
+add_custom_command(TARGET VoxelWorldViewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${OPENVDB_DLLS}
+    $<TARGET_FILE_DIR:VoxelWorldViewer>
+)
+
+# ========== Intel oneAPI 本地安装 oneTBB 自动拷贝 DLL ==========
+
+# 本地dll固定 redist/intel64/vc14/
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(TBB_DLL "${TBB_OFFLINE_ROOT}/bin/tbb12_debug.dll")
+else()
+    set(TBB_DLL "${TBB_OFFLINE_ROOT}/bin/tbb12.dll")
+endif()
+
+# ����TBB dll
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TBB_DLL}" $<TARGET_FILE_DIR:voxel_world>/
+    COMMENT "������oneTBB��Copy tbb dll..."
+)
+add_custom_command(TARGET VoxelWorldViewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TBB_DLL}" $<TARGET_FILE_DIR:VoxelWorldViewer>/
+    COMMENT "������oneTBB��Copy tbb dll for viewer..."
+)
+
+# ˳������OpenVDB dll��Debug������openvdb_d.dll��
+set(OPENVDB_DLL "${OPENVDB_ROOT}/bin/$<IF:$<CONFIG:Debug>,openvdb.dll,openvdb.dll>")
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENVDB_DLL}" $<TARGET_FILE_DIR:voxel_world>/
+    COMMENT "Copy OpenVDB dll..."
+)
