@@ -149,7 +149,7 @@ if(WIN32)
 
     target_compile_definitions(voxel_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
-    add_executable(VoxelWorldViewer WIN32 src/viewer.cpp src/dx12_renderer.cpp src/cloud_noise.cpp src/lod_range_dialog.cpp src/render_settings_dialog.cpp)
+    add_executable(VoxelWorldViewer WIN32 src/viewer.cpp src/sweep.cpp src/dx12_renderer.cpp src/cloud_noise.cpp src/lod_range_dialog.cpp src/render_settings_dialog.cpp)
     target_include_directories(VoxelWorldViewer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(VoxelWorldViewer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(VoxelWorldViewer PRIVATE voxel_core d3d12 dxgi d3dcompiler gdi32 user32 shell32 psapi comctl32 TBB::tbb)

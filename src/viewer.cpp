@@ -3,6 +3,7 @@
 #include "render_settings_dialog.hpp"
 #include "world.hpp"
 #include "free_camera.hpp"
+#include "sweep.hpp"
 
 #include <shellapi.h>
 #include <psapi.h>
@@ -46,14 +47,14 @@ Key terrainPage(Key chunk) {
 }
 
 enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows, Clouds,
-               RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget, TerrainStyle };
+               Sweep, RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget, TerrainStyle };
 
 struct ToolbarButton { const wchar_t* label; int width; };
 constexpr std::array<ToolbarButton, GraphicsSettings> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
     {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108},
-    {L"Clouds [V]", 100},
+    {L"Clouds [V]", 100}, {L"Sweep [X]", 96},
     {L"LOD ranges...", 112}, {L"Render settings...", 136}
 }};
 
@@ -66,6 +67,7 @@ struct Options {
     double voxelDensity{1};
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
+    SweepOptions sweep;
     std::filesystem::path captures;
     std::filesystem::path streamProfile;
 };
@@ -101,6 +103,19 @@ Options readOptions() {
                 throw std::invalid_argument("Expected a nonnegative integer");
             }
             return std::stoull(text);
+        };
+        auto bounded = [&](std::uint64_t min, std::uint64_t max) {
+            const auto value = integer();
+            if (value < min || value > max) throw std::invalid_argument("Value out of range");
+            return int(value);
+        };
+        auto real = [&](double min, double max) {
+            const std::wstring text = next();
+            std::size_t consumed = 0;
+            const double value = std::stod(text, &consumed);
+            if (consumed != text.size() || !std::isfinite(value) || value < min || value > max)
+                throw std::invalid_argument("Value out of range");
+            return value;
         };
         const auto renderOption = [&](const auto& parameters) {
             for (const auto& parameter : parameters) if (option == parameter.option) {
@@ -178,6 +193,21 @@ Options readOptions() {
             const auto n = integer();
             if (n < 1 || n > maxInvokers) throw std::invalid_argument("Invoker count must be from 1 to 16");
             result.invokers = int(n);
+        } else if (option == L"--sweep") result.sweep.enabled = true;
+        else if (option == L"--shapes-per-invoker") result.sweep.shapesPerInvoker = bounded(1, 84);
+        else if (option == L"--sweep-frames") result.sweep.frames = bounded(1, 400);
+        else if (option == L"--sweep-warmup") result.sweep.warmup = bounded(0, 20);
+        else if (option == L"--sweep-budget") result.sweep.budget = bounded(1, 10000000);
+        else if (option == L"--sweep-tolerance") result.sweep.tolerance = real(0.01, 10.0);
+        else if (option == L"--sweep-frame") {
+            const std::wstring text = next();
+            if (text == L"-1") result.sweep.frame = -1;
+            else {
+                if (text.empty() || text.find_first_not_of(L"0123456789") != std::wstring::npos)
+                    throw std::invalid_argument("Expected -1 or a nonnegative frame");
+                result.sweep.frame = int(std::stoull(text));
+                if (result.sweep.frame > 100000) throw std::invalid_argument("Sweep frame is out of range");
+            }
         } else if (option == L"--scheme") {
             const auto value = next();
             if (value == L"mesh" || value == L"1") result.method = 0;
@@ -557,6 +587,9 @@ private:
 
     void rebuild() {
         world_.reset();
+        sweepYaw_ = 0;
+        sweepPitch_ = 0.2;
+        sweepDistance_ = 0;
         clipmapPositions_.clear();
         clipmapForecast_ = {};
         preparedTerrain_.clear();
@@ -573,8 +606,14 @@ private:
                 prepareTerrainPages(live, staged, removed);
             });
         world_->setLod0Radius(lod0Radius_);
+        sweep_.attachBackend(*world_, methods[method_], opts_.morton, opts_.voxelDensity);
+        sweep_.clear();
         updateTerrain(true);
-        for (int i = 0; i < opts_.invokers; ++i) spawn(i);
+        if (sweepMode_) {
+            sweep_.begin(invokers_, invokers_.front());
+        } else {
+            for (int i = 0; i < opts_.invokers; ++i) spawn(i);
+        }
         updateFooter();
         repaintButtons();
     }
@@ -595,6 +634,7 @@ private:
     }
 
     void tick() {
+        if (sweepMode_) return;
         world_->physics.step(dt, true);
         simulationTime_ += dt;
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
@@ -790,6 +830,7 @@ private:
             streamBuilt_ = stats.build.built;
         }
         if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
+        sweep_.onTerrainPublished(force, stats, invokers_, camera().eye);
     }
 
     void refreshRanges() {
@@ -808,11 +849,19 @@ private:
                 }
             }
         }
+        if (sweepMode_) sweep_.appendOverlay(lines, camera());
         renderer_->setClipmapLines(lines);
     }
 
     void buildObjects() {
         objects_.clear();
+        if (sweepMode_) {
+            sweep_.appendShapes(objects_);
+            std::vector<Vertex> overlay;
+            sweep_.appendOverlay(overlay, camera());
+            renderer_->setClipmapLines(overlay);
+            return;
+        }
         if (surface_ || freeView_) {
             const Vec focus = freeView_ ? flight_.position() : invokers_[selected_];
             for (const auto& body : shapes_) {
@@ -835,6 +884,19 @@ private:
 
     Camera camera() const {
         const auto textureSeed = std::uint32_t((opts_.seed ^ (opts_.seed >> 32)) % 1021);
+        if (sweepMode_ && sweep_.focusValid()) {
+            const Vec target = sweep_.focus();
+            const Vec radial = unit(target);
+            const auto basis = frameAt(radial);
+            const double distance = sweepDistance_ > 0 ? sweepDistance_ : sweep_.focusDistance();
+            const Vec dir = radial * std::cos(sweepPitch_)
+                          + basis[0] * std::sin(sweepYaw_) * std::cos(sweepPitch_)
+                          + basis[1] * std::sin(sweepPitch_);
+            const Vec eye = target + dir * distance;
+            const Vec forward = unit(target - eye), right = unit(cross(forward, radial), basis[0]);
+            return {eye, right, unit(cross(right, forward)), forward, 0.3, 20 * planetRadius,
+                    lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
+        }
         if (freeView_) {
             return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
                     lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
@@ -1635,6 +1697,7 @@ private:
         else if (command == Wireframe) wireframe_ = !wireframe_;
         else if (command == Atmosphere) opts_.render.atmosphereEnabled = !opts_.render.atmosphereEnabled;
         else if (command == Clouds) opts_.render.cloudsEnabled = !opts_.render.cloudsEnabled;
+        else if (command == Sweep) { sweepMode_ = !sweepMode_; rebuild(); }
         else if (command == Shadows) opts_.render.shadowsEnabled = !opts_.render.shadowsEnabled;
         else if (command == Ranges) {
             showRanges_ = !showRanges_;
@@ -1642,9 +1705,11 @@ private:
         }
         else if (command == Pause) paused_ = !paused_;
         else if (command == Drop) {
-            freeView_ = false;
-            surface_ = true;
-            spawn(int(selected_));
+            if (!sweepMode_) {
+                freeView_ = false;
+                surface_ = true;
+                spawn(int(selected_));
+            }
         } else if (command == Reset) {
             freeView_ = false;
             selected_ = 0;
@@ -1675,6 +1740,19 @@ private:
         if ((freeView_ || controlling_) && (code == 'W' || code == 'A' || code == 'S' || code == 'D' || code == VK_SHIFT)) return true;
         if (freeView_ && (code == 'Q' || code == 'E')) return true;
         if (!first) return false;
+        if (sweepMode_) {
+            if (code == VK_LEFT) sweep_.prevCast();
+            else if (code == VK_RIGHT) sweep_.nextCast();
+            else if (code == 'N') sweep_.jumpFrame();
+            else if (code == 'C') sweep_.nextMismatch();
+            else if (code == 'E') sweep_.nextWorstError();
+            else if (code == 'O') sweep_.nextWorstPoint();
+            else if (code == 'V') sweep_.revalidate();
+            else if (code == 'X') action(Sweep);
+            else return false;
+            updateFooter();
+            return true;
+        }
         if (code >= '1' && code <= '4') action(int(code - '1' + Mesh));
         else if (code == 'F') action(View);
         else if (code == 'L') action(Tint);
@@ -1794,6 +1872,11 @@ private:
                     << L"   |   Collision " << memory.physics / mib
                     << L"   |   Metadata " << memory.metadata / mib;
         terrainMemory_ = terrainInfo.str();
+        if (sweepMode_) {
+            status_ = sweep_.statusLine(methodLabels, triangles_);
+            processMemory_ = sweep_.castLine();
+            terrainMemory_ = sweep_.totalsLine();
+        }
         RECT footer{};
         GetClientRect(window_, &footer);
         footer.top = std::max(0L, footer.bottom - footerHeight);
@@ -1848,13 +1931,19 @@ private:
         SetTextColor(dc, RGB(152, 170, 193));
         row.top += 22;
         row.bottom += 22;
-        const wchar_t* controls = freeView_
-            ? L"Free [C]: WASD move / Q-E down-up / Drag to look / Shift x5 / Wheel speed / F2 wireframe / H atmosphere"
-            : controlling_
-            ? L"WASD move / Shift x3 / Drag to orbit / Wheel zoom / Tab next Invoker / Esc detach / C free camera"
-            : lodTint_ || showRanges_
-            ? lodLegend_.c_str()
-            : L"Drag to orbit / Wheel zoom / Tab Invoker / Space pause / B drop / J shadows / [ ] exposure -/+0.5 EV";
+        std::wstring sweepHint;
+        const wchar_t* controls;
+        if (sweepMode_) {
+            sweepHint = sweep_.controlsHint();
+            controls = sweepHint.c_str();
+        } else if (freeView_)
+            controls = L"Free [C]: WASD move / Q-E down-up / Drag to look / Shift x5 / Wheel speed / F2 wireframe / H atmosphere";
+        else if (controlling_)
+            controls = L"WASD move / Shift x3 / Drag to orbit / Wheel zoom / Tab next Invoker / Esc detach / C free camera";
+        else if (lodTint_ || showRanges_)
+            controls = lodLegend_.c_str();
+        else
+            controls = L"Drag to orbit / Wheel zoom / Tab Invoker / Space pause / B drop / J shadows / [ ] exposure -/+0.5 EV";
         row.bottom = client.bottom - 6;
         DrawTextW(dc, controls, -1, &row, DT_WORDBREAK | DT_NOPREFIX);
         RECT cameraRow{panel.left, panel.top, panel.right, panel.top + 18};
@@ -1879,7 +1968,8 @@ private:
                             (button == Tint && lodTint_) || (button == Ranges && showRanges_) ||
                             (button == Wireframe && wireframe_) || (button == Pause && paused_) ||
                             (button == Atmosphere && opts_.render.atmosphereEnabled) || (button == FreeView && freeView_) ||
-                            (button == Shadows && opts_.render.shadowsEnabled) || (button == Clouds && opts_.render.cloudsEnabled);
+                            (button == Shadows && opts_.render.shadowsEnabled) || (button == Clouds && opts_.render.cloudsEnabled) ||
+                            (button == Sweep && sweepMode_);
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const HBRUSH fill = CreateSolidBrush(active ? RGB(34, 72, 88) : pressed ? RGB(52, 65, 84) : RGB(31, 42, 58));
         FillRect(item.hDC, &item.rcItem, fill);
@@ -1959,7 +2049,10 @@ private:
                 if (app->dragging_) {
                     const POINT next{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                     const double dx = (next.x - app->mouse_.x) * 0.006, dy = (next.y - app->mouse_.y) * 0.006;
-                    if (app->freeView_) {
+                    if (app->sweepMode_) {
+                        app->sweepYaw_ = std::remainder(app->sweepYaw_ - dx, 2 * pi);
+                        app->sweepPitch_ = std::clamp(app->sweepPitch_ + dy, -1.35, 1.35);
+                    } else if (app->freeView_) {
                         app->flight_.look(dx, -dy);
                     } else if (app->surface_) {
                         app->bearing_ = std::remainder(app->bearing_ - dx, 2 * pi);
@@ -1976,7 +2069,11 @@ private:
             case WM_CAPTURECHANGED: app->dragging_ = false; return 0;
             case WM_MOUSEWHEEL: {
                 const double factor = std::pow(0.84, double(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA);
-                if (app->freeView_) app->flightSpeed_ = std::clamp(app->flightSpeed_ / factor, 1.0, 10000000.0);
+                if (app->sweepMode_) {
+                    const double base = app->sweepDistance_ > 0 ? app->sweepDistance_ : app->sweep_.focusDistance();
+                    app->sweepDistance_ = std::clamp(base * factor, 60.0, 4000.0);
+                }
+                else if (app->freeView_) app->flightSpeed_ = std::clamp(app->flightSpeed_ / factor, 1.0, 10000000.0);
                 else if (app->controlling_) app->followDistance_ = std::clamp(app->followDistance_ * factor, 30.0, 10500.0);
                 else if (app->surface_) app->surfaceDistance_ = std::clamp(app->surfaceDistance_ * factor, 110.0, 10500.0);
                 else app->orbitDistance_ = std::clamp(app->orbitDistance_ * factor, 1.02 * planetRadius, 8 * planetRadius);
@@ -1990,6 +2087,8 @@ private:
 
     Options opts_;
     Planet planet_;
+    SweepInspector sweep_{planet_, opts_.sweep, opts_.seed};
+    bool sweepMode_{opts_.sweep.enabled};
     int method_, pending_{};
     HWND window_{}, viewport_{};
     std::array<HWND, toolbarButtons.size()> buttons_{};
@@ -2022,6 +2121,7 @@ private:
     int streamBuilt_{};
     double yaw_{0.13}, pitch_{0.16}, orbitDistance_{2.5 * planetRadius}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
     double followDistance_{175};
+    double sweepYaw_{}, sweepPitch_{0.2}, sweepDistance_{};
 };
 
 }  // namespace
