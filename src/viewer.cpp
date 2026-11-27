@@ -62,8 +62,8 @@ struct Options {
     int method{1};
     std::uint64_t seed{42};
     InvokerSettings invoker;
-    bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{}, lodRangeCaptures{};
-    bool cloudFlight{}, cloudFlightCaptures{}, invokerCaptures{}, clipmapCaptures{}, clipmapLoadingCaptures{};
+    bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{}, lodRangeCaptures{}, shadowCaptures{};
+    bool cloudFlight{}, cloudFlightCaptures{}, invokerCaptures{}, clipmapCaptures{}, clipmapLoadingCaptures{}, invokerStressCaptures{}, invokerContractCaptures{};
     int clipmapCaptureCount{};
     double voxelDensity{1};
     std::uint32_t lod0Cells{defaultLod0Cells};
@@ -163,10 +163,17 @@ Options readOptions() {
         else if (option == L"--capture-clouds") { result.captures = next(); result.cloudCaptures = true; }
         else if (option == L"--capture-temporal") { result.captures = next(); result.temporalCaptures = true; }
         else if (option == L"--capture-stability") { result.captures = next(); result.stabilityCaptures = true; }
+        else if (option == L"--capture-shadows") { result.captures = next(); result.shadowCaptures = true; }
         else if (option == L"--replay-cloud-flight") result.cloudFlight = true;
         else if (option == L"--capture-cloud-flight") { result.captures = next(); result.cloudFlightCaptures = true; }
         else if (option == L"--capture-lod-ranges") { result.captures = next(); result.lodRangeCaptures = true; }
         else if (option == L"--capture-invokers") { result.captures = next(); result.invokerCaptures = true; }
+        else if (option == L"--capture-invoker-stress") {
+            result.captures = next(); result.clipmapCaptures = result.invokerStressCaptures = true;
+        }
+        else if (option == L"--capture-invoker-contract") {
+            result.captures = next(); result.clipmapCaptures = result.invokerStressCaptures = result.invokerContractCaptures = true;
+        }
         else if (option == L"--capture-clipmaps") { result.captures = next(); result.clipmapCaptures = true; }
         else if (option == L"--capture-clipmap-loading") {
             result.captures = next(); result.clipmapCaptures = result.clipmapLoadingCaptures = true;
@@ -372,6 +379,8 @@ public:
     }
 
     int run() {
+        if (opts_.shadowCaptures) return captureShadows();
+        if (opts_.invokerStressCaptures) return captureInvokerStress();
         if (opts_.clipmapLoadingCaptures) return captureInvokerLoading();
         if (opts_.clipmapCaptures) return captureClipmaps();
         if (opts_.invokerCaptures) {
@@ -386,7 +395,7 @@ public:
                    << "\nreturn_to_frozen_route=passed\nmode_change_preserves_positions=passed"
                    << "\ncount_change_preserves_bodies=passed\ncount_10000_navigation_and_last_target=passed"
                    << "\ncount_10000_terrain_stress=not_run\nglobal_surface_placement=passed"
-                   << "\ncamera_follow_keeps_cruising=passed\nfine_terrain_wait_and_resume=passed\nscenarios=passed\n";
+                   << "\ncamera_follow_keeps_cruising=passed\ncruise_while_terrain_pending=passed\nscenarios=passed\n";
             return 0;
         }
         if (opts_.cloudFlightCaptures) return captureCloudFlight();
@@ -595,8 +604,6 @@ private:
         invokerRoutes_.resize(std::size_t(count));
         invokerLodSources_.resize(std::size_t(count));
         invokerGround_.resize(std::size_t(count));
-        invokerTerrainWaiting_.resize(std::size_t(count), 1);
-        fineInvokerSources_.resize(std::size_t(count), 0);
         for (std::size_t i = previous; i < invokers_.size(); ++i) {
             const Vec direction = initialInvokerDirection(i, opts_.seed);
             invokers_[i] = direction * planetRadius;
@@ -641,10 +648,7 @@ private:
         invokers_.resize(std::size_t(opts_.invoker.count));
         invokerLodSources_.resize(invokers_.size());
         invokerGround_.assign(invokers_.size(), InvokerGround{});
-        invokerTerrainWaiting_.assign(invokers_.size(), 1);
-        fineInvokerSources_.assign(invokers_.size(), 0);
-        for (std::size_t i = 0; i < std::min(std::size_t(2), invokers_.size()); ++i) fineInvokerSources_[i] = 1;
-        fineInvokerSources_[selected_] = 1;
+        movingInvokerCount_ = 0;
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             const Vec direction = initialInvokerDirection(i, opts_.seed);
             invokers_[i] = direction * planetRadius;
@@ -681,20 +685,18 @@ private:
     void tick() {
         world_->physics.step(dt, true);
         simulationTime_ += dt;
+        movingInvokerCount_ = 0;
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
-            invokerTerrainWaiting_[i] = 0;
             if (controlling_ && manualControl_ && i == selected_) continue;
-            // A population build may take longer than it takes to walk across
-            // LOD0. Do not let autonomous actors leave the published fine field
-            // or advance a route clock while its starting patch is still pending.
-            if (!world_->hasFinestLod(invokerLodSources_[i])) { invokerTerrainWaiting_[i] = 1; continue; }
             auto nextRoute = invokerRoutes_[i];
             if (!returning_[i]) nextRoute.advance(dt, opts_.invoker);
             const Vec route = planet_.surface(nextRoute.direction(opts_.invoker));
             const double speed = returning_[i] ? opts_.invoker.returnSpeed : opts_.invoker.cruiseSpeed;
             if (speed <= 0) continue;
-            const auto step = advanceInvokerOnSurface(planet_, invokers_[i], route, speed * dt);
-            if (!world_->hasFinestLod(step.position)) { invokerTerrainWaiting_[i] = 1; continue; }
+            // Navigation uses the analytical surface, independently of render
+            // residency. Missing LOD0 must not silently reduce the stress load.
+            const auto step = advanceInvokerOnSurface(planet_, invokerLodSources_[i], route, speed * dt);
+            movingInvokerCount_ += length(step.position - invokerLodSources_[i]) > 1e-9;
             invokerRoutes_[i] = nextRoute;
             invokers_[i] = step.position;
             invokerLodSources_[i] = step.position;
@@ -753,34 +755,24 @@ private:
         }
     }
 
-    ClipmapForecast terrainForecast(bool admitOne) {
-        if (admitOne) {
-            // The selected target is served before the remaining background
-            // population. Every admitted source keeps all its requested rings.
-            if (controlling_ && !fineInvokerSources_[selected_]) fineInvokerSources_[selected_] = 1;
-            else {
-                const auto next = std::find(fineInvokerSources_.begin(), fineInvokerSources_.end(), 0);
-                if (next != fineInvokerSources_.end()) *next = 1;
-            }
-        }
+    ClipmapForecast terrainForecast() const {
         auto forecast = clipmapForecast_;
+        // All configured Invokers always request the full LOD hierarchy.
+        // Attaching a camera changes the view, never source admission/quality.
         forecast.minimumLod.assign(invokers_.size() + 1, 0);
-        const int coarse = std::max(0, gridRootLevel(voxelDensityShift(opts_.voxelDensity)) - 2);
-        for (std::size_t i = 0; i < invokers_.size(); ++i)
-            if (!fineInvokerSources_[i]) forecast.minimumLod[i] = coarse;
         return forecast;
     }
 
     bool requestTerrainUpdate(Vec eye) {
         if (world_->updatePending()) return false;
-        return world_->requestUpdate(invokerLodSources_, true, eye, true, terrainForecast(true));
+        return world_->requestUpdate(invokerLodSources_, true, eye, true, terrainForecast());
     }
 
     void updateTerrain(bool force) {
         fullTerrainBuild_ = force;
         for (std::size_t i = 0; i < invokers_.size(); ++i)
             invokerLodSources_[i] = planet_.surface(unit(invokers_[i]));
-        const auto stats = world_->update(invokerLodSources_, true, camera().eye, terrainForecast(!force));
+        const auto stats = world_->update(invokerLodSources_, true, camera().eye, terrainForecast());
         fullTerrainBuild_ = false;
         finishTerrainUpdate(stats, force);
     }
@@ -908,7 +900,6 @@ private:
         }
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             groundInvoker(invokers_[i], world_->chunks, planet_.elevationRange(), invokerGround_[i]);
-            invokerTerrainWaiting_[i] = !world_->hasFinestLod(invokerLodSources_[i]);
         }
         if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
     }
@@ -1162,6 +1153,74 @@ private:
         record("restored");
         renderer_->draw(camera(), objects_, opts_.captures / "lod-range-restored.bmp", true);
         report << "scenarios=passed\n";
+        return 0;
+    }
+
+    int captureShadows() {
+        std::filesystem::create_directories(opts_.captures);
+        SetWindowPos(window_, nullptr, 0, 0, 1280, 800, SWP_NOMOVE | SWP_NOZORDER);
+        renderer_->setClipmapLines({});
+        surface_ = controlling_ = true; freeView_ = false;
+        buildObjects();
+        Camera local = camera();
+        local.settings.shadowResolution = 2048;
+        local.settings.taaEnabled = false;
+        local.settings.shadowNearDistanceM = 4096;
+        renderer_->draw(local, objects_, opts_.captures / "shadow-terrain-wide.bmp", true);
+        local.settings.shadowNearDistanceM = RenderSettings{}.shadowNearDistanceM;
+        renderer_->draw(local, objects_, opts_.captures / "shadow-terrain-near.bmp", true);
+        local.settings.taaEnabled = true;
+        renderer_->resetTemporalHistory();
+        for (int frame = 0; frame < 48; ++frame) renderer_->draw(local, objects_);
+        renderer_->draw(local, objects_, opts_.captures / "shadow-terrain-near-taa.bmp", true);
+        const Vec origin{0,0,planetRadius};
+        std::vector<Vertex> ground, objects;
+        Shape floor = sampleShape(3, {0,0,1}); floor.size = {150,150,0.1};
+        appendBox(ground, floor, origin - Vec{0,0,0.1}, color({0.7,0.7,0.7}, 254));
+        appendBeacon(objects, origin + Vec{-3,0,0}, 1, true);
+        appendBox(objects, sampleShape(3, {0,0,1}), origin + Vec{0,0,1}, color({0.8,0.35,0.12}, 254));
+        appendRound(objects, sampleShape(2, {0,0,1}), origin + Vec{3,0,1}, color({0.15,0.6,0.75}, 254));
+        renderer_->setTerrain(ground);
+        Camera view{};
+        view.eye = origin + Vec{5,-12,7};
+        view.forward = unit(origin + Vec{0,0,0.7} - view.eye);
+        view.right = unit(cross(view.forward, {0,0,1})); view.up = cross(view.right, view.forward);
+        view.nearPlane = 0.05; view.farPlane = 20 * planetRadius;
+        view.settings.atmosphereEnabled = view.settings.cloudsEnabled = view.settings.taaEnabled = false;
+        const auto capture = [&](const std::string& name, Camera camera) {
+            renderer_->draw(camera, objects, opts_.captures / ("shadow-" + name + ".bmp"), true);
+        };
+        for (int edge : shadowResolutions) {
+            view.settings.shadowResolution = edge;
+            view.settings.shadowNearDistanceM = 4096;
+            capture("wide-" + std::to_string(edge), view);
+            view.settings.shadowNearDistanceM = RenderSettings{}.shadowNearDistanceM;
+            capture("near-" + std::to_string(edge), view);
+            auto off = view; off.settings.shadowsEnabled = false;
+            capture("off-" + std::to_string(edge), off);
+        }
+        view.settings.shadowResolution = 2048;
+        capture("precision-base", view);
+        const Vec translation{1e12,-1e12,1e12};
+        const auto baseGround = ground, baseObjects = objects;
+        for (auto& vertex : ground) vertex.position = vertex.position + translation;
+        for (auto& vertex : objects) vertex.position = vertex.position + translation;
+        renderer_->setTerrain(ground);
+        Camera translated = view; translated.eye = translated.eye + translation; translated.planetCenter = translation;
+        capture("precision-translated", translated);
+        ground = baseGround; objects = baseObjects;
+        renderer_->setTerrain(ground);
+        view.settings.taaEnabled = true;
+        renderer_->resetTemporalHistory();
+        for (int frame = 0; frame < 48; ++frame) renderer_->draw(view, objects);
+        capture("near-2048-taa", view);
+        std::ofstream report(opts_.captures / "shadow-validation.txt");
+        report << "renderer=" << (renderer_->isWarp() ? "WARP" : "hardware")
+               << "\nbox_dimensions_m=1,1,2\ncapsule_dimensions_m=1,1,2\nbeacon_dimensions_m=1,1,2"
+               << "\nnear_range_m=" << RenderSettings{}.shadowNearDistanceM
+               << "\nwide_range_m=4096\nfar_distance_cap_km=" << view.settings.shadowDistanceKm
+               << "\nlog_split_weight=" << view.settings.shadowSplitBlend
+               << "\nterrain=" << name(opts_.terrain) << "\nscenarios=15\n";
         return 0;
     }
 
@@ -1630,18 +1689,189 @@ private:
         return 0;
     }
 
+    int captureInvokerStress() {
+        selectCaptureItem(TerrainStyle, int(TerrainPreset::Mars));
+        auto settings = opts_.invoker;
+        settings.count = opts_.clipmapCaptureCount;
+        applyInvokerSettings(settings);
+        if (controlling_ || manualControl_) throw std::runtime_error("Stress test unexpectedly attached a camera");
+        if (settings.cruiseSpeed <= 0) throw std::invalid_argument("Invoker stress capture requires a positive cruise speed");
+        const auto expectedMoving = std::size_t(settings.count);
+        if (invokers_.size() != expectedMoving) throw std::runtime_error("The stress population was reduced below the requested count");
+        const auto fineCount = [&] {
+            std::size_t ready = 0;
+            for (Vec source : invokerLodSources_) ready += world_->hasFinestLod(source);
+            return ready;
+        };
+        const auto checkRequest = [&] {
+            const auto forecast = terrainForecast();
+            if (forecast.minimumLod.size() != invokers_.size() + 1 ||
+                std::any_of(forecast.minimumLod.begin(), forecast.minimumLod.end(), [](int lod) { return lod != 0; }))
+                throw std::runtime_error("An unattached Invoker did not request the complete LOD hierarchy");
+        };
+        const auto advance = [&] {
+            tick();
+            if (controlling_ || manualControl_ || movingInvokerCount_ != expectedMoving)
+                throw std::runtime_error("The configured population did not advance together without attach");
+        };
+        // This check runs while the new actors still have no fine terrain.
+        const auto initialSources = invokerLodSources_;
+        for (int frame = 0; frame < 60; ++frame) advance();
+        checkRequest();
+        {
+            std::ofstream contract(opts_.captures / "stress-contract.txt");
+            contract << "requested_invokers=" << settings.count << "\nactual_invokers=" << invokers_.size()
+                     << "\nlod0_cells_per_edge=" << lod0Cells_ << "\nvoxel_spacing_m=" << opts_.voxelDensity
+                     << "\nattached=0\nmoving_before_fine_terrain=" << movingInvokerCount_
+                     << "\nready_before_warmup=" << fineCount() << "\nrequested_lod0=" << invokers_.size()
+                     << "\nadditional_camera_sources=1\nall_request_minimum_lod_zero=passed\nscenarios=passed\n";
+            std::ofstream sources(opts_.captures / "stress-sources.csv");
+            sources << std::setprecision(17) << "invoker,minimum_lod,start_x,start_y,start_z,current_x,current_y,current_z,route_phase\n";
+            for (std::size_t i = 0; i < invokers_.size(); ++i) {
+                const Vec start = initialSources[i], current = invokerLodSources_[i];
+                sources << i + 1 << ",0," << start.x << ',' << start.y << ',' << start.z << ','
+                        << current.x << ',' << current.y << ',' << current.z << ',' << invokerRoutes_[i].phase() << '\n';
+            }
+        }
+        if (opts_.invokerContractCaptures) return 0;
+
+        std::ofstream progress(opts_.captures / "stress-progress.csv");
+        progress << "phase,elapsed_ms,moving,invokers,lod0_ready,working_set_mib,private_commit_mib,triangles\n";
+        const auto checkpoint = [&](const char* phase, double elapsed) {
+            PROCESS_MEMORY_COUNTERS_EX memory{};
+            GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+            const bool simulating = std::strcmp(phase, "moving") == 0 || std::strcmp(phase, "before_warmup") == 0;
+            progress << phase << ',' << elapsed << ',' << (simulating ? movingInvokerCount_ : 0) << ',' << invokers_.size() << ','
+                     << fineCount() << ',' << memory.WorkingSetSize / (1024.0 * 1024.0) << ','
+                     << memory.PrivateUsage / (1024.0 * 1024.0) << ',' << triangles_ << '\n';
+            progress.flush();
+        };
+        checkpoint("before_warmup", 0);
+        const auto waitForTerrain = [&](const char* phase) {
+            const auto start = Clock::now();
+            double lastReport = -1000;
+            for (;;) {
+                if (const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(false); })) {
+                    applyTerrain(*published, false);
+                    break;
+                }
+                renderer_->draw(camera(), {});
+                const double elapsed = milliseconds(start);
+                if (elapsed - lastReport >= 1000) { checkpoint(phase, elapsed); lastReport = elapsed; }
+            }
+            const double elapsed = milliseconds(start);
+            checkpoint(phase, elapsed);
+            return elapsed;
+        };
+        // Warm-up holds the entire population at once, only in this benchmark.
+        // Normal operation never pauses actors to wait for terrain.
+        if (!requestTerrainUpdate(camera().eye)) throw std::runtime_error("Could not start full-population warm-up");
+        const double warmupMs = waitForTerrain("warmup");
+        if (fineCount() != invokers_.size()) throw std::runtime_error("Warm-up did not load every requested Invoker LOD0");
+        const auto motionStart = invokerLodSources_;
+        std::ofstream frames(opts_.captures / "stress-frames.csv");
+        frames << "frame,simulation_s,frame_ms,tick_ms,simulation_ticks,moving,invokers,lod0_ready,requested_lod0,update_pending,"
+                  "built_chunks,update_ms,select_ms,sample_cpu_ms,mesh_cpu_ms\n";
+        std::vector<double> frameTimes, tickTimes, updateTimes;
+        std::size_t minReady = invokers_.size(), publications = 0, built = 0;
+        constexpr int targetTicks = 600;
+        int ticks = 0, frame = 0;
+        double accumulator = dt;
+        auto previous = Clock::now();
+        const auto steadyStart = previous;
+        while (ticks < targetTicks) {
+            const auto frameStart = Clock::now();
+            const double elapsed = std::clamp(std::chrono::duration<double>(frameStart - previous).count(), 0.0, 0.1);
+            previous = frameStart;
+            accumulator += elapsed;
+            const auto tickStart = Clock::now();
+            int frameTicks = 0;
+            while (accumulator >= dt && ticks < targetTicks) {
+                advance(); accumulator -= dt; ++ticks; ++frameTicks;
+            }
+            const double tickMs = milliseconds(tickStart);
+            if (frameTicks) tickTimes.push_back(tickMs / frameTicks);
+            const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(false); });
+            if (published) {
+                applyTerrain(*published, false);
+                if (published->build.built || published->build.removed) {
+                    ++publications; built += published->build.built; updateTimes.push_back(published->updateMs);
+                }
+            }
+            const auto view = camera();
+            trackClipmapMotion(view.eye, elapsed);
+            checkRequest();
+            requestTerrainUpdate(view.eye);
+            renderer_->draw(view, {});
+            const double frameMs = milliseconds(frameStart);
+            frameTimes.push_back(frameMs);
+            const auto ready = fineCount();
+            minReady = std::min(minReady, ready);
+            frames << frame++ << ',' << ticks * dt << ',' << frameMs << ',' << tickMs << ',' << frameTicks << ','
+                   << movingInvokerCount_ << ',' << invokers_.size() << ',' << ready << ',' << invokers_.size() << ','
+                   << world_->updatePending() << ',' << (published ? published->build.built : 0) << ','
+                   << (published ? published->updateMs : 0) << ',' << (published ? published->selectMs : 0) << ','
+                   << (published ? published->build.sampleMs : 0) << ',' << (published ? published->build.meshMs : 0) << '\n';
+            if (frame % 60 == 0) { frames.flush(); checkpoint("moving", milliseconds(steadyStart)); }
+        }
+        frames.close();
+        const double steadyMs = milliseconds(steadyStart);
+        const auto readyBeforeDrain = fineCount();
+        double drainMs = 0;
+        if (world_->updatePending()) drainMs += waitForTerrain("drain");
+        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, false, terrainForecast()))
+            throw std::runtime_error("Could not request the final stress snapshot");
+        drainMs += waitForTerrain("final_snapshot");
+        if (fineCount() != invokers_.size()) throw std::runtime_error("Final snapshot did not load every moving Invoker");
+        double minDistance = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < invokers_.size(); ++i) {
+            const Vec a = unit(motionStart[i]), b = unit(invokerLodSources_[i]);
+            minDistance = std::min(minDistance, planetRadius * std::atan2(length(cross(a, b)), dot(a, b)));
+        }
+        const auto percentile = [](std::vector<double> values, double p) {
+            if (values.empty()) return 0.0;
+            std::sort(values.begin(), values.end());
+            return values[std::size_t((values.size() - 1) * p)];
+        };
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+        std::ofstream report(opts_.captures / "stress-validation.txt");
+        report << "terrain=" << name(planet_.preset()) << "\nbackend=" << name(methods[method_])
+               << "\ninvokers=" << invokers_.size() << "\nattached=0\nrequested_lod0=" << invokers_.size()
+               << "\nlod0_cells_per_edge=" << lod0Cells_ << "\nvoxel_spacing_m=" << opts_.voxelDensity
+               << "\nmode=" << (settings.mode == InvokerCruiseMode::Area ? "area" : "great-circle")
+               << "\ncruise_speed_mps=" << settings.cruiseSpeed << "\nprewarmup_all_advance=passed"
+               << "\nwarmup_simulation_paused=1\ndrain_simulation_paused=1"
+               << "\nwarmup_ms=" << warmupMs << "\nwarmup_lod0_ready=" << invokers_.size()
+               << "\nsteady_simulation_s=" << ticks * dt << "\nsteady_wall_ms=" << steadyMs
+               << "\nsteady_ticks=" << ticks << "\nall_ticks_moving=" << expectedMoving
+               << "\nmin_surface_displacement_m=" << minDistance << "\nmin_lod0_ready_while_moving=" << minReady
+               << "\nready_before_drain=" << readyBeforeDrain << "\ndrain_ms=" << drainMs
+               << "\nchanged_publications=" << publications << "\nbuilt_while_moving=" << built
+               << "\nframe_p50_ms=" << percentile(frameTimes, 0.5) << "\nframe_p95_ms=" << percentile(frameTimes, 0.95)
+               << "\ntick_p95_ms=" << percentile(tickTimes, 0.95) << "\nchanged_update_p95_ms=" << percentile(updateTimes, 0.95)
+               << "\nfinal_lod0_ready=" << fineCount() << "\ntriangles=" << triangles_
+               << "\nworking_set_mib=" << memory.WorkingSetSize / (1024.0 * 1024.0)
+               << "\npeak_working_set_mib=" << memory.PeakWorkingSetSize / (1024.0 * 1024.0)
+               << "\nprivate_commit_mib=" << memory.PrivateUsage / (1024.0 * 1024.0)
+               << "\nclouds=" << opts_.render.cloudsEnabled << "\natmosphere=" << opts_.render.atmosphereEnabled
+               << "\nshadows=" << opts_.render.shadowsEnabled << "\ntaa=" << opts_.render.taaEnabled
+               << "\nscenarios=passed\n";
+        return 0;
+    }
+
     int captureInvokerLoading() {
         // Reproduce the actual control path, including an old update in flight:
         // Classic -> Mars -> increase count -> follow 8, 9 and 12 in order.
         selectCaptureItem(TerrainStyle, int(TerrainPreset::Mars));
-        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true, terrainForecast(false)))
+        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true, terrainForecast()))
             throw std::runtime_error("Could not start the pre-existing terrain update");
         auto settings = opts_.invoker;
         settings.count = opts_.clipmapCaptureCount;
         applyInvokerSettings(settings);
         captureLoadingTargets("pending");
         std::ofstream progress(opts_.captures / "loading-progress.csv");
-        progress << "target,elapsed_ms,admitted_invokers,published_lod0,working_set_mib,triangles\n";
+        progress << "target,elapsed_ms,requested_invokers,published_lod0,working_set_mib,triangles\n";
         const auto start = Clock::now();
         for (int number : {8, 9, 12}) {
             if (number > int(invokers_.size())) continue;
@@ -1654,7 +1884,7 @@ private:
                     PROCESS_MEMORY_COUNTERS memory{};
                     GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory));
                     progress << number << ',' << milliseconds(start) << ','
-                             << std::count(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1) << ','
+                             << invokers_.size() << ','
                              << world_->hasFinestLod(invokerLodSources_[selected_]) << ','
                              << memory.WorkingSetSize / (1024.0 * 1024.0) << ',' << triangles_ << '\n';
                     progress.flush();
@@ -1683,14 +1913,14 @@ private:
 
     int captureClipmaps() {
         setInvokerCount(opts_.clipmapCaptureCount);
-        std::fill(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1);
         if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true))
             throw std::runtime_error("Could not request distributed Invoker terrain");
         const auto starting = invokers_;
         const bool newPending = invokers_.size() > 2 && !world_->hasFinestLod(invokerLodSources_[2]);
         for (int frame = 0; frame < 600; ++frame) tick();
-        if (newPending && (length(invokers_[2] - starting[2]) != 0 || invokerRoutes_[2].phase() != 0))
-            throw std::runtime_error("An Invoker walked away before its initial LOD0 was published");
+        if (newPending && opts_.invoker.cruiseSpeed > 0 &&
+            (length(invokers_[2] - starting[2]) == 0 || invokerRoutes_[2].phase() == 0))
+            throw std::runtime_error("A pending Invoker incorrectly stopped cruising before LOD0 publication");
         for (;;) {
             if (const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(true); })) {
                 applyTerrain(*published, false);
@@ -1876,8 +2106,9 @@ private:
         const double pendingPhase = invokerRoutes_[2].phase();
         const bool pendingFine = !world_->hasFinestLod(invokerLodSources_[2]);
         tick();
-        if (pendingFine && (length(invokers_[2] - pendingPosition) != 0 || invokerRoutes_[2].phase() != pendingPhase))
-            throw std::runtime_error("Autonomous cruise advanced before the starting LOD0 was ready");
+        if (pendingFine && opts_.invoker.cruiseSpeed > 0 &&
+            (length(invokers_[2] - pendingPosition) == 0 || invokerRoutes_[2].phase() == pendingPhase))
+            throw std::runtime_error("Autonomous cruise was paused by a missing starting LOD0");
         updateTerrain(false);
         const double readyPhase = invokerRoutes_[2].phase();
         tick();
@@ -2142,7 +2373,8 @@ private:
         std::wostringstream info;
         // Keep the applied/requested range and resident counts visible even
         // when the remaining diagnostic text is ellipsized on narrow windows.
-        info << L"Invoker LOD0 " << fineReady << L"/" << invokers_.size();
+        info << L"Moving " << (paused_ ? 0 : movingInvokerCount_) << L"/" << invokers_.size()
+             << L"   |   Invoker LOD0 " << fineReady << L"/" << invokers_.size();
         if (fineReady < invokers_.size()) info << (world_->updatePending() ? L" loading" : L" queued");
         info << L"   |   LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
              << L" / " << counts[3] << L" / " << coarse
@@ -2157,10 +2389,8 @@ private:
         const auto pendingGround = std::count_if(invokerGround_.begin(), invokerGround_.end(),
             [](const InvokerGround& ground) { return !ground.ready; });
         if (pendingGround) info << L"   |   Surface pending " << pendingGround;
-        std::size_t pendingFine = 0;
-        for (std::size_t i = 0; i < invokerLodSources_.size(); ++i)
-            pendingFine += invokerTerrainWaiting_[i] || !world_->hasFinestLod(invokerLodSources_[i]);
-        if (pendingFine) info << L"   |   LOD0 waiting " << pendingFine;
+        const auto pendingFine = invokers_.size() - fineReady;
+        if (pendingFine) info << L"   |   LOD0 data pending " << pendingFine;
         if (freeView_) info << L"   |   Free " << std::fixed << std::setprecision(0) << flightSpeed_ << L" m/s";
         info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invoker.count << L" + camera"
              << (controlling_ ? (manualControl_ ? L" (manual)" : L" (following cruise)") : L"")
@@ -2419,8 +2649,7 @@ private:
     std::vector<Vec> invokers_;
     std::vector<Vec> invokerLodSources_;
     std::vector<InvokerGround> invokerGround_;
-    std::vector<std::uint8_t> invokerTerrainWaiting_;
-    std::vector<std::uint8_t> fineInvokerSources_;
+    std::size_t movingInvokerCount_{};
     mutable InvokerGround cameraGround_;
     std::vector<Vec> clipmapPositions_;
     ClipmapForecast clipmapForecast_;

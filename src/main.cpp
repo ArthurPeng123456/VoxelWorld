@@ -43,7 +43,7 @@ void help() {
               << "  [--morton] [--global] [--obj] [--out DIRECTORY] [--capsule-stress]\n"
               << "  [--self-test] [--self-test-global] (full-planet integration tests)\n"
               << "  [--voxel-density 0.125|0.25|0.5|1|2] (LOD0 spacing in meters; default 1m)\n"
-              << "  [--lod0-range N] (global clipmap cells per edge; power of two >=32; default 256)\n"
+              << "  [--lod0-range N] (global clipmap cells per edge; power of two >=32; default 128)\n"
               << "  [--terrain classic|mars|volcanic]\n"
               << "Defaults: 90 frames, 6 warmup, 2 moving invokers plus a camera, 12 queries per type per frame,\n"
               << "48 bodies and a terrain update every 6 frames. Units are meters.\n";
@@ -513,10 +513,10 @@ void selfTestGlobalTerrain() {
     const Planet planet(42);
     const auto first = invokerPositions(planet, 1, 0);
     {
-        check(defaultLod0Cells == 256 && validLod0Cells(32) && validLod0Cells(4096) &&
+        check(defaultLod0Cells == 128 && validLod0Cells(32) && validLod0Cells(4096) &&
               !validLod0Cells(0) && !validLod0Cells(16) && !validLod0Cells(500),
-              "LOD0 range is a power-of-two cell count per edge, default 256, at least one brick");
-        check(parseLod0Cells(std::string("4096")) == 4096 && parseLod0Cells(std::wstring(L"256")) == defaultLod0Cells,
+              "LOD0 range is a power-of-two cell count per edge, default 128, at least one brick");
+        check(parseLod0Cells(std::string("4096")) == 4096 && parseLod0Cells(std::wstring(L"128")) == defaultLod0Cells,
               "CLI and viewer parse the same cell count");
         for (const auto* text : {"", "16", "500", "-32", "4096m", "8388608", "4294967296", "18446744073709551615"}) {
             bool rejected = false;
@@ -868,12 +868,44 @@ void selfTest() {
         }
         RenderSettings settings;
         settings.shadowDistanceKm = 4;
+        settings.shadowNearDistanceM = 4096;
         settings.shadowSplitBlend = 0;
         settings.shadowDepthBias = 0;
         const auto adjusted = buildShadowCascades(eye, right, up, forward, 0.3, 10000000, 1.6, {0.45,0.25,0.86}, settings);
         check(adjusted.cascades.back().farDistance == 4000 && adjusted.cascades.front().depthBias == 0 &&
               std::abs(adjusted.cascades.front().farDistance - 1000.225) < 1e-9,
               "CSM distance cap, split weight and depth bias reach the cascade fit");
+        RenderSettings close;
+        close.shadowResolution = 2048;
+        const auto human = buildShadowCascades(eye, right, up, forward, 0.05, 10000000, 2.4, {0.45,0.25,0.86}, close);
+        close.shadowNearDistanceM = 4096; // Reproduce the old, unconstrained split distribution.
+        const auto wide = buildShadowCascades(eye, right, up, forward, 0.05, 10000000, 2.4, {0.45,0.25,0.86}, close);
+        check(human.cascades.front().farDistance <= 64 && human.cascades.front().texelSize < 0.1 &&
+              wide.cascades.front().texelSize > human.cascades.front().texelSize * 5 &&
+              human.cascades.back().farDistance == wide.cascades.back().farDistance,
+              "human-scale near shadows keep sub-decimeter texels without shortening distant coverage");
+        const auto previousClose = close;
+        close.shadowNearDistanceM = 32;
+        const auto closer = buildShadowCascades(eye, right, up, forward, 0.05, 10000000, 2.4, {0.45,0.25,0.86}, close);
+        check(closer.cascades.front().texelSize < human.cascades.front().texelSize * 0.51 &&
+              !sameHistorySettings(close, previousClose), "near shadow range changes fit and invalidates temporal history");
+        for (double near : {0.05, 0.3, 100.0, 1500.0, 9000.0}) for (double weight : {0.0, 0.85, 1.0}) {
+            close.shadowSplitBlend = weight;
+            const auto fitted = buildShadowCascades(eye, right, up, forward, near, 10000000, 2.4, {0.45,0.25,0.86}, close);
+            double first = near;
+            for (const auto& cascade : fitted.cascades) {
+                check(cascade.farDistance > first, "near range keeps strictly ordered splits at ground and aerial near planes");
+                for (int corner = 0; corner < 8; ++corner) {
+                    const double distance = corner & 4 ? cascade.farDistance : first;
+                    const Vec p = forward * distance + right * ((corner & 1 ? 1 : -1) * distance * 2.4 / 1.92)
+                                + up * ((corner & 2 ? 1 : -1) * distance / 1.92);
+                    const Vec q = cascade.project(p);
+                    check(std::abs(q.x) <= 1.000001 && std::abs(q.y) <= 1.000001 && q.z >= 0 && q.z <= 1,
+                          "near-range cascades cover the whole view without gaps");
+                }
+                first = cascade.farDistance;
+            }
+        }
         check(toneMap(0, 0) == 0 && toneMap(4, 0) > toneMap(1, 0) && toneMap(1, 1) > toneMap(1, 0) &&
               toneMap(1000, 0) <= 1, "HDR exposure and highlight compression are monotonic and bounded");
         check(!readRenderParameter(L"nan", hdrParameters.front()) && !readRenderParameter(L"11", hdrParameters.front()) &&

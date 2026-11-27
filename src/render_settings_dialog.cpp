@@ -139,8 +139,8 @@ INT_PTR CALLBACK renderDialog(HWND dialog, UINT message, WPARAM w, LPARAM l) {
             SendDlgItemMessageW(dialog, Resolution, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         }
         addFields(dialog, shadowParameters, ShadowFirst, 18, 82);
-        addControl(dialog, L"STATIC", L"", 0, ShadowMemory, 18, 165, 179, 11);
-        addControl(dialog, L"STATIC", L"Higher map resolution uses more GPU memory.\n\nDistance sets the maximum local shadow range; orbital views can fall outside that range.", 0, -1, 220, 45, 190, 90);
+        addControl(dialog, L"STATIC", L"", 0, ShadowMemory, 18, 184, 179, 11);
+        addControl(dialog, L"STATIC", L"Near cascade range reserves shadow detail close to the camera. Smaller values sharpen nearby shadows.\n\nThe near range limits the split distribution; the distance cap still controls distant coverage.\n\nHigher map resolution uses more GPU memory.", 0, -1, 220, 45, 190, 130);
 
         state(dialog).buildingPage = AtmospherePage;
         addControl(dialog, L"BUTTON", L"Enable atmosphere [H]", WS_TABSTOP | BS_AUTOCHECKBOX, AtmosphereEnabled, 18, 40, 180, 12);

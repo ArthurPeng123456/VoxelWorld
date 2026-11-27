@@ -23,6 +23,7 @@ struct RenderSettings {
     bool shadowsEnabled{true};
     int shadowResolution{shadowResolutions.front()};
     double shadowDistanceKm{200}, shadowSplitBlend{0.85};
+    double shadowNearDistanceM{64};
     double shadowNormalBias{1}, shadowDepthBias{1};
     bool atmosphereEnabled{true};
     double atmosphereHeightKm{referenceAtmosphereHeightKm}, rayleighHeightKm{8}, mieHeightKm{1.2};
@@ -59,6 +60,7 @@ struct RenderParameter {
 
 inline constexpr std::array shadowParameters{
     RenderParameter{L"--shadow-distance-km", L"Distance cap (km)", &RenderSettings::shadowDistanceKm, 1, 1000},
+    RenderParameter{L"--shadow-near-distance-m", L"Near cascade range (m)", &RenderSettings::shadowNearDistanceM, 4, 4096},
     RenderParameter{L"--shadow-split-blend", L"Log split weight", &RenderSettings::shadowSplitBlend, 0, 1},
     RenderParameter{L"--shadow-normal-bias", L"Normal bias multiplier", &RenderSettings::shadowNormalBias, 0, 8},
     RenderParameter{L"--shadow-depth-bias", L"Depth bias multiplier", &RenderSettings::shadowDepthBias, 0, 8}

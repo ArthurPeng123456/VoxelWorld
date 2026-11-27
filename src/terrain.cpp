@@ -656,6 +656,9 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     start = Clock::now();
     meshChunk(*chunk, method != Method::Mesh);
     if (hasCoarserEdge) stitchFaces(*chunk, boundary, layout);
+    // Published meshes are immutable. Do not retain vector growth capacity
+    // across resident and staged generations of the terrain.
+    chunk->mesh.shrink_to_fit();
     stats.meshMs += milliseconds(start);
     if (method == Method::Mesh) chunk->field.reset();
     ++stats.built;

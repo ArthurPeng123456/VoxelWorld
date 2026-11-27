@@ -87,7 +87,7 @@ inline double gridChunkSize(int densityShift) { return std::ldexp(chunkSize, den
 inline double gridSpacing(int densityShift) { return std::ldexp(1.0, densityShift); }
 constexpr int gridRootLevel(int densityShift) { return rootLevel - densityShift; }
 constexpr std::uint32_t fieldCellsPerAxis(int densityShift) { return fineCells * (1u << (gridRootLevel(densityShift) + 1)); }
-constexpr std::uint32_t defaultLod0Cells = 256;
+constexpr std::uint32_t defaultLod0Cells = 128;
 constexpr bool validLod0Cells(std::uint32_t cells) {
     return cells >= fineCells && (cells & (cells - 1)) == 0 && cells < fieldCellsPerAxis(1);
 }

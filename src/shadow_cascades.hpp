@@ -29,11 +29,18 @@ inline ShadowCascades buildShadowCascades(Vec planetEye, Vec right, Vec up, Vec 
     const Vec z = unit(sun) * -1;
     const Vec x = unit(cross(std::abs(z.z) < 0.9 ? Vec{0,0,1} : Vec{0,1,0}, z));
     const Vec y = cross(z, x);
+    // A small uniform contribution over a planetary shadow distance otherwise
+    // consumes the entire first map on hundreds of meters. Reserve a close
+    // cascade for meter-scale objects and spread the other ceilings out to far.
+    // Keep the interval valid when the camera's near plane is already distant.
+    const double nearRange = std::min(farDistance, std::max(settings.shadowNearDistanceM, nearPlane * 2));
     double previous = nearPlane;
     for (int i = 0; i < shadowCascadeCount; ++i) {
         const double t = double(i + 1) / shadowCascadeCount;
-        const double split = settings.shadowSplitBlend * nearPlane * std::pow(farDistance / nearPlane, t)
-                           + (1 - settings.shadowSplitBlend) * (nearPlane + (farDistance - nearPlane) * t);
+        const double practical = settings.shadowSplitBlend * nearPlane * std::pow(farDistance / nearPlane, t)
+                               + (1 - settings.shadowSplitBlend) * (nearPlane + (farDistance - nearPlane) * t);
+        const double ceiling = nearRange * std::pow(farDistance / nearRange, double(i) / (shadowCascadeCount - 1));
+        const double split = i == shadowCascadeCount - 1 ? farDistance : std::min(practical, ceiling);
         // Overlap the fitted intervals for smooth blending at cascade boundaries.
         const double first = i ? previous - (previous - nearPlane) * 0.12 : nearPlane;
         const Vec center = forward * ((first + split) * 0.5);

@@ -654,7 +654,7 @@ struct Dx12Renderer::Impl {
     void inspect(const Readback& color, const Readback& sceneDepth, const Readback& normals,
                  const std::array<Readback, 4>& maps, const Readback& clouds, const Readback& temporal,
                  const Readback& rawCloudMetadata, const Readback& resolvedCloudMetadata, const Readback& velocities,
-                 bool historyUsed, const std::filesystem::path& capture) {
+                 bool historyUsed, const ShadowCascades& csm, const std::filesystem::path& capture) {
         lastDiagnostics = {}; lastDiagnostics.debugLayer = debugLayer;
         lastDiagnostics.temporalHistoryValid = historyUsed;
         lastDiagnostics.shadowResolution = maps.front().footprint.Footprint.Width;
@@ -771,7 +771,11 @@ struct Dx12Renderer::Impl {
                << "\ncloud_primary_steps=" << lastDiagnostics.cloudRaySteps
                << "\nmoving_object_pixels=" << lastDiagnostics.movingObjectPixels
                << "\nmax_object_motion_pixels=" << lastDiagnostics.maxObjectMotionPixels << '\n';
-        for (int i = 0; i < shadowCascadeCount; ++i) report << "cascade_" << i << "_depth_pixels=" << lastDiagnostics.shadowPixels[i] << '\n';
+        for (int i = 0; i < shadowCascadeCount; ++i) {
+            report << "cascade_" << i << "_depth_pixels=" << lastDiagnostics.shadowPixels[i]
+                   << "\ncascade_" << i << "_far_m=" << csm.cascades[i].farDistance
+                   << "\ncascade_" << i << "_texel_m=" << csm.cascades[i].texelSize << '\n';
+        }
         if (lastDiagnostics.invalidValues) throw std::runtime_error("Pipeline validation found invalid GPU values");
     }
 
@@ -1079,7 +1083,7 @@ struct Dx12Renderer::Impl {
             const D3D12_RANGE noWrites{0,0}; screenshot.resource->Unmap(0, &noWrites);
         }
         if (inspectPipeline) inspect(hdrRead, depthRead, normalRead, shadowRead, cloudRead, temporalRead,
-                                     rawCloudMetadataRead, resolvedCloudMetadataRead, motionRead, validHistory, capture);
+                                     rawCloudMetadataRead, resolvedCloudMetadataRead, motionRead, validHistory, csm, capture);
     }
 
     HWND window;
