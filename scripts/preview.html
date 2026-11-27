@@ -222,7 +222,7 @@ function start() {
     surface.setAttribute('aria-pressed', String(local));
     tint.setAttribute('aria-pressed', String(useTint));
     ranges.setAttribute('aria-pressed', String(showRanges));
-    const step = 50 * (mesh.voxelDensity ?? 1);
+    const step = mesh.finestSpacingM ?? 50 * (mesh.voxelDensity ?? 1);
     const legend = useTint || showRanges ? ` · 青 ${step} m / 绿 ${step*2} m / 金 ${step*4} m / 紫 ${step*8} m / LOD 4+ 红至蓝，间距逐级翻倍` : '';
     const camera = mesh.camera ? ' + 导出摄像机' : '';
     status.textContent = `6,371 km 基准半径 · ${count} 个三角形 · Invoker ${selected + 1}/${mesh.invokers.length}${camera}${legend}`;

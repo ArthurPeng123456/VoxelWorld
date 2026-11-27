@@ -149,6 +149,17 @@ float Planet::sdf(Vec p) const {
     return float(r - planetRadius - elevation(unit(p)));
 }
 
+bool Planet::mayContainSurface(Box box) const {
+    const Vec center = box.center();
+    const double radius = length(box.hi - center), minimumRadius = length(center) - radius;
+    if (minimumRadius <= 0) return true;
+    // Conservative interval from the same analytical gradient bound used by
+    // certifyUniform. No corner-only test: small craters must not disappear.
+    const double variation = radius * (1 + 12 * planetRadius / minimumRadius) + 0.01;
+    const double margin = std::max(16.0, 2 * (box.hi.x - box.lo.x) / fineCells);
+    return std::abs(sdf(center)) <= variation + margin;
+}
+
 Vec Planet::invokerDirection(int index, double frame) const {
     const Vec axis = preset_ == TerrainPreset::Classic ? craters_[std::size_t(index) % craters_.size()].axis
                                                        : impacts_[std::size_t(index) % impacts_.size()].axis;
@@ -338,8 +349,9 @@ bool certifyUniform(const Planet& planet, Vec center, double radius, double sign
                     int subdivisions, double& closest) {
     const double distance = sign * planet.sdf(center);
     if (distance <= margin) return false;
-    // The sum of the directional relief-gradient bounds for Mars and Volcanic
-    // is below 12 m/m on the reference sphere. Along a segment inside this box,
+    // All presets have a relief-gradient bound below 12 m/m on the reference
+    // sphere (Classic's maximum bowl/rim slopes and three waves total < 6).
+    // Along a segment inside this box,
     // normalization can amplify that bound by at most R / minRadius.
     const double minimumRadius = length(center) - radius;
     if (minimumRadius <= 0) return false;
@@ -378,7 +390,7 @@ void stitchHierarchicalFaces(Chunk& chunk, BoundarySampler& boundary, const Layo
             const Box neighborBox = bounds(*neighbor);
             Key grid;
             for (int a = 0; a < 3; ++a) {
-                const int cells = fineCells >> std::min(lod, 3);
+                const int cells = chunkCells(*neighbor, lod);
                 const int index = std::clamp(int(std::floor((probe[a] - neighborBox.lo[a]) / spacing)), 0, cells - 1);
                 grid[a] = (*neighbor)[a] * fineCells + index * step;
             }
@@ -552,7 +564,7 @@ void meshChunk(Chunk& chunk, bool indexField) {
 std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Key key,
                                   Method method, bool morton, BuildStats& stats, const Chunk* previous) {
     const int lod = layout.at(key);
-    const int cells = fineCells >> std::min(lod, 3);
+    const int cells = chunkCells(key, lod);
     const int count = cells + 1;
     const auto box = bounds(key);
     const bool shell = intersectsPlanetShell(key, planet.elevationRange());
@@ -563,7 +575,7 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
         if (method != Method::Mesh) {
             chunk->field = makeStorage(method, count, {value}, morton, chunk->spacing, box.lo);
             const auto solidMask = value < 0 ? std::uint32_t((std::uint64_t(1) << cells) - 1) : 0;
-            chunk->rows.assign(std::size_t(cells) * cells, CellRow{0, solidMask});
+            chunk->rows.assign(1, CellRow{0, solidMask});
         }
         stats.storageMs += milliseconds(start);
         ++stats.built;
@@ -580,9 +592,8 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
                        key.z * fineCells + z * stride};
         return boundary.interpolate(grid, coarsest);
     };
-    const bool compact = planet.preset() != TerrainPreset::Classic;
     const double margin = std::max(16.0, 2 * chunk->spacing);
-    if (compact) {
+    {
         const auto center = box.center();
         const double prior = previous && previous->key == key ? previous->certifiedDistance : 0;
         const bool reuseProof = std::abs(prior) > margin;
@@ -630,7 +641,7 @@ std::unique_ptr<Chunk> buildChunk(const Planet& planet, const Layout& layout, Ke
     }
     stats.sampleMs += milliseconds(start);
     start = Clock::now();
-    if (compact) {
+    {
         // Test the final samples, including the coarser boundary interpolation.
         // Trilinear cells cannot cross zero when all corners are on one side.
         // Keep signed distances in the band used by contact and seam queries.

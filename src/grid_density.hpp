@@ -10,7 +10,7 @@ inline constexpr std::array<double, 5> voxelDensities{{0.125, 0.25, 0.5, 1.0, 2.
 inline int voxelDensityShift(double value) {
     for (int i = 0; i < int(voxelDensities.size()); ++i)
         if (value == voxelDensities[i]) return i - 3;
-    throw std::invalid_argument("Voxel density must be 0.125, 0.25, 0.5, 1 or 2 (sampling-spacing multiplier)");
+    throw std::invalid_argument("Voxel step must be 0.125, 0.25, 0.5, 1 or 2 meters");
 }
 template<class Text> double parseVoxelDensity(const Text& text) {
     try {

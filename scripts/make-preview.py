@@ -14,6 +14,7 @@ def package_mesh(mesh_path, out_path):
     windows = []
     camera = None
     density = 1.0
+    spacing = None
     positions = array("d")
     levels = bytearray()
     level = 3
@@ -21,6 +22,8 @@ def package_mesh(mesh_path, out_path):
         for line in mesh:
             if line.startswith("# voxel_density "):
                 density = float(line.split()[2])
+            elif line.startswith("# finest_spacing_m "):
+                spacing = float(line.split()[2])
             elif line.startswith("# invoker "):
                 invokers.append([float(value) for value in line.split()[2:5]])
             elif line.startswith("# camera_invoker "):
@@ -47,6 +50,7 @@ def package_mesh(mesh_path, out_path):
     data = {
         "invokers": invokers,
         "voxelDensity": density,
+        "finestSpacingM": spacing if spacing is not None else 50 * density,
         "camera": camera,
         "windows": windows,
         "positions": b64encode(positions).decode("ascii"),

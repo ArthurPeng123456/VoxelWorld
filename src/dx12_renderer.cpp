@@ -902,6 +902,7 @@ struct Dx12Renderer::Impl {
         frameUpload->Unmap(0, nullptr);
         require(allocator->Reset(), "Reset command allocator");
         require(list->Reset(allocator.Get(), nullptr), "Reset command list");
+        const bool copiedTerrain = terrainCopiesPending;
         if (terrainCopiesPending) {
             copyTerrainPages(terrainPages);
             copyTerrainPages(stagedTerrainPages);
@@ -1050,6 +1051,14 @@ struct Dx12Renderer::Impl {
         require(list->Close(), "Close draw command list");
         ID3D12CommandList* commands[]{list.Get()}; queue->ExecuteCommandLists(1, commands); submitted = true;
         const HRESULT presented = swap->Present(1,0); wait(); require(presented, "Present frame");
+        if (copiedTerrain) {
+            // The fence has completed every copy. Keep the draw buffer, release
+            // the upload heap instead of retaining a second copy of all terrain.
+            for (auto* pages : {&terrainPages, &stagedTerrainPages}) for (auto& [key, page] : *pages) {
+                page.staging.resource.Reset();
+                page.staging.capacity = 0;
+            }
+        }
         lastCloudTiming = {};
         if (cloudTimestamps && settings.cloudsEnabled) {
             const D3D12_RANGE read{0, 3 * sizeof(UINT64)}, noWrites{0, 0};

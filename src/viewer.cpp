@@ -3,6 +3,8 @@
 #include "render_settings_dialog.hpp"
 #include "world.hpp"
 #include "free_camera.hpp"
+#include "invoker_navigation.hpp"
+#include "invoker_settings_dialog.hpp"
 #include "sweep.hpp"
 
 #include <shellapi.h>
@@ -30,9 +32,8 @@ constexpr int cameraPanelWidth = 340;
 constexpr int cameraPanelHeight = 90;
 constexpr double pi = 3.14159265358979323846;
 constexpr double dt = 1.0 / 60.0;
-constexpr int maxInvokers = 16;
-constexpr double invokerSpeed = 240.0;
-constexpr double invokerReturnSpeed = 720.0;
+constexpr double defaultSurfaceDistance = 12.0;
+constexpr double defaultFollowDistance = 6.0;
 constexpr std::array<Method, 4> methods{Method::Mesh, Method::Grid, Method::Dag, Method::Vdb};
 constexpr std::array<const wchar_t*, 4> methodLabels{L"Mesh BVH", L"VoxelField", L"HashDAG", L"OpenVDB"};
 constexpr std::array terrainLabels{L"Classic", L"Mars Craters", L"Volcanic Highlands"};
@@ -46,25 +47,27 @@ Key terrainPage(Key chunk) {
     return {align(chunk.x), align(chunk.y), align(chunk.z), level, chunk.densityShift};
 }
 
-enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows, Clouds,
-               Sweep, RangeSettings, GraphicsSettings, Density = 100, InvokerCount, CameraTarget, TerrainStyle };
+enum Command { Mesh = 1, Grid, Dag, Vdb, View, Tint, Pause, Drop, Reset, Ranges, Wireframe, Atmosphere, FreeView, Shadows, Clouds, Sweep,
+               RangeSettings, GraphicsSettings, InvokerOptions, Density = 100, CameraTarget, TerrainStyle };
 
 struct ToolbarButton { const wchar_t* label; int width; };
-constexpr std::array<ToolbarButton, GraphicsSettings> toolbarButtons{{
+constexpr std::array<ToolbarButton, InvokerOptions> toolbarButtons{{
     {L"1  Mesh BVH", 100}, {L"2  VoxelField", 100}, {L"3  HashDAG", 100}, {L"4  OpenVDB", 100},
     {L"Surface [F]", 104}, {L"LOD [L]", 72}, {L"Pause", 68}, {L"Drop [B]", 76}, {L"Reset", 56},
     {L"Ranges [K]", 84}, {L"Wireframe [F2]", 116}, {L"Atmosphere [H]", 128}, {L"Free [C]", 92}, {L"Shadows [J]", 108},
-    {L"Clouds [V]", 100}, {L"Sweep [X]", 96},
-    {L"LOD ranges...", 112}, {L"Render settings...", 136}
+    {L"Clouds [V]", 100},{ L"Sweep [X]", 96 },
+    {L"LOD ranges...", 112}, {L"Render settings...", 136}, {L"Invoker settings...", 144}
 }};
 
 struct Options {
     int method{1};
     std::uint64_t seed{42};
-    int invokers{2};
+    InvokerSettings invoker;
     bool warp{}, morton{}, cloudCaptures{}, temporalCaptures{}, stabilityCaptures{}, lodRangeCaptures{};
-    bool cloudFlight{}, cloudFlightCaptures{};
+    bool cloudFlight{}, cloudFlightCaptures{}, invokerCaptures{}, clipmapCaptures{}, clipmapLoadingCaptures{};
+    int clipmapCaptureCount{};
     double voxelDensity{1};
+    std::uint32_t lod0Cells{defaultLod0Cells};
     TerrainPreset terrain{TerrainPreset::Classic};
     RenderSettings render;
     SweepOptions sweep;
@@ -178,8 +181,14 @@ Options readOptions() {
         else if (option == L"--replay-cloud-flight") result.cloudFlight = true;
         else if (option == L"--capture-cloud-flight") { result.captures = next(); result.cloudFlightCaptures = true; }
         else if (option == L"--capture-lod-ranges") { result.captures = next(); result.lodRangeCaptures = true; }
+        else if (option == L"--capture-invokers") { result.captures = next(); result.invokerCaptures = true; }
+        else if (option == L"--capture-clipmaps") { result.captures = next(); result.clipmapCaptures = true; }
+        else if (option == L"--capture-clipmap-loading") {
+            result.captures = next(); result.clipmapCaptures = result.clipmapLoadingCaptures = true;
+        }
         else if (option == L"--profile-stream") result.streamProfile = next();
         else if (option == L"--voxel-density" || option == L"--density") result.voxelDensity = parseVoxelDensity(next());
+        else if (option == L"--lod0-range") result.lod0Cells = parseLod0Cells(next());
         else if (option == L"--seed") result.seed = integer();
         else if (option == L"--terrain") {
             const auto value = next();
@@ -190,15 +199,23 @@ Options readOptions() {
             result.terrain = parseTerrainPreset(ascii);
         }
         else if (option == L"--invokers") {
-            const auto n = integer();
-            if (n < 1 || n > maxInvokers) throw std::invalid_argument("Invoker count must be from 1 to 16");
-            result.invokers = int(n);
-        } else if (option == L"--sweep") result.sweep.enabled = true;
+            result.invoker.count = parseInvokerCount(next());
+        } else if (option == L"--invoker-cruise") {
+            const auto mode = next();
+            if (mode == L"area") result.invoker.mode = InvokerCruiseMode::Area;
+            else if (mode == L"great-circle") result.invoker.mode = InvokerCruiseMode::GreatCircle;
+            else throw std::invalid_argument("--invoker-cruise requires area or great-circle");
+        } else if (option == L"--invoker-patrol-radius-m") result.invoker.patrolRadius = parseInvokerNumber(next());
+        else if (option == L"--invoker-cruise-speed") result.invoker.cruiseSpeed = parseInvokerNumber(next());
+        else if (option == L"--invoker-return-speed") result.invoker.returnSpeed = parseInvokerNumber(next());
+        else if (option == L"--invoker-control-speed") result.invoker.controlSpeed = parseInvokerNumber(next());
+        else if (option == L"--sweep") result.sweep.enabled = true;
         else if (option == L"--sweep-invokers") {
             const auto n = integer();
             if (n < 1 || n > 1000) throw std::invalid_argument("Sweep invoker count must be from 1 to 1000");
             result.sweep.invokers = int(n);
-        } else if (option == L"--shapes-per-invoker") result.sweep.shapesPerInvoker = bounded(1, 84);
+        }
+        else if (option == L"--shapes-per-invoker") result.sweep.shapesPerInvoker = bounded(1, 84);
         else if (option == L"--sweep-frames") result.sweep.frames = bounded(1, 400);
         else if (option == L"--sweep-warmup") result.sweep.warmup = bounded(0, 20);
         else if (option == L"--sweep-budget") result.sweep.budget = bounded(1, 10000000);
@@ -212,7 +229,8 @@ Options readOptions() {
                 result.sweep.frame = int(std::stoull(text));
                 if (result.sweep.frame > 100000) throw std::invalid_argument("Sweep frame is out of range");
             }
-        } else if (option == L"--scheme") {
+        }
+        else if (option == L"--scheme") {
             const auto value = next();
             if (value == L"mesh" || value == L"1") result.method = 0;
             else if (value == L"grid" || value == L"2") result.method = 1;
@@ -229,6 +247,11 @@ Options readOptions() {
     const auto defaults = defaultRenderSettings(result.terrain);
     for (std::size_t field = 0; field < terrainRenderFields.size(); ++field)
         if (!renderOverrides[field]) result.render.*terrainRenderFields[field] = defaults.*terrainRenderFields[field];
+    if (!validInvokerSettings(result.invoker)) throw std::invalid_argument("Invalid Invoker settings");
+    if (result.clipmapCaptures) {
+        result.clipmapCaptureCount = result.invoker.count;
+        result.invoker.count = std::min(2, result.invoker.count);
+    }
     return result;
 }
 
@@ -302,7 +325,7 @@ void appendBeacon(std::vector<Vertex>& batch, Vec surface, double size, bool sel
     const Vec bottom = surface + up * (size * 0.89), top = surface + up * (size * 1.11);
     const Vec tip = surface + up * (size * 2);
     for (int i = 0; i < sides; ++i) {
-        const Vec x = directions[i] * (size * 0.55), y = directions[(i + 1) % sides] * (size * 0.55);
+        const Vec x = directions[i] * (size * 0.5), y = directions[(i + 1) % sides] * (size * 0.5);
         const Vec normal = unit(x + y);
         flatTriangle(batch, surface, bottom + x, bottom + y, normal, shell);
         flatTriangle(batch, bottom + x, top + x, top + y, normal, belt);
@@ -318,7 +341,8 @@ Vec moveOnPlanet(const Planet& planet, Vec position, Vec tangent, double meters)
 
 class App {
 public:
-    explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed, opts_.terrain), method_(opts_.method) {}
+    explicit App(Options options) : opts_(std::move(options)), planet_(opts_.seed, opts_.terrain), method_(opts_.method),
+                                    lod0Cells_(opts_.lod0Cells) {}
     ~App() {
         world_.reset();
         renderer_.reset();
@@ -365,19 +389,16 @@ public:
             SendMessageW(buttons_[i], WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
         }
         createCombo(instance, Density, L"Voxel step", 80, 156);
-        createCombo(instance, InvokerCount, L"Invokers", 67, 67);
         createCombo(instance, CameraTarget, L"Camera", 66, 125);
         createCombo(instance, TerrainStyle, L"Terrain", 65, 177);
         for (const auto* label : terrainLabels) addComboItem(TerrainStyle, label);
         SendMessageW(combo(TerrainStyle), CB_SETCURSEL, WPARAM(opts_.terrain), 0);
         for (int i = 0; i < int(voxelDensities.size()); ++i) {
             std::wostringstream label;
-            label << voxelDensities[i] << L"x (" << chunkSize / fineCells * voxelDensities[i] << L" m)";
+            label << voxelDensities[i] << L"x (" << voxelDensities[i] << L" m)";
             addComboItem(Density, label.str());
             if (voxelDensities[i] == opts_.voxelDensity) SendMessageW(combo(Density), CB_SETCURSEL, WPARAM(i), 0);
         }
-        for (int count = 1; count <= maxInvokers; ++count) addComboItem(InvokerCount, std::to_wstring(count));
-        SendMessageW(combo(InvokerCount), CB_SETCURSEL, WPARAM(opts_.invokers - 1), 0);
         arrange();
         ShowWindow(window_, show);
         UpdateWindow(window_);
@@ -387,6 +408,23 @@ public:
     }
 
     int run() {
+        if (opts_.clipmapLoadingCaptures) return captureInvokerLoading();
+        if (opts_.clipmapCaptures) return captureClipmaps();
+        if (opts_.invokerCaptures) {
+            const auto original = opts_.invoker;
+            captureInvokerControls();
+            std::ofstream report(opts_.captures / "invoker-validation.txt");
+            report << "mode=" << (original.mode == InvokerCruiseMode::Area ? "area" : "great-circle")
+                   << "\ncount=" << original.count << "\npatrol_radius_m=" << original.patrolRadius
+                   << "\ncruise_speed_mps=" << original.cruiseSpeed << "\nreturn_speed_mps=" << original.returnSpeed
+                   << "\ncontrol_speed_mps=" << original.controlSpeed
+                   << "\nspeed_limits=passed\ncontrol_pauses_route=passed\nnumpad_speed_keys=passed"
+                   << "\nreturn_to_frozen_route=passed\nmode_change_preserves_positions=passed"
+                   << "\ncount_change_preserves_bodies=passed\ncount_10000_navigation_and_last_target=passed"
+                   << "\ncount_10000_terrain_stress=not_run\nglobal_surface_placement=passed"
+                   << "\ncamera_follow_keeps_cruising=passed\nfine_terrain_wait_and_resume=passed\nscenarios=passed\n";
+            return 0;
+        }
         if (opts_.cloudFlightCaptures) return captureCloudFlight();
         if (opts_.cloudFlight) return replayCloudFlight();
         if (opts_.lodRangeCaptures) return captureLodRanges();
@@ -457,7 +495,7 @@ public:
             trackClipmapMotion(frameCamera.eye, elapsed);
             streamElapsed += elapsed;
             if ((streamElapsed >= dt || profile.is_open()) &&
-                world_->requestUpdate(invokers_, true, frameCamera.eye, true, clipmapForecast_)) {
+                requestTerrainUpdate(frameCamera.eye)) {
                 streamElapsed = 0;
             }
             const double terrainMs = milliseconds(terrainStart) + uploadMs;
@@ -541,10 +579,15 @@ private:
     }
 
     void refreshCameraTargets() {
+        SendMessageW(combo(CameraTarget), WM_SETREDRAW, FALSE, 0);
         SendMessageW(combo(CameraTarget), CB_RESETCONTENT, 0, 0);
+        SendMessageW(combo(CameraTarget), CB_INITSTORAGE, opts_.invoker.count + 1,
+                     LPARAM((opts_.invoker.count + 1) * 16 * sizeof(wchar_t)));
         addComboItem(CameraTarget, L"Detached");
-        for (int i = 1; i <= opts_.invokers; ++i) addComboItem(CameraTarget, L"Invoker " + std::to_wstring(i));
+        for (int i = 1; i <= opts_.invoker.count; ++i) addComboItem(CameraTarget, L"Invoker " + std::to_wstring(i));
         syncCameraTarget();
+        SendMessageW(combo(CameraTarget), WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(combo(CameraTarget), nullptr, TRUE);
     }
 
     void syncCameraTarget() {
@@ -552,8 +595,9 @@ private:
     }
 
     void detachInvoker() {
-        if (controlling_) returning_[selected_] = true;
+        if (controlling_ && manualControl_) returning_[selected_] = true;
         controlling_ = false;
+        manualControl_ = false;
     }
 
     void selectCameraTarget(std::size_t item) {
@@ -565,7 +609,7 @@ private:
         } else if (item <= invokers_.size()) {
             detachInvoker();
             selected_ = item - 1;
-            returning_[selected_] = false;
+            manualControl_ = false;
             controlling_ = true;
             freeView_ = false;
             surface_ = true;
@@ -574,23 +618,53 @@ private:
     }
 
     void setInvokerCount(int count) {
+        if (count < 1 || count > maxInvokerCount) throw std::invalid_argument("Invoker count must be from 1 to 10000");
         const auto previous = invokers_.size();
         if (count == int(previous)) return;
         if (selected_ >= std::size_t(count)) {
             if (controlling_) selectCameraTarget(0);
             selected_ = std::size_t(count - 1);
         }
-        opts_.invokers = count;
+        opts_.invoker.count = count;
         invokers_.resize(std::size_t(count));
+        returning_.resize(std::size_t(count), 0);
+        invokerRoutes_.resize(std::size_t(count));
+        invokerLodSources_.resize(std::size_t(count));
+        invokerGround_.resize(std::size_t(count));
+        invokerTerrainWaiting_.resize(std::size_t(count), 1);
+        fineInvokerSources_.resize(std::size_t(count), 0);
         for (std::size_t i = previous; i < invokers_.size(); ++i) {
-            invokers_[i] = planet_.surface(planet_.invokerDirection(int(i), simulationTime_ * 2.0));
+            const Vec direction = initialInvokerDirection(i, opts_.seed);
+            invokers_[i] = direction * planetRadius;
+            invokerLodSources_[i] = planet_.surface(direction);
+            invokerGround_[i] = {};
+            invokerRoutes_[i].reset(invokers_[i], int(i));
             returning_[i] = false;
+            if (world_) groundInvoker(invokers_[i], world_->chunks, planet_.elevationRange(), invokerGround_[i]);
         }
         refreshCameraTargets();
     }
 
+    void applyInvokerSettings(const InvokerSettings& settings) {
+        if (!validInvokerSettings(settings)) throw std::invalid_argument("Invalid Invoker settings");
+        const auto previous = opts_.invoker;
+        setInvokerCount(settings.count);
+        if (settings.mode != previous.mode || settings.patrolRadius != previous.patrolRadius) {
+            manualControl_ = false; // Applying a new autonomous route resumes camera-follow cruise.
+            for (std::size_t i = 0; i < invokers_.size(); ++i) {
+                const Vec heading = invokerRoutes_[i].heading(previous);
+                invokerRoutes_[i].reset(invokers_[i], int(i), heading);
+                returning_[i] = false;
+            }
+        }
+        opts_.invoker = settings;
+        updateFooter();
+    }
+
     void rebuild() {
         world_.reset();
+        sweep_.clear();
+        sweepFree_ = false;
         sweepYaw_ = 0;
         sweepPitch_ = 0.2;
         sweepDistance_ = 0;
@@ -601,24 +675,42 @@ private:
         nextTerrainUpload_ = 0;
         simulationTime_ = 0;
         shapes_.clear();
-        controlling_ = false;
-        returning_.fill(false);
-        const int sweepCount = sweepMode_ ? opts_.sweep.invokers : opts_.invokers;
+        controlling_ = manualControl_ = false;
+        cameraGround_ = {};
+        returning_.assign(std::size_t(opts_.invoker.count), 0);
+        invokerRoutes_.assign(std::size_t(opts_.invoker.count), InvokerRoute{});
+        invokers_.resize(std::size_t(opts_.invoker.count));
+        invokerLodSources_.resize(invokers_.size());
+        invokerGround_.assign(invokers_.size(), InvokerGround{});
+        invokerTerrainWaiting_.assign(invokers_.size(), 1);
+        fineInvokerSources_.assign(invokers_.size(), 0);
+        for (std::size_t i = 0; i < std::min(std::size_t(2), invokers_.size()); ++i) fineInvokerSources_[i] = 1;
+        fineInvokerSources_[selected_] = 1;
+        for (std::size_t i = 0; i < invokers_.size(); ++i) {
+            const Vec direction = initialInvokerDirection(i, opts_.seed);
+            invokers_[i] = direction * planetRadius;
+            invokerLodSources_[i] = planet_.surface(direction);
+            invokerRoutes_[i].reset(invokers_[i], int(i));
+        }
+        const int sweepCount = sweepMode_ ? opts_.sweep.invokers : opts_.invoker.count;
         invokers_ = invokerPositions(planet_, sweepCount, 0);
         refreshCameraTargets();
         world_ = std::make_unique<World>(planet_, methods[method_], opts_.morton, opts_.voxelDensity,
             [this](const Chunks& live, const Chunks& staged, const std::vector<Key>& removed) {
                 prepareTerrainPages(live, staged, removed);
             });
-        world_->setLod0Radius(lod0Radius_);
-        sweep_.attachBackend(*world_, methods[method_], opts_.morton, opts_.voxelDensity);
-        sweep_.clear();
+        world_->setLod0Cells(lod0Cells_);
         updateTerrain(true);
         if (sweepMode_) {
+            sweep_.attachBackend(*world_, methods[method_], opts_.morton, opts_.voxelDensity);
             sweep_.begin(invokers_, invokers_.front());
+            const Camera orbit = camera();
+            flight_.reset(orbit.eye, orbit.forward, orbit.up);
+            flightSpeed_ = 40.0;
         } else {
-            for (int i = 0; i < opts_.invokers; ++i) spawn(i);
+            for (int i = 0; i < opts_.invoker.count; ++i) spawn(i);
         }
+        for (int i = 0; i < opts_.invoker.count; ++i) spawn(i);
         updateFooter();
         repaintButtons();
     }
@@ -630,10 +722,10 @@ private:
         constexpr Vec palette[] = {{0.98, 0.61, 0.27}, {0.33, 0.84, 0.95}, {0.77, 0.68, 0.99}};
         for (int i = 0; i < 9; ++i) {
             const double angle = i * 2.3999632;
-            const double distance = 52 * std::sqrt(double(i));
+            const double distance = 3 * std::sqrt(double(i));
             const Vec up = unit(point + (basis[0] * std::cos(angle) + basis[1] * std::sin(angle)) * distance);
             Shape shape = sampleShape(i % 3 + 1, up);
-            const auto id = world_->physics.addBody(shape, planet_.surface(up) + up * (72 + 8 * i), up * -18);
+            const auto id = world_->physics.addBody(shape, planet_.surface(up) + up * (2.5 + 0.35 * i), up * -1.5);
             shapes_.push_back({id, shape, color(palette[i % 3], 254)});
         }
     }
@@ -643,52 +735,69 @@ private:
         world_->physics.step(dt, true);
         simulationTime_ += dt;
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
-            if (controlling_ && i == selected_) continue;
-            const Vec route = planet_.surface(planet_.invokerDirection(int(i), simulationTime_ * 2.0));
-            if (returning_[i]) {
-                const Vec up = unit(invokers_[i]), goal = unit(route);
-                const double cosine = dot(up, goal);
-                const Vec tangent = goal - up * cosine;
-                const double angle = std::atan2(length(tangent), cosine);
-                if (angle * length(invokers_[i]) > invokerReturnSpeed * dt) {
-                    invokers_[i] = moveOnPlanet(planet_, invokers_[i], unit(tangent, frameAt(up)[0]), invokerReturnSpeed * dt);
-                    continue;
-                }
-                returning_[i] = false;
-            }
-            invokers_[i] = route;
+            invokerTerrainWaiting_[i] = 0;
+            if (controlling_ && manualControl_ && i == selected_) continue;
+            // A population build may take longer than it takes to walk across
+            // LOD0. Do not let autonomous actors leave the published fine field
+            // or advance a route clock while its starting patch is still pending.
+            if (!world_->hasFinestLod(invokerLodSources_[i])) { invokerTerrainWaiting_[i] = 1; continue; }
+            auto nextRoute = invokerRoutes_[i];
+            if (!returning_[i]) nextRoute.advance(dt, opts_.invoker);
+            const Vec route = planet_.surface(nextRoute.direction(opts_.invoker));
+            const double speed = returning_[i] ? opts_.invoker.returnSpeed : opts_.invoker.cruiseSpeed;
+            if (speed <= 0) continue;
+            const auto step = advanceInvokerOnSurface(planet_, invokers_[i], route, speed * dt);
+            if (!world_->hasFinestLod(step.position)) { invokerTerrainWaiting_[i] = 1; continue; }
+            invokerRoutes_[i] = nextRoute;
+            invokers_[i] = step.position;
+            invokerLodSources_[i] = step.position;
+            groundInvoker(invokers_[i], world_->chunks, planet_.elevationRange(), invokerGround_[i]);
+            if (step.arrived) returning_[i] = false;
         }
     }
 
     void moveControlled(double elapsed) {
         // Poll current state so held keys move smoothly and focus changes cannot
         // leave a movement key stuck.
-        if ((!freeView_ && !controlling_) || GetForegroundWindow() != window_ || GetFocus() != viewport_) return;
+        if (GetForegroundWindow() != window_ || GetFocus() != viewport_) return;
         auto down = [](int keyCode) { return (GetAsyncKeyState(keyCode) & 0x8000) != 0; };
-        const double ahead = double(down('W')) - double(down('S'));
-        const double sideways = double(down('D')) - double(down('A'));
+        const bool w = down('W'), a = down('A'), s = down('S'), d = down('D');
+        const bool q = down('Q'), e = down('E');
+        if (sweepMode_ && !sweepFree_ && (w || a || s || d || q || e)) {
+            sweepFree_ = true;
+            const Camera view = camera();
+            flight_.reset(view.eye, view.forward, view.up);
+        }
+        const bool flying = freeView_ || sweepFree_;
+        if (!flying && !controlling_) return;
+        const double ahead = double(w) - double(s);
+        const double sideways = double(d) - double(a);
         if (controlling_) {
             moveInvoker(ahead, sideways, elapsed, down(VK_SHIFT));
         } else {
-            const double vertical = double(down('E')) - double(down('Q'));
+            const double vertical = double(e) - double(q);
             flight_.move(ahead, sideways, vertical, elapsed, flightSpeed_ * (down(VK_SHIFT) ? 5 : 1));
         }
     }
 
     void moveInvoker(double ahead, double sideways, double elapsed, bool faster) {
         if ((!ahead && !sideways) || elapsed <= 0) return;
+        manualControl_ = true;
+        returning_[selected_] = false;
         Vec& position = invokers_[selected_];
         const Vec up = unit(position), view = camera().forward;
         const Vec forward = unit(view - up * dot(view, up), frameAt(up)[0]);
         const Vec right = cross(forward, up);
         const Vec direction = unit(forward * ahead + right * sideways);
-        position = moveOnPlanet(planet_, position, direction, invokerSpeed * elapsed * (faster ? 3 : 1));
+        position = moveOnPlanet(planet_, position, direction, opts_.invoker.controlSpeed * elapsed * (faster ? 3 : 1));
+        invokerLodSources_[selected_] = position;
+        groundInvoker(position, world_->chunks, planet_.elevationRange(), invokerGround_[selected_]);
     }
 
     void trackClipmapMotion(Vec cameraEye, double elapsed) {
         const std::size_t count = invokers_.size() + 1;
         clipmapForecast_.primary = controlling_ ? selected_ : count - 1;
-        const auto positionAt = [&](std::size_t i) { return i < invokers_.size() ? invokers_[i] : cameraEye; };
+        const auto positionAt = [&](std::size_t i) { return i < invokers_.size() ? invokerLodSources_[i] : cameraEye; };
         if (clipmapPositions_.size() != count || elapsed <= 0) {
             clipmapPositions_.resize(count);
             for (std::size_t i = 0; i < count; ++i) clipmapPositions_[i] = positionAt(i);
@@ -697,7 +806,7 @@ private:
         }
         const double blend = std::min(1.0, elapsed / 0.10);
         const double lookAhead = std::clamp(0.70 + streamMs_ * 0.0006, 0.70, 1.00);
-        const double jump = 2.0 * world_->lod0Radius();
+        const double jump = lodSideLength(world_->lod0Cells(), voxelDensityShift(world_->voxelDensity()));
         for (std::size_t i = 0; i < count; ++i) {
             const Vec current = positionAt(i), delta = current - clipmapPositions_[i];
             clipmapPositions_[i] = current;
@@ -706,9 +815,34 @@ private:
         }
     }
 
+    ClipmapForecast terrainForecast(bool admitOne) {
+        if (admitOne) {
+            // The selected target is served before the remaining background
+            // population. Every admitted source keeps all its requested rings.
+            if (controlling_ && !fineInvokerSources_[selected_]) fineInvokerSources_[selected_] = 1;
+            else {
+                const auto next = std::find(fineInvokerSources_.begin(), fineInvokerSources_.end(), 0);
+                if (next != fineInvokerSources_.end()) *next = 1;
+            }
+        }
+        auto forecast = clipmapForecast_;
+        forecast.minimumLod.assign(invokers_.size() + 1, 0);
+        const int coarse = std::max(0, gridRootLevel(voxelDensityShift(opts_.voxelDensity)) - 2);
+        for (std::size_t i = 0; i < invokers_.size(); ++i)
+            if (!fineInvokerSources_[i]) forecast.minimumLod[i] = coarse;
+        return forecast;
+    }
+
+    bool requestTerrainUpdate(Vec eye) {
+        if (world_->updatePending()) return false;
+        return world_->requestUpdate(invokerLodSources_, true, eye, true, terrainForecast(true));
+    }
+
     void updateTerrain(bool force) {
         fullTerrainBuild_ = force;
-        const auto stats = world_->update(invokers_, true, camera().eye);
+        for (std::size_t i = 0; i < invokers_.size(); ++i)
+            invokerLodSources_[i] = planet_.surface(unit(invokers_[i]));
+        const auto stats = world_->update(invokerLodSources_, true, camera().eye, terrainForecast(!force));
         fullTerrainBuild_ = false;
         finishTerrainUpdate(stats, force);
     }
@@ -834,6 +968,10 @@ private:
             streamMs_ = stats.updateMs;
             streamBuilt_ = stats.build.built;
         }
+        for (std::size_t i = 0; i < invokers_.size(); ++i) {
+            groundInvoker(invokers_[i], world_->chunks, planet_.elevationRange(), invokerGround_[i]);
+            invokerTerrainWaiting_[i] = !world_->hasFinestLod(invokerLodSources_[i]);
+        }
         if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
         sweep_.onTerrainPublished(force, stats, invokers_, camera().eye);
     }
@@ -882,13 +1020,18 @@ private:
         }
         for (std::size_t i = 0; i < invokers_.size(); ++i) {
             const auto first = objects_.size();
-            appendBeacon(objects_, invokers_[i], surface_ || freeView_ ? 24 : 380, i == selected_);
+            if (!invokerGround_[i].ready) continue;
+            appendBeacon(objects_, invokers_[i], 1.0, i == selected_);
             for (auto j = first; j < objects_.size(); ++j) objects_[j].motionId = (1ull << 63) | (i + 1);
         }
     }
 
     Camera camera() const {
         const auto textureSeed = std::uint32_t((opts_.seed ^ (opts_.seed >> 32)) % 1021);
+        if (sweepMode_ && sweepFree_) {
+            return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
+                    lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
+        }
         if (sweepMode_ && sweep_.focusValid()) {
             const Vec target = sweep_.focus();
             const Vec radial = unit(target);
@@ -903,10 +1046,10 @@ private:
                     lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
         }
         if (freeView_) {
-            return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.3, 20 * planetRadius,
+            return {flight_.position(), flight_.right(), flight_.up(), flight_.forward(), 0.05, 20 * planetRadius,
                     lodTint_, wireframe_, {}, opts_.render, opts_.terrain, textureSeed, simulationTime_};
         }
-        const Vec target = invokers_[selected_];
+        const Vec target = invokerGround_[selected_].ready ? invokers_[selected_] : invokerLodSources_[selected_];
         const Vec radial = unit(target);
         const auto basis = frameAt(radial);
         Vec eye, center, nominalUp;
@@ -915,12 +1058,15 @@ private:
             const double distance = controlling_ ? followDistance_ : surfaceDistance_;
             const Vec tangent = basis[0] * std::cos(bearing_) + basis[1] * std::sin(bearing_);
             const Vec offset = radial * std::sin(elevation_) + tangent * std::cos(elevation_);
-            center = target + radial * 24;
+            center = target + radial;
             eye = center + offset * distance;
-            const double clearance = length(planet_.surface(unit(eye))) + 30 - length(eye);
+            Vec ground = eye;
+            const bool visibleGround = world_ && groundInvoker(ground, world_->chunks, planet_.elevationRange(), cameraGround_);
+            const double clearance = visibleGround ? length(ground) + 0.3 - invokerGroundClearance - length(eye)
+                                                  : length(planet_.surface(unit(eye))) + 0.3 - length(eye);
             if (clearance > 0) eye = eye + unit(eye) * clearance;
             nominalUp = radial;
-            nearPlane = std::max(0.3, distance * 0.004);
+            nearPlane = std::max(0.05, distance * 0.004);
         } else {
             const Vec orbit = radial * (std::cos(yaw_) * std::cos(pitch_)) + basis[0] * (std::sin(yaw_) * std::cos(pitch_))
                               + basis[1] * std::sin(pitch_);
@@ -1040,9 +1186,9 @@ private:
         return 0;
     }
 
-    void setLod0Radius(std::uint32_t radius) {
-        world_->setLod0Radius(radius);
-        lod0Radius_ = radius;
+    void setLod0Cells(std::uint32_t cells) {
+        world_->setLod0Cells(cells);
+        lod0Cells_ = cells;
         updateFooter();
     }
 
@@ -1052,13 +1198,19 @@ private:
         lodTint_ = true;
         opts_.render.cloudsEnabled = opts_.render.atmosphereEnabled = opts_.render.shadowsEnabled = false;
         opts_.render.taaEnabled = false;
+        const auto baseCells = world_->lod0Cells(), expandedCells = baseCells * 2;
+        if (!validLod0Cells(expandedCells)) throw std::runtime_error("Capture range is too large to double");
         buildObjects();
-        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-512.bmp", true);
+        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-before.bmp", true);
         const auto before = world_->lodCounts();
         std::ofstream report(opts_.captures / "lod-range-validation.txt");
         const auto record = [&](const char* stage) {
             updateFooter();
-            report << stage << "_radius=" << world_->lod0Radius() << '\n' << stage << "_counts=";
+            report << stage << "_cells_per_edge=" << world_->lod0Cells() << '\n'
+                   << stage << "_spacing_m=" << world_->voxelDensity() << '\n'
+                   << stage << "_nominal_side_m=" << world_->lod0Cells() * world_->voxelDensity() << '\n'
+                   << stage << "_window_side_m=" << world_->clipmapWindows().front().box.hi.x - world_->clipmapWindows().front().box.lo.x << '\n'
+                   << stage << "_counts=";
             for (const auto count : world_->lodCounts()) report << count << ',';
             const int bytes = WideCharToMultiByte(CP_UTF8, 0, status_.data(), int(status_.size()), nullptr, 0, nullptr, nullptr);
             std::string text(std::size_t(bytes), '\0');
@@ -1066,12 +1218,12 @@ private:
             report << '\n' << stage << "_status=" << text << '\n';
         };
         record("before");
-        const auto replace = [&](std::uint32_t radius) {
-            setLod0Radius(radius);
-            if (!world_->requestUpdate(invokers_, true, camera().eye, true))
+        const auto replace = [&](std::uint32_t cells) {
+            setLod0Cells(cells);
+            if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true))
                 throw std::runtime_error("LOD range capture could not schedule the update");
-            if (radius == 4096) {
-                if (world_->lodCounts() != before || world_->lod0Radius() != 512)
+            if (cells == expandedCells) {
+                if (world_->lodCounts() != before || world_->lod0Cells() != baseCells)
                     throw std::runtime_error("Pending LOD range was published before GPU upload");
                 record("pending");
                 renderer_->draw(camera(), objects_, opts_.captures / "lod-range-pending.bmp", true);
@@ -1080,21 +1232,21 @@ private:
             for (;;) {
                 if (const auto stats = world_->pollUpdate([&] { return stagePreparedTerrain(false); })) {
                     applyTerrain(*stats, false);
-                    report << "update_" << radius << "_ms=" << stats->updateMs << '\n';
+                    report << "update_" << cells << "_ms=" << stats->updateMs << '\n';
                     break;
                 }
                 if (milliseconds(start) > 120000) throw std::runtime_error("LOD range publication timed out");
                 renderer_->draw(camera(), objects_); // Executes staged GPU copies, as in the interactive loop.
             }
-            if (world_->lod0Radius() != radius || !renderer_->terrainUploadsReady())
+            if (world_->lod0Cells() != cells || !renderer_->terrainUploadsReady())
                 throw std::runtime_error("LOD range did not publish together with its GPU meshes");
         };
-        replace(4096);
-        if (world_->lodCounts()[0] <= before[0]) throw std::runtime_error("4096 m range did not expand resident LOD0 blocks");
+        replace(expandedCells);
+        if (world_->lodCounts()[0] <= before[0]) throw std::runtime_error("Expanded cell range did not expand resident LOD0 blocks");
         record("expanded");
-        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-4096.bmp", true);
-        replace(512);
-        if (world_->lodCounts() != before) throw std::runtime_error("512 m range did not restore resident block counts");
+        renderer_->draw(camera(), objects_, opts_.captures / "lod-range-expanded.bmp", true);
+        replace(baseCells);
+        if (world_->lodCounts() != before) throw std::runtime_error("Original cell range did not restore resident block counts");
         record("restored");
         renderer_->draw(camera(), objects_, opts_.captures / "lod-range-restored.bmp", true);
         report << "scenarios=passed\n";
@@ -1406,7 +1558,8 @@ private:
             }
             updateTerrain(false);
             // Center the surface capture on the test bodies' original drop location.
-            invokers_ = invokerPositions(planet_, opts_.invokers, 0);
+            for (std::size_t index = 0; index < invokers_.size(); ++index)
+                invokers_[index] = initialInvokerDirection(index, opts_.seed) * planetRadius;
             surface_ = true;
             updateTerrain(false);
             buildObjects();
@@ -1466,7 +1619,7 @@ private:
             renderer_->draw(camera(), objects_, opts_.captures / (prefix + "-ranges.bmp"));
             showRanges_ = false;
             refreshRanges();
-            report << prefix << " triangles=" << triangles_ << " invokers=" << opts_.invokers << " bodies=" << shapes_.size()
+            report << prefix << " triangles=" << triangles_ << " invokers=" << opts_.invoker.count << " bodies=" << shapes_.size()
                    << " peak_contacts=" << maxContacts << '\n';
             updateFooter();
             // The diagnostic labels and numeric formatting above are ASCII.
@@ -1556,12 +1709,168 @@ private:
                 const Vec target = invokers_[selected_], direction = unit(target);
                 const auto hit = world_->physics.ray(target + direction * 250, target - direction * 250);
                 if (planet_.preset() != preset || camera().terrain != preset || triangles_ == 0 ||
-                    std::abs(planet_.sdf(target)) > 1e-6 || hit.state != Hit::State::Contact)
+                    !invokerGround_[selected_].ready ||
+                    std::abs(planet_.sdf(invokerLodSources_[selected_])) > 0.001 || hit.state != Hit::State::Contact)
                     throw std::runtime_error("Terrain dropdown did not replace both the rendered and collision fields");
             }
             report << "terrain_controls=passed\n";
         }
         return 0;
+    }
+
+    int captureInvokerLoading() {
+        // Reproduce the actual control path, including an old update in flight:
+        // Classic -> Mars -> increase count -> follow 8, 9 and 12 in order.
+        selectCaptureItem(TerrainStyle, int(TerrainPreset::Mars));
+        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true, terrainForecast(false)))
+            throw std::runtime_error("Could not start the pre-existing terrain update");
+        auto settings = opts_.invoker;
+        settings.count = opts_.clipmapCaptureCount;
+        applyInvokerSettings(settings);
+        captureLoadingTargets("pending");
+        std::ofstream progress(opts_.captures / "loading-progress.csv");
+        progress << "target,elapsed_ms,admitted_invokers,published_lod0,working_set_mib,triangles\n";
+        const auto start = Clock::now();
+        for (int number : {8, 9, 12}) {
+            if (number > int(invokers_.size())) continue;
+            selectCaptureItem(CameraTarget, number);
+            const auto targetStart = Clock::now();
+            for (;;) {
+                tick();
+                if (const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(false); })) {
+                    applyTerrain(*published, false);
+                    PROCESS_MEMORY_COUNTERS memory{};
+                    GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory));
+                    progress << number << ',' << milliseconds(start) << ','
+                             << std::count(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1) << ','
+                             << world_->hasFinestLod(invokerLodSources_[selected_]) << ','
+                             << memory.WorkingSetSize / (1024.0 * 1024.0) << ',' << triangles_ << '\n';
+                    progress.flush();
+                }
+                const auto& windows = world_->clipmapWindows();
+                const bool ownFineWindow = std::any_of(windows.begin(), windows.end(), [&](const ClipmapWindow& window) {
+                    return window.invoker == selected_ && window.lod == 0;
+                });
+                if (ownFineWindow && world_->hasFinestLod(invokerLodSources_[selected_]) && !world_->updatePending()) break;
+                const auto view = camera();
+                trackClipmapMotion(view.eye, dt);
+                requestTerrainUpdate(view.eye);
+                renderer_->draw(view, {});
+                if (milliseconds(targetStart) > 180000)
+                    throw std::runtime_error("Following Invoker " + std::to_string(number) + " did not publish its clipmap within three minutes");
+            }
+        }
+        captureLoadingTargets("published");
+        for (int number : {8, 9, 12}) if (number <= int(invokers_.size())) {
+            const std::size_t index = std::size_t(number - 1);
+            if (!world_->hasFinestLod(invokerLodSources_[index]) || !invokerGround_[index].ready || invokerGround_[index].owner.level != 0)
+                throw std::runtime_error("A requested Invoker has no published fine ground after focus loading");
+        }
+        return 0;
+    }
+
+    int captureClipmaps() {
+        setInvokerCount(opts_.clipmapCaptureCount);
+        std::fill(fineInvokerSources_.begin(), fineInvokerSources_.end(), 1);
+        if (!world_->requestUpdate(invokerLodSources_, true, camera().eye, true))
+            throw std::runtime_error("Could not request distributed Invoker terrain");
+        const auto starting = invokers_;
+        const bool newPending = invokers_.size() > 2 && !world_->hasFinestLod(invokerLodSources_[2]);
+        for (int frame = 0; frame < 600; ++frame) tick();
+        if (newPending && (length(invokers_[2] - starting[2]) != 0 || invokerRoutes_[2].phase() != 0))
+            throw std::runtime_error("An Invoker walked away before its initial LOD0 was published");
+        for (;;) {
+            if (const auto published = world_->pollUpdate([&] { return stagePreparedTerrain(true); })) {
+                applyTerrain(*published, false);
+                break;
+            }
+            Sleep(1);
+        }
+        const double pendingPhase = invokers_.size() > 2 ? invokerRoutes_[2].phase() : 0;
+        for (int frame = 0; frame < 120; ++frame) tick();
+        if (invokers_.size() > 2 && opts_.invoker.cruiseSpeed > 0 && invokerRoutes_[2].phase() == pendingPhase)
+            throw std::runtime_error("A pending Invoker did not resume cruise after LOD0 publication");
+        std::ofstream report(opts_.captures / "clipmaps.csv");
+        report << "invoker,lod,mesh_chunks,triangles,center_lod,ground_lod,ground_error_m\n";
+        Layout layout;
+        for (const auto& [key, chunk] : world_->chunks) layout.emplace(key, chunk->lod);
+        for (std::size_t i = 0; i < invokers_.size(); ++i) {
+            const Vec target = invokerLodSources_[i], up = unit(target);
+            const auto axes = frameAt(up);
+            Key groundOwner;
+            const auto hit = meshRay(world_->chunks, target + up * 20000, target - up * 65536, nullptr, &groundOwner);
+            const auto leaf = leafAt(layout, target);
+            if (!leaf || leaf->level != 0 || hit.state != Hit::State::Contact || groundOwner.level != 0 ||
+                length(hit.position - target) > 2 * world_->voxelDensity())
+                throw std::runtime_error("Invoker " + std::to_string(i + 1) + " is missing its fine surface mesh");
+            for (int lod = 0; lod < 8; ++lod) {
+                const double radius = lodSideLength(lod0Cells_, voxelDensityShift(opts_.voxelDensity), lod) / 2;
+                const Box box{target - splat(2 * radius), target + splat(2 * radius)};
+                std::size_t count = 0, triangles = 0;
+                for (Key key : intersectingLeaves(layout, box)) {
+                    const auto& chunk = *world_->chunks.at(key);
+                    if (chunk.lod != lod || chunk.mesh.empty()) continue;
+                    ++count;
+                    triangles += chunk.mesh.size();
+                }
+                report << i + 1 << ',' << lod << ',' << count << ',' << triangles << ','
+                       << (leaf ? leaf->level : -1) << ','
+                       << (hit.state == Hit::State::Contact ? groundOwner.level : -1) << ','
+                       << (hit.state == Hit::State::Contact ? length(hit.position - target) : -1) << '\n';
+            }
+            report.flush();
+            if (i > 3 && i != 7 && i != 31 && i != 127 && i + 1 != invokers_.size() &&
+                hit.state == Hit::State::Contact && length(hit.position - target) < 1) continue;
+            Camera view = camera();
+            view.eye = target + up * (lodSideLength(lod0Cells_, voxelDensityShift(opts_.voxelDensity)) * 3.5);
+            view.forward = up * -1;
+            view.right = axes[0];
+            view.up = cross(view.right, view.forward);
+            view.sunDirection = unit(up + axes[0] * 0.4);
+            view.nearPlane = 0.5;
+            view.settings = RenderSettings{};
+            view.settings.atmosphereEnabled = view.settings.shadowsEnabled = false;
+            view.settings.cloudsEnabled = false;
+            view.settings.taaEnabled = false;
+            view.lodTint = true;
+            view.wireframe = false;
+            renderer_->draw(view, {}, opts_.captures / ("invoker-" + std::to_string(i + 1) + "-lod.bmp"));
+            view.wireframe = true;
+            renderer_->draw(view, {}, opts_.captures / ("invoker-" + std::to_string(i + 1) + "-wire.bmp"));
+        }
+        return 0;
+    }
+
+    void captureLoadingTargets(const char* stage) {
+        std::ofstream report(opts_.captures / (std::string(stage) + ".csv"));
+        report << "invoker,requested_count,terrain,finest_published,ground_lod,source_altitude,marker_altitude,camera_altitude,triangles\n";
+        for (int number : {8, 9, 12}) {
+            if (number > int(invokers_.size())) continue;
+            selectCaptureItem(CameraTarget, number);
+            auto view = camera();
+            for (int frame = 0; frame < 4; ++frame) renderer_->draw(view, {});
+            const auto stem = std::string(stage) + "-invoker-" + std::to_string(number);
+            renderer_->draw(view, {}, opts_.captures / (stem + "-actual.bmp"));
+            auto actualWire = view;
+            actualWire.lodTint = actualWire.wireframe = true;
+            renderer_->draw(actualWire, {}, opts_.captures / (stem + "-actual-wire.bmp"));
+            const auto& ground = invokerGround_[selected_];
+            report << number << ',' << invokers_.size() << ',' << name(planet_.preset()) << ','
+                   << world_->hasFinestLod(invokerLodSources_[selected_]) << ',' << (ground.ready ? ground.owner.level : -1) << ','
+                   << length(invokerLodSources_[selected_]) - planetRadius << ',' << length(invokers_[selected_]) - planetRadius << ','
+                   << length(view.eye) - planetRadius << ',' << triangles_ << '\n';
+            const Vec target = invokerLodSources_[selected_], up = unit(target);
+            view.eye = target + up * (lodSideLength(lod0Cells_, voxelDensityShift(opts_.voxelDensity)) * 3.5);
+            view.forward = up * -1;
+            view.right = frameAt(up)[0];
+            view.up = cross(view.right, view.forward);
+            view.nearPlane = 0.5;
+            view.sunDirection = unit(up + view.right * 0.4);
+            view.settings.atmosphereEnabled = view.settings.cloudsEnabled = view.settings.shadowsEnabled = view.settings.taaEnabled = false;
+            view.lodTint = view.wireframe = true;
+            renderer_->draw(view, {}, opts_.captures / (stem + "-wire.bmp"));
+            report.flush();
+        }
     }
 
     void captureRemoteMars() {
@@ -1594,42 +1903,150 @@ private:
     }
 
     void captureInvokerControls() {
+        const auto surfaceDistance = [](Vec a, Vec b) {
+            const Vec u = unit(a), v = unit(b);
+            return length(a) * std::atan2(length(cross(u, v)), dot(u, v));
+        };
+        const auto verifyGround = [&](std::size_t index) {
+            const auto& ground = invokerGround_[index];
+            if (!ground.ready) throw std::runtime_error("An Invoker did not find the published planetary surface");
+            const Vec position = invokers_[index], up = unit(position);
+            const Vec normal = unit(cross(ground.support.vertices[1] - ground.support.vertices[0],
+                                          ground.support.vertices[2] - ground.support.vertices[0]));
+            if (dot(up, normal) <= 0 ||
+                std::abs(dot(position - up * invokerGroundClearance - ground.support.vertices[0], normal)) > 0.001)
+                throw std::runtime_error("An Invoker was placed below or away from its visible terrain triangle");
+        };
+        for (std::size_t i = 0; i < invokers_.size(); ++i) verifyGround(i);
+        // Exercise 10000 live navigation states and the last camera target,
+        // then restore the small test scene before asking for terrain updates.
+        // This is a count/state test, not a 10000-window terrain stress test.
+        const auto originalSettings = opts_.invoker;
+        const auto originalPositions = invokers_;
+        const auto originalBodies = shapes_.size();
+        auto maximum = originalSettings;
+        maximum.count = maxInvokerCount;
+        applyInvokerSettings(maximum);
+        for (std::size_t i = 0; i < invokers_.size(); ++i) verifyGround(i);
+        if (invokers_.size() != maxInvokerCount || returning_.size() != maxInvokerCount ||
+            invokerRoutes_.size() != maxInvokerCount || shapes_.size() != originalBodies ||
+            SendMessageW(combo(CameraTarget), CB_GETCOUNT, 0, 0) != maxInvokerCount + 1)
+            throw std::runtime_error("10000 Invokers did not allocate coherent navigation states and camera targets");
+        for (std::size_t i = 0; i < originalPositions.size(); ++i)
+            if (length(invokers_[i] - originalPositions[i]) != 0)
+                throw std::runtime_error("Growing the Invoker count moved an existing Invoker");
+        selectCaptureItem(CameraTarget, maxInvokerCount);
+        moveInvoker(1, 0, dt, false);
+        const Vec last = invokers_.back();
+        tick();
+        if (selected_ != maxInvokerCount - 1 || !controlling_ || length(invokers_.back() - last) != 0)
+            throw std::runtime_error("The 10000th Invoker could not be controlled independently");
+        applyInvokerSettings(originalSettings);
+        if (controlling_ || selected_ >= invokers_.size() || returning_.size() != invokers_.size() ||
+            invokerRoutes_.size() != invokers_.size() || shapes_.size() != originalBodies)
+            throw std::runtime_error("Shrinking the Invoker count did not safely detach the removed target");
+        for (int frame = 0; frame < 60; ++frame) {
+            const auto previous = invokers_;
+            tick();
+            for (std::size_t i = 0; i < invokers_.size(); ++i)
+                if (surfaceDistance(previous[i], invokers_[i]) > opts_.invoker.cruiseSpeed * dt + 1e-5)
+                    throw std::runtime_error("Automatic Invoker cruise exceeded configured speed");
+        }
         const auto bodyCount = shapes_.size();
         const Vec first = invokers_.front();
-        selectCaptureItem(InvokerCount, 2);
+        auto settings = opts_.invoker;
+        settings.count = 3;
+        applyInvokerSettings(settings);
         if (invokers_.size() != 3 || length(invokers_.front() - first) != 0 || shapes_.size() != bodyCount ||
             SendMessageW(combo(CameraTarget), CB_GETCOUNT, 0, 0) != 4)
             throw std::runtime_error("Changing Invoker count did not preserve the scene and update the camera list");
+        const Vec pendingPosition = invokers_[2];
+        const double pendingPhase = invokerRoutes_[2].phase();
+        const bool pendingFine = !world_->hasFinestLod(invokerLodSources_[2]);
+        tick();
+        if (pendingFine && (length(invokers_[2] - pendingPosition) != 0 || invokerRoutes_[2].phase() != pendingPhase))
+            throw std::runtime_error("Autonomous cruise advanced before the starting LOD0 was ready");
+        updateTerrain(false);
+        const double readyPhase = invokerRoutes_[2].phase();
+        tick();
+        if (opts_.invoker.cruiseSpeed > 0 && invokerRoutes_[2].phase() == readyPhase)
+            throw std::runtime_error("Publishing LOD0 did not resume autonomous cruise");
 
         selectCaptureItem(CameraTarget, 2);
         if (!controlling_ || !surface_ || freeView_ || selected_ != 1 ||
             (GetActiveWindow() == window_ && GetFocus() != viewport_))
-            throw std::runtime_error("Camera selection did not hand control to the selected Invoker");
-        const Vec start = invokers_[1];
-        moveInvoker(1, 1, 1, false);
-        const Vec driven = invokers_[1];
-        const Vec startUp = unit(start), drivenUp = unit(driven);
-        const double arc = length(start) * std::atan2(length(cross(startUp, drivenUp)), dot(startUp, drivenUp));
-        if (std::abs(arc - invokerSpeed) > 0.01 ||
-            std::abs(planet_.sdf(driven)) > 1e-6)
-            throw std::runtime_error("Invoker movement did not follow the ground at the expected diagonal speed");
+            throw std::runtime_error("Camera selection did not follow the selected Invoker");
+        const Vec followed = invokers_[1];
+        const double followedPhase = invokerRoutes_[1].phase();
         tick();
-        if (length(invokers_[1] - driven) != 0 || length(invokers_.front() - first) == 0)
-            throw std::runtime_error("Automatic routing did not respect the currently controlled Invoker");
+        if (manualControl_ || (opts_.invoker.cruiseSpeed > 0 &&
+            (invokerRoutes_[1].phase() == followedPhase || length(invokers_[1] - followed) == 0)))
+            throw std::runtime_error("Following an Invoker incorrectly paused its autonomous cruise");
+        const Vec start = invokers_[1];
+        const double baseSpeed = opts_.invoker.controlSpeed;
+        if (!key(VK_ADD, true) || opts_.invoker.controlSpeed <= baseSpeed ||
+            !key(VK_SUBTRACT, true) || std::abs(opts_.invoker.controlSpeed - baseSpeed) > 1e-10 ||
+            length(invokers_[1] - start) != 0)
+            throw std::runtime_error("Numpad +/- did not adjust controlled speed without moving the Invoker");
+        moveInvoker(1, 1, 1, false);
+        Vec driven = invokers_[1];
+        const auto& support = invokerGround_[1];
+        const Vec normal = unit(cross(support.support.vertices[1] - support.support.vertices[0],
+                                      support.support.vertices[2] - support.support.vertices[0]));
+        const double groundError = dot(driven - unit(driven) * invokerGroundClearance - support.support.vertices[0], normal);
+        if (std::abs(surfaceDistance(start, driven) - baseSpeed) > 0.01 || !support.ready || std::abs(groundError) > 0.001)
+            throw std::runtime_error("Invoker movement did not follow the ground at the configured speed; arc=" +
+                std::to_string(surfaceDistance(start, driven)) + ", speed=" + std::to_string(baseSpeed) +
+                ", mesh height error=" + std::to_string(groundError));
+        const double heldPhase = invokerRoutes_[1].phase();
+        tick();
+        if (length(invokers_[1] - driven) != 0 || invokerRoutes_[1].phase() != heldPhase)
+            throw std::runtime_error("Control did not pause the selected Invoker's route");
 
         updateTerrain(true);
-        if (!world_->hasFinestLod(driven)) throw std::runtime_error("Controlled Invoker did not drive terrain LOD");
+        driven = invokers_[1];
+        if (!world_->hasFinestLod(invokerLodSources_[1])) throw std::runtime_error("Controlled Invoker did not drive terrain LOD");
         buildObjects();
         renderer_->draw(camera(), objects_, opts_.captures / "invoker-control.bmp");
 
         if (!key(VK_ESCAPE, true) || controlling_ || !returning_[1] || length(invokers_[1] - driven) != 0)
             throw std::runtime_error("Detaching did not start the Invoker's return from its current position");
-        for (int i = 0; i < 120 && returning_[1]; ++i) tick();
-        const Vec route = planet_.surface(planet_.invokerDirection(1, simulationTime_ * 2.0));
-        if (returning_[1] || length(invokers_[1] - route) != 0)
+        Vec route = planet_.surface(invokerRoutes_[1].direction(opts_.invoker));
+        InvokerGround routeGround;
+        groundInvoker(route, world_->chunks, planet_.elevationRange(), routeGround);
+        if (opts_.invoker.returnSpeed == 0) {
+            tick();
+            if (length(invokers_[1] - driven) != 0) throw std::runtime_error("Zero return speed did not pause returning");
+            settings = opts_.invoker;
+            settings.returnSpeed = 3;
+            applyInvokerSettings(settings);
+        }
+        const int returnFrames = int(std::ceil(surfaceDistance(driven, route) / opts_.invoker.returnSpeed / dt)) + 60;
+        for (int i = 0; i < returnFrames && returning_[1]; ++i) {
+            const Vec before = invokers_[1];
+            tick();
+            if (surfaceDistance(before, invokers_[1]) > opts_.invoker.returnSpeed * dt + 1e-5 ||
+                invokerRoutes_[1].phase() != heldPhase)
+                throw std::runtime_error("Returning did not respect its speed and frozen route");
+        }
+        if (returning_[1] || length(invokers_[1] - route) > 1e-5)
             throw std::runtime_error("Detached Invoker did not rejoin its route");
+
+        const auto beforeMode = invokers_;
+        settings = opts_.invoker;
+        settings.mode = settings.mode == InvokerCruiseMode::Area ? InvokerCruiseMode::GreatCircle : InvokerCruiseMode::Area;
+        settings.patrolRadius = 50;
+        applyInvokerSettings(settings);
+        for (std::size_t i = 0; i < invokers_.size(); ++i)
+            if (length(invokers_[i] - beforeMode[i]) != 0)
+                throw std::runtime_error("Changing cruise mode moved an existing Invoker");
+        tick();
+        for (std::size_t i = 0; i < invokers_.size(); ++i)
+            if (surfaceDistance(beforeMode[i], invokers_[i]) > settings.cruiseSpeed * dt + 1e-5)
+                throw std::runtime_error("Cruise mode transition exceeded the configured speed");
         selectCaptureItem(CameraTarget, 3);
-        selectCaptureItem(InvokerCount, 0);
+        settings.count = 1;
+        applyInvokerSettings(settings);
         if (controlling_ || selected_ != 0 || invokers_.size() != 1 || shapes_.size() != bodyCount ||
             SendMessageW(combo(CameraTarget), CB_GETCURSEL, 0, 0) != 0)
             throw std::runtime_error("Removing the controlled Invoker did not safely detach the camera");
@@ -1647,9 +2064,6 @@ private:
                 opts_.voxelDensity = voxelDensities[std::size_t(selected)];
                 world_->setVoxelDensity(opts_.voxelDensity);
             }
-        } else if (command == InvokerCount) {
-            const auto selected = SendMessageW(combo(InvokerCount), CB_GETCURSEL, 0, 0);
-            if (selected >= 0 && selected < maxInvokers) setInvokerCount(int(selected + 1));
         } else if (command == CameraTarget) {
             const auto selected = SendMessageW(combo(CameraTarget), CB_GETCURSEL, 0, 0);
             if (selected >= 0) selectCameraTarget(std::size_t(selected));
@@ -1671,9 +2085,12 @@ private:
                 }
             }
         } else if (command == RangeSettings) {
-            if (editLodRanges(window_, lod0Radius_, voxelDensityShift(opts_.voxelDensity))) {
-                setLod0Radius(lod0Radius_);
+            if (editLodRanges(window_, lod0Cells_, voxelDensityShift(opts_.voxelDensity))) {
+                setLod0Cells(lod0Cells_);
             }
+        } else if (command == InvokerOptions) {
+            auto settings = opts_.invoker;
+            if (editInvokerSettings(window_, settings)) applyInvokerSettings(settings);
         } else if (command == GraphicsSettings) {
             auto next = opts_.render;
             if (editRenderSettings(window_, next, defaultRenderSettings(opts_.terrain))) {
@@ -1695,7 +2112,8 @@ private:
                 const Camera current = camera();
                 detachInvoker();
                 flight_.reset(current.eye, current.forward, current.up);
-                flightSpeed_ = std::clamp(std::abs(length(current.eye) - planetRadius) * 0.05, 50.0, 1000000.0);
+                const double altitude = length(current.eye) - length(planet_.surface(unit(current.eye)));
+                flightSpeed_ = std::clamp(altitude * 0.05, 1.0, 1000000.0);
             }
             freeView_ = !freeView_;
         } else if (command == Tint) lodTint_ = !lodTint_;
@@ -1721,8 +2139,8 @@ private:
             yaw_ = 0.13;
             pitch_ = 0.16;
             orbitDistance_ = 2.5 * planetRadius;
-            surfaceDistance_ = 1950;
-            followDistance_ = 175;
+            surfaceDistance_ = defaultSurfaceDistance;
+            followDistance_ = defaultFollowDistance;
             bearing_ = 0.42;
             elevation_ = 0.90;
             paused_ = false;
@@ -1742,19 +2160,24 @@ private:
             }
             return true;
         }
-        if ((freeView_ || controlling_) && (code == 'W' || code == 'A' || code == 'S' || code == 'D' || code == VK_SHIFT)) return true;
-        if (freeView_ && (code == 'Q' || code == 'E')) return true;
+        if ((freeView_ || controlling_ || (sweepMode_ && sweepFree_)) && (code == 'W' || code == 'A' || code == 'S' || code == 'D' || code == VK_SHIFT)) return true;
+        if ((freeView_ || (sweepMode_ && sweepFree_)) && (code == 'Q' || code == 'E')) return true;
         if (!first) return false;
         if (sweepMode_) {
             if (code == VK_LEFT) sweep_.prevCast();
             else if (code == VK_RIGHT) sweep_.nextCast();
             else if (code == 'N') sweep_.jumpFrame();
             else if (code == 'C') sweep_.nextMismatch();
-            else if (code == 'E') sweep_.nextWorstError();
+            else if (code == 'E' && !sweepFree_) sweep_.nextWorstError();
             else if (code == 'O') sweep_.nextWorstPoint();
             else if (code == 'V') sweep_.revalidate();
             else if (code == 'X') action(Sweep);
             else return false;
+            updateFooter();
+            return true;
+        }
+        if (controlling_ && (code == VK_ADD || code == VK_SUBTRACT)) {
+            opts_.invoker.controlSpeed = adjustedInvokerControlSpeed(opts_.invoker.controlSpeed, code == VK_ADD);
             updateFooter();
             return true;
         }
@@ -1818,22 +2241,34 @@ private:
         const auto counts = world_->lodCounts();
         int coarse = 0;
         for (int lod = 4; lod < lodCount; ++lod) coarse += counts[lod];
+        std::size_t fineReady = 0;
+        for (const Vec point : invokerLodSources_) fineReady += world_->hasFinestLod(point);
         std::wostringstream info;
         // Keep the applied/requested range and resident counts visible even
         // when the remaining diagnostic text is ellipsized on narrow windows.
-        info << L"LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
+        info << L"Invoker LOD0 " << fineReady << L"/" << invokers_.size();
+        if (fineReady < invokers_.size()) info << (world_->updatePending() ? L" loading" : L" queued");
+        info << L"   |   LOD blocks 0/1/2/3/4+  " << counts[0] << L" / " << counts[1] << L" / " << counts[2]
              << L" / " << counts[3] << L" / " << coarse
-             << L"   |   LOD0 radius " << world_->lod0Radius();
-        if (world_->lod0Radius() != lod0Radius_) info << L" -> " << lod0Radius_ << L" m (building)";
-        else info << L" m";
+             << L"   |   LOD0 " << world_->lod0Cells() << L" cells/edge ("
+             << world_->lod0Cells() * world_->voxelDensity() << L" m side)";
+        if (world_->lod0Cells() != lod0Cells_ || world_->voxelDensity() != opts_.voxelDensity)
+            info << L" -> " << lod0Cells_ << L" cells, " << lod0Cells_ * opts_.voxelDensity << L" m (building)";
         info << L"   |   " << methodLabels[method_] << L"   |   " << terrainLabels[std::size_t(opts_.terrain)];
         info << L"   |   Step " << world_->voxelDensity() << L"x ("
              << chunkSize / fineCells * world_->voxelDensity() << L" m)";
         if (world_->voxelDensity() != opts_.voxelDensity) info << L" -> " << opts_.voxelDensity << L"x building";
+        const auto pendingGround = std::count_if(invokerGround_.begin(), invokerGround_.end(),
+            [](const InvokerGround& ground) { return !ground.ready; });
+        if (pendingGround) info << L"   |   Surface pending " << pendingGround;
+        std::size_t pendingFine = 0;
+        for (std::size_t i = 0; i < invokerLodSources_.size(); ++i)
+            pendingFine += invokerTerrainWaiting_[i] || !world_->hasFinestLod(invokerLodSources_[i]);
+        if (pendingFine) info << L"   |   LOD0 waiting " << pendingFine;
         if (freeView_) info << L"   |   Free " << std::fixed << std::setprecision(0) << flightSpeed_ << L" m/s";
-        info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invokers << L" + camera"
-             << (controlling_ ? L" (controlled)" : L"")
-             << (world_->hasFinestLod(invokers_[selected_]) ? L"" : L" (LOD0 pending)")
+        info << L"   |   Invoker " << selected_ + 1 << L"/" << opts_.invoker.count << L" + camera"
+             << (controlling_ ? (manualControl_ ? L" (manual)" : L" (following cruise)") : L"")
+             << (world_->hasFinestLod(invokerLodSources_[selected_]) ? L"" : L" (LOD0 pending)")
              << L"   |   " << triangles_ << L" triangles   |   " << shapes_.size() << L" bodies   |   "
              << std::fixed << std::setprecision(1) << streamMs_ << L" ms LOD update (" << streamBuilt_ << L" built)";
         if (fps_ > 0) info << L"   |   " << std::setprecision(0) << fps_ << L" FPS";
@@ -1896,7 +2331,7 @@ private:
     }
 
     void updateCameraInfo(const Camera& view) {
-        const auto mode = freeView_ ? std::wstring(L"Free") : controlling_
+        const auto mode = freeView_ || sweepFree_ ? std::wstring(L"Free") : controlling_
             ? L"Invoker " + std::to_wstring(selected_ + 1) : surface_ ? std::wstring(L"Surface") : std::wstring(L"Orbit");
         const auto title = L"Camera world (m) | " + mode;
         const std::array<double, 4> values{view.eye.x, view.eye.y, view.eye.z,
@@ -1939,8 +2374,12 @@ private:
         std::wstring sweepHint;
         const wchar_t* controls;
         if (sweepMode_) {
-            sweepHint = sweep_.controlsHint();
-            controls = sweepHint.c_str();
+            if (sweepFree_)
+                controls = L"Sweep free flight: WASD move / Q-E down-up / Drag to look / Shift x5 / Wheel speed / Left-Right cast / X toggle sweep";
+            else {
+                sweepHint = sweep_.controlsHint();
+                controls = sweepHint.c_str();
+            }
         } else if (freeView_)
             controls = L"Free [C]: WASD move / Q-E down-up / Drag to look / Shift x5 / Wheel speed / F2 wireframe / H atmosphere";
         else if (controlling_)
@@ -2018,7 +2457,7 @@ private:
                 if (command >= Density && command <= TerrainStyle) {
                     if (notification == CBN_SELENDOK || (notification == CBN_SELCHANGE &&
                         !SendMessageW(app->combo(command), CB_GETDROPPEDSTATE, 0, 0))) app->pending_ = command;
-                } else if (command >= Mesh && command <= GraphicsSettings && notification == BN_CLICKED) app->pending_ = command;
+                } else if (command >= Mesh && command <= InvokerOptions && notification == BN_CLICKED) app->pending_ = command;
                 return 0;
             }
             case WM_CTLCOLORSTATIC:
@@ -2055,8 +2494,12 @@ private:
                     const POINT next{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                     const double dx = (next.x - app->mouse_.x) * 0.006, dy = (next.y - app->mouse_.y) * 0.006;
                     if (app->sweepMode_) {
-                        app->sweepYaw_ = std::remainder(app->sweepYaw_ - dx, 2 * pi);
-                        app->sweepPitch_ = std::clamp(app->sweepPitch_ + dy, -1.35, 1.35);
+                        if (app->sweepFree_) {
+                            app->flight_.look(dx, -dy);
+                        } else {
+                            app->sweepYaw_ = std::remainder(app->sweepYaw_ - dx, 2 * pi);
+                            app->sweepPitch_ = std::clamp(app->sweepPitch_ + dy, -1.35, 1.35);
+                        }
                     } else if (app->freeView_) {
                         app->flight_.look(dx, -dy);
                     } else if (app->surface_) {
@@ -2075,8 +2518,12 @@ private:
             case WM_MOUSEWHEEL: {
                 const double factor = std::pow(0.84, double(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA);
                 if (app->sweepMode_) {
-                    const double base = app->sweepDistance_ > 0 ? app->sweepDistance_ : app->sweep_.focusDistance();
-                    app->sweepDistance_ = std::clamp(base * factor, 60.0, 4000.0);
+                    if (app->sweepFree_) {
+                        app->flightSpeed_ = std::clamp(app->flightSpeed_ / factor, 1.0, 10000000.0);
+                    } else {
+                        const double base = app->sweepDistance_ > 0 ? app->sweepDistance_ : app->sweep_.focusDistance();
+                        app->sweepDistance_ = std::clamp(base * factor, 60.0, 4000.0);
+                    }
                 }
                 else if (app->freeView_) app->flightSpeed_ = std::clamp(app->flightSpeed_ / factor, 1.0, 10000000.0);
                 else if (app->controlling_) app->followDistance_ = std::clamp(app->followDistance_ * factor, 30.0, 10500.0);
@@ -2103,10 +2550,16 @@ private:
     std::unique_ptr<Dx12Renderer> renderer_;
     std::unique_ptr<World> world_;
     std::vector<Vec> invokers_;
+    std::vector<Vec> invokerLodSources_;
+    std::vector<InvokerGround> invokerGround_;
+    std::vector<std::uint8_t> invokerTerrainWaiting_;
+    std::vector<std::uint8_t> fineInvokerSources_;
+    mutable InvokerGround cameraGround_;
     std::vector<Vec> clipmapPositions_;
     ClipmapForecast clipmapForecast_;
-    std::array<bool, maxInvokers> returning_{};
-    std::uint32_t lod0Radius_{defaultLod0Radius};
+    std::vector<std::uint8_t> returning_;
+    std::vector<InvokerRoute> invokerRoutes_;
+    std::uint32_t lod0Cells_{defaultLod0Cells};
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
     std::map<Key, TerrainPage> terrainPages_;
@@ -2118,14 +2571,14 @@ private:
     std::wstring cameraTitle_;
     std::array<std::wstring, 4> cameraValues_;
     bool closed_{}, dragging_{}, surface_{}, lodTint_{}, showRanges_{}, wireframe_{}, paused_{};
-    bool freeView_{}, controlling_{};
+    bool freeView_{}, controlling_{}, manualControl_{}, sweepFree_{};
     FreeCamera flight_;
     double flightSpeed_{200};
     POINT mouse_{};
     double simulationTime_{}, streamMs_{}, fps_{};
     int streamBuilt_{};
-    double yaw_{0.13}, pitch_{0.16}, orbitDistance_{2.5 * planetRadius}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{1950};
-    double followDistance_{175};
+    double yaw_{0.13}, pitch_{0.16}, orbitDistance_{2.5 * planetRadius}, bearing_{0.42}, elevation_{0.90}, surfaceDistance_{ defaultFollowDistance };
+    double followDistance_{ defaultFollowDistance };
     double sweepYaw_{}, sweepPitch_{0.2}, sweepDistance_{};
 };
 

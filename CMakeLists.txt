@@ -149,7 +149,7 @@ if(WIN32)
 
     target_compile_definitions(voxel_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
-    add_executable(VoxelWorldViewer WIN32 src/viewer.cpp src/sweep.cpp src/dx12_renderer.cpp src/cloud_noise.cpp src/lod_range_dialog.cpp src/render_settings_dialog.cpp)
+    add_executable(VoxelWorldViewer WIN32 src/viewer.cpp src/sweep.cpp src/dx12_renderer.cpp src/cloud_noise.cpp src/lod_range_dialog.cpp src/render_settings_dialog.cpp src/invoker_settings_dialog.cpp)
     target_include_directories(VoxelWorldViewer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(VoxelWorldViewer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(VoxelWorldViewer PRIVATE voxel_core d3d12 dxgi d3dcompiler gdi32 user32 shell32 psapi comctl32 TBB::tbb)
@@ -171,11 +171,18 @@ if(WIN32)
 endif()
 
 enable_testing()
+add_executable(voxel_clipmap_distribution tests/clipmap_distribution.cpp)
+target_include_directories(voxel_clipmap_distribution PRIVATE src)
+target_link_libraries(voxel_clipmap_distribution PRIVATE voxel_core)
+voxel_warnings(voxel_clipmap_distribution)
 add_test(NAME voxel_world_correctness COMMAND voxel_world --self-test)
 if(CMAKE_CONFIGURATION_TYPES)
+    add_test(NAME voxel_clipmap_distribution COMMAND voxel_clipmap_distribution 16 64
+        CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
     add_test(NAME voxel_world_global_terrain COMMAND voxel_world --self-test-global
         CONFIGURATIONS Release RelWithDebInfo MinSizeRel)
 elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    add_test(NAME voxel_clipmap_distribution COMMAND voxel_clipmap_distribution 16 64)
     add_test(NAME voxel_world_global_terrain COMMAND voxel_world --self-test-global)
 endif()
 if(WIN32)

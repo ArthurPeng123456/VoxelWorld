@@ -17,8 +17,8 @@ constexpr std::size_t mapNodeOverhead = 4 * sizeof(void*);
 struct KeyBox { Key lo, hi; }; // Half-open in chunk coordinates.
 
 double lodAnchorStep(double radius, int lod, int densityShift) {
-    const double chunkStride = std::ldexp(gridChunkSize(densityShift), lod - 3);
-    return std::min(std::max(128.0, radius / 2), chunkStride);
+    const double chunkStride = std::ldexp(gridChunkSize(densityShift), lod);
+    return std::min(radius / 2, chunkStride);
 }
 
 double maxComponent(Vec v) { return std::max({v.x, v.y, v.z}); }
@@ -89,7 +89,7 @@ constexpr std::size_t chunkMetadata = sizeof(Chunk) + sizeof(Chunks::value_type)
 }  // namespace
 
 std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std::size_t& visits,
-                             std::uint32_t lod0Radius, bool rolling, const ClipmapForecast& forecast) {
+                             std::uint32_t lod0Cells, bool rolling, const ClipmapForecast& forecast) {
     std::set<Key> changed;
     if (global) {
         const bool rebuild = !global_ || layoutDensityShift(layout_) != densityShift_;
@@ -97,21 +97,41 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
         std::vector<ClipmapWindow> windows;
         std::vector<ClipmapSlab> dirty;
         constexpr int nearLevels = 3;
-        const int windowCount = lodWindowCount(lod0Radius);
-        if (!windowCount) throw std::invalid_argument("Invalid LOD0 radius");
-        const bool sameRadius = lod0Radius_ == lod0Radius;
+        const int windowCount = lodWindowCount(lod0Cells, densityShift_);
+        if (!windowCount) throw std::invalid_argument("Invalid LOD0 cell count");
+        const auto minimumLod = [&](std::size_t i) {
+            return i < forecast.minimumLod.size() ? std::clamp(forecast.minimumLod[i], 0, windowCount) : 0;
+        };
+        bool anyEnabled = false;
+        for (std::size_t i = 0; i < invokers.size(); ++i) anyEnabled |= minimumLod(i) < windowCount;
+        const int fallback = anyEnabled ? windowCount : gridRootLevel(densityShift_);
+        int oldFallback = 0;
+        for (const auto& window : globalWindows_) if (window.enabled) oldFallback = std::max(oldFallback, window.lod + 1);
+        if (!oldFallback) oldFallback = gridRootLevel(densityShift_);
+        if (!rebuild && fallback != oldFallback) {
+            const auto half = splat(fieldSideLength / 2);
+            dirty.push_back({{half * -1, half}, std::min(fallback, oldFallback)});
+        }
+        const bool sameRange = lod0Cells_ == lod0Cells;
         const std::size_t noRoll = invokers.size() * windowCount;
-        const bool phased = rolling && !rebuild && sameRadius && noRoll == globalWindows_.size();
-        double nearOverdue = 0, outerOverdue = 0, fineRisk = 0;
-        std::size_t nearWindow = noRoll, outerWindow = noRoll, fineWindow = noRoll;
-        bool fineBuffer = true;
+        const bool phased = rolling && !rebuild && sameRange && noRoll == globalWindows_.size();
+        struct RollChoice {
+            double nearOverdue{}, outerOverdue{};
+            std::size_t nearWindow, outerWindow, fineWindow;
+            bool fineBuffer{true};
+        };
+        std::vector<RollChoice> choices(invokers.size(), {0, 0, noRoll, noRoll, noRoll, true});
+        if (!phased) nearRolls_.assign(invokers.size(), 0);
+        else nearRolls_.resize(invokers.size(), 0);
         for (std::size_t i = 0; i < invokers.size(); ++i) for (int lod = 0; lod < windowCount; ++lod) {
             const auto index = next.size();
-            const double radius = std::ldexp(double(lod0Radius), lod);
+            const bool enabled = lod >= minimumLod(i);
+            const bool windowPhased = phased && globalWindows_[index].enabled && enabled;
+            const double radius = lodSideLength(lod0Cells, densityShift_, lod) / 2;
             const double step = lodAnchorStep(radius, lod, densityShift_);
             const double margin = step / 8;
             const Vec position = invokers[i];
-            const bool tracksMotion = phased && i < forecast.displacement.size();
+            const bool tracksMotion = windowPhased && i < forecast.displacement.size();
             const bool primary = tracksMotion && i == forecast.primary;
             const Vec displacement = tracksMotion ? forecast.displacement[i] : Vec{};
             const double lead = maxComponent(abs(displacement));
@@ -125,7 +145,8 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             Vec origin;
             for (int axis = 0; axis < 3; ++axis) {
                 origin[axis] = std::floor(target[axis] / step) * step;
-                if (!sameRadius || index >= globalAnchors_.size() || globalAnchors_[index].step != step) continue;
+                if (!sameRange || index >= globalAnchors_.size() || globalAnchors_[index].step != step ||
+                    globalWindows_[index].enabled != enabled) continue;
                 const double previous = globalAnchors_[index].origin[axis];
                 const double center = previous + step / 2;
                 if (target[axis] >= center - guard && target[axis] < center + guard) origin[axis] = previous;
@@ -137,10 +158,10 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             // Recover a small overrun in the same slab-sized increments as
             // normal movement. Larger jumps can recenter in a single batch.
             const double rollLimit = predicting ? (lod == 0 ? 1.40 * radius : std::numeric_limits<double>::infinity()) : radius;
-            if (phased && overdue > 0 && (tracksMotion ? liveOffset < rollLimit : overdue < radius)) {
+            if (windowPhased && overdue > 0 && (tracksMotion ? liveOffset < rollLimit : overdue < radius)) {
                 const auto previous = globalAnchors_[index].origin;
                 const double delta = origin[mostOverdueAxis] - previous[mostOverdueAxis];
-                const double chunkSpan = std::ldexp(gridChunkSize(densityShift_), std::max(0, lod - 3));
+                const double chunkSpan = std::ldexp(gridChunkSize(densityShift_), lod);
                 const double maxRoll = tracksMotion ? std::max(step, std::floor(std::min(0.48 * radius, chunkSpan) / step) * step)
                                                     : step;
                 origin = previous;
@@ -148,8 +169,9 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
             }
             next.push_back({origin, step});
             const auto box = Box{origin, origin + splat(step)}.expanded(splat(radius + margin));
-            windows.push_back({i, lod, box});
-            if (!phased) continue;
+            windows.push_back({i, lod, box, enabled});
+            if (!windowPhased) continue;
+            auto& choice = choices[i];
             const double urgency = overdue / radius;
             if (lod == 0 && overdue > 0) {
                 const Vec future = position + displacement;
@@ -158,43 +180,52 @@ std::set<Key> Clipmap::update(const std::vector<Vec>& invokers, bool global, std
                     globalWindows_[forecast.primary * windowCount].box.contains(position) &&
                     globalWindows_[forecast.primary * windowCount].box.expanded(splat(-0.12 * radius)).contains(future);
                 if (!primaryCovers && (liveOffset >= radius || (predicting && risk >= (primary ? 0.57 : 0.64)))) {
-                    const double priority = (liveOffset >= radius ? 4.0 : 0.0) + liveOffset / radius + risk * 0.45;
-                    // A following camera can have greater displacement than the
-                    // player. Serve it once the player's fine coverage has slack.
-                    const bool primaryChosen = fineWindow != noRoll && tracksMotion && fineWindow / windowCount == forecast.primary;
-                    if (primary || (!primaryChosen && priority > fineRisk)) { fineRisk = priority; fineWindow = index; }
+                    choice.fineWindow = index;
                 }
             }
             if (lod < nearLevels) {
-                if (urgency > nearOverdue) { nearOverdue = urgency; nearWindow = index; }
-            } else if (urgency > outerOverdue) { outerOverdue = urgency; outerWindow = index; }
-            if (lod == 0) fineBuffer &= globalWindows_[index].box.expanded(splat(-double(lod0Radius) / 2)).contains(invokers[i]);
+                if (urgency > choice.nearOverdue) { choice.nearOverdue = urgency; choice.nearWindow = index; }
+            } else if (urgency > choice.outerOverdue) { choice.outerOverdue = urgency; choice.outerWindow = index; }
+            if (lod == 0) choice.fineBuffer = globalWindows_[index].box.expanded(splat(-radius / 2)).contains(invokers[i]);
         }
 
-        // Prioritize the near field. Give a waiting outer window a turn when
-        // frequent near rolls still leave every invoker well inside its LOD0.
-        const bool doNear = nearWindow != noRoll && (outerWindow == noRoll || nearRolls_ < 3 || !fineBuffer);
-        const auto activeWindow = fineWindow != noRoll ? fineWindow : (doNear ? nearWindow : outerWindow);
-        nearRolls_ = phased && activeWindow != noRoll && activeWindow % windowCount < nearLevels && outerWindow != noRoll
-                     ? std::min(nearRolls_ + 1, 3) : 0;
+        // Roll one window per source, not one for the entire planet. A distant
+        // moving Invoker must not wait behind every other Invoker and camera.
+        // Keep near/outer fairness independent while merging the dirty slabs
+        // into a single balanced layout and atomic terrain publication.
+        std::vector<std::uint8_t> active(windows.size(), 0);
+        for (std::size_t i = 0; phased && i < choices.size(); ++i) {
+            const auto& choice = choices[i];
+            const bool doNear = choice.nearWindow != noRoll &&
+                (choice.outerWindow == noRoll || nearRolls_[i] < 3 || !choice.fineBuffer);
+            const auto selected = choice.fineWindow != noRoll ? choice.fineWindow :
+                (doNear ? choice.nearWindow : choice.outerWindow);
+            if (selected != noRoll) active[selected] = 1;
+            nearRolls_[i] = selected != noRoll && selected % windowCount < nearLevels && choice.outerWindow != noRoll
+                ? std::min(nearRolls_[i] + 1, 3) : 0;
+        }
         for (std::size_t i = 0; i < windows.size(); ++i) {
-            if (phased && i != activeWindow) {
+            const bool wasEnabled = i < globalWindows_.size() && globalWindows_[i].enabled;
+            if (phased && !active[i] && wasEnabled == windows[i].enabled) {
                 next[i] = globalAnchors_[i];
                 windows[i] = globalWindows_[i];
-            } else if (!sameRadius || i >= globalWindows_.size()) {
-                dirty.push_back({windows[i].box, windows[i].lod});
-            } else {
+            } else if (!sameRange || i >= globalWindows_.size()) {
+                if (windows[i].enabled) dirty.push_back({windows[i].box, windows[i].lod});
+            } else if (wasEnabled != windows[i].enabled) {
+                if (wasEnabled) dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
+                if (windows[i].enabled) dirty.push_back({windows[i].box, windows[i].lod});
+            } else if (windows[i].enabled) {
                 appendDifference(windows[i], globalWindows_[i].box, dirty);
                 appendDifference(globalWindows_[i], windows[i].box, dirty);
             }
         }
-        for (std::size_t i = sameRadius ? windows.size() : 0; i < globalWindows_.size(); ++i)
-            dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
-        changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits, elevationRange_);
+        for (std::size_t i = sameRange ? windows.size() : 0; i < globalWindows_.size(); ++i)
+            if (globalWindows_[i].enabled) dirty.push_back({globalWindows_[i].box, globalWindows_[i].lod});
+        changed = updatePlanetLayout(idealLayout_, layout_, windows, dirty, densityShift_, rebuild, visits, elevationRange_, planet_);
         if (!dirty.empty() || rebuild) ++windowRevision_;
         globalAnchors_ = std::move(next);
         globalWindows_ = std::move(windows);
-        lod0Radius_ = lod0Radius;
+        lod0Cells_ = lod0Cells;
         anchors_.clear();
         coverage_.clear();
         global_ = true;
@@ -270,6 +301,7 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
     if (global_) {
         const double limit = fieldSideLength / 2;
         for (const auto& w : globalWindows_) {
+            if (!w.enabled) continue;
             const Box box{max(splat(-limit), w.box.lo), min(splat(limit), w.box.hi)};
             if (hasVolume(box)) result.push_back({w.invoker, w.lod, box});
         }
@@ -286,6 +318,7 @@ std::vector<ClipmapWindow> Clipmap::windows() const {
 
 std::size_t Clipmap::bytes() const {
     return sizeof(*this) + anchors_.capacity() * sizeof(Key)
+         + nearRolls_.capacity() * sizeof(int)
          + globalAnchors_.capacity() * sizeof(GlobalAnchor) + globalWindows_.capacity() * sizeof(ClipmapWindow)
          + coverage_.size() * (sizeof(decltype(coverage_)::value_type) + mapNodeOverhead)
          + (layout_.size() + idealLayout_.size()) * (sizeof(Layout::value_type) + mapNodeOverhead);
@@ -294,41 +327,41 @@ std::size_t Clipmap::bytes() const {
 World::World(const Planet& planet, Method method, bool morton, double density, TerrainPreparation prepareTerrain)
     : physics(method, chunks), planet_(planet), method_(method), morton_(morton),
       densityShift_(voxelDensityShift(density)), publishedDensityShift_(densityShift_),
-      clipmap_(densityShift_, planet.elevationRange()), prepareTerrain_(std::move(prepareTerrain)) {
+      clipmap_(densityShift_, planet.elevationRange(), &planet), prepareTerrain_(std::move(prepareTerrain)) {
     publishedClipmapBytes_ = clipmap_.bytes();
 }
 
-void World::setLod0Radius(std::uint32_t radius) {
-    if (!validLod0Radius(radius)) throw std::invalid_argument("Invalid LOD0 radius");
-    lod0Radius_ = radius;
+void World::setLod0Cells(std::uint32_t cells) {
+    if (!validLod0Cells(cells)) throw std::invalid_argument("LOD0 range must be a power-of-two cell count, at least 32");
+    lod0Cells_ = cells;
 }
 
 World::Batch World::prepareUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                                  std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
+                                  std::uint32_t lod0Cells, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
     try {
         // Destruction of VDB trees and mesh BVHs can be expensive. Detach them
         // at publication and free them before the next background build.
         retiredColliders_.clear();
         retiredChunks_.clear();
-        auto batch = planUpdate(sources, global, densityShift, lod0Radius, start, rolling, forecast);
+        auto batch = planUpdate(sources, global, densityShift, lod0Cells, start, rolling, forecast);
         build(batch, clipmap_.layout());
         if (prepareTerrain_) prepareTerrain_(chunks, batch.staged, batch.remove);
         recoverPlan_ = false;
         return batch;
     } catch (...) {
-        clipmap_ = Clipmap(densityShift, planet_.elevationRange());
+        clipmap_ = Clipmap(densityShift, planet_.elevationRange(), &planet_);
         recoverPlan_ = true;
         throw;
     }
 }
 
 World::Batch World::planUpdate(const std::vector<Vec>& sources, bool global, int densityShift,
-                              std::uint32_t lod0Radius, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
+                              std::uint32_t lod0Cells, Clock::time_point start, bool rolling, const ClipmapForecast& forecast) {
     Batch batch{};
     batch.start = start;
     clipmap_.setDensityShift(densityShift);
     const auto windowRevision = clipmap_.windowRevision();
-    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits, lod0Radius, rolling, forecast);
+    const auto changed = clipmap_.update(sources, global, batch.stats.windowVisits, lod0Cells, rolling, forecast);
     batch.stats.windowsChanged = clipmap_.windowRevision() != windowRevision || recoverPlan_;
     const auto& layout = clipmap_.layout();
     const auto& published = chunks;
@@ -401,6 +434,7 @@ void World::build(Batch& batch, const Layout& layout) {
 
 WorldStats World::publish(Batch batch) {
     const auto activation = Clock::now();
+    if (!batch.remove.empty() || !batch.staged.empty()) ++terrainRevision_;
     for (const Key key : batch.remove) {
         const auto old = chunks.find(key);
         --lodCounts_[old->second->lod];
@@ -412,7 +446,8 @@ WorldStats World::publish(Batch batch) {
     }
     while (!batch.staged.empty()) {
         auto inserted = chunks.insert(batch.staged.extract(batch.staged.begin()));
-        const auto& chunk = *inserted.position->second;
+        auto& chunk = *inserted.position->second;
+        chunk.revision = terrainRevision_;
         ++lodCounts_[chunk.lod];
         fieldBytes_ += chunk.fieldBytes;
         meshBytes_ += chunk.mesh.capacity() * sizeof(Triangle);
@@ -421,19 +456,19 @@ WorldStats World::publish(Batch batch) {
     }
     batch.stats.physicsLoadMs = milliseconds(activation);
     publishedDensityShift_ = clipmap_.densityShift();
-    publishedLod0Radius_ = clipmap_.lod0Radius();
+    publishedLod0Cells_ = clipmap_.lod0Cells();
     publishedClipmapBytes_ = clipmap_.bytes();
     if (batch.stats.windowsChanged) publishedWindows_ = clipmap_.windows();
     batch.stats.updateMs = milliseconds(batch.start);
     return batch.stats;
 }
 
-WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera) {
+WorldStats World::update(const std::vector<Vec>& invokers, bool global, std::optional<Vec> camera, ClipmapForecast forecast) {
     if (building_.valid() || ready_) throw std::logic_error("An asynchronous Clipmap update is pending");
     const auto start = Clock::now();
     auto sources = invokers;
     if (camera) sources.push_back(*camera);
-    return publish(prepareUpdate(sources, global, densityShift_, lod0Radius_, start, false, {}));
+    return publish(prepareUpdate(sources, global, densityShift_, lod0Cells_, start, false, forecast));
 }
 
 bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec camera, bool rolling, ClipmapForecast forecast) {
@@ -443,9 +478,9 @@ bool World::requestUpdate(const std::vector<Vec>& invokers, bool global, Vec cam
     sources.push_back(camera);
     // Published chunks are read-only until this worker finishes. Only the worker
     // touches the planner; queries and physics continue using the published chunks.
-    building_ = std::async(std::launch::async, [this, densityShift = densityShift_, lod0Radius = lod0Radius_,
+    building_ = std::async(std::launch::async, [this, densityShift = densityShift_, lod0Cells = lod0Cells_,
             global, start, rolling, sources = std::move(sources), forecast = std::move(forecast)] {
-        return prepareUpdate(sources, global, densityShift, lod0Radius, start, rolling, forecast);
+        return prepareUpdate(sources, global, densityShift, lod0Cells, start, rolling, forecast);
     });
     return true;
 }
@@ -494,9 +529,10 @@ std::array<Vec, 3> frameAt(Vec up) {
 }
 
 Shape sampleShape(int kind, Vec up) {
-    if (kind == 1) return {ShapeKind::Sphere, {13, 0, 0}, frameAt(up)};
-    if (kind == 2) return {ShapeKind::Capsule, {9, 0, 12}, frameAt(up)};
-    return {ShapeKind::Box, {15, 11, 10}, frameAt(up)};
+    if (kind == 1) return {ShapeKind::Sphere, {0.5, 0, 0}, frameAt(up)};
+    // Radius 0.5m + a 1m cylindrical segment gives a 2m total height.
+    if (kind == 2) return {ShapeKind::Capsule, {0.5, 0, 0.5}, frameAt(up)};
+    return {ShapeKind::Box, {0.5, 0.5, 1.0}, frameAt(up)};
 }
 
 }  // namespace voxel

@@ -152,6 +152,7 @@ void SweepInspector::attachBackend(World& backend, Method method, bool morton, d
 }
 
 void SweepInspector::clear() {
+    backend_ = nullptr;
     mesh_.reset();
     casts_.clear();
     tally_ = SweepTally{};
@@ -322,7 +323,7 @@ void SweepInspector::validateSweep(const std::vector<Vec>& invokers) {
 
 void SweepInspector::onTerrainPublished(bool force, const WorldStats& stats,
                                          const std::vector<Vec>& invokers, Vec cameraEye) {
-    if (!mesh_ || !(force || stats.build.built != 0 || stats.build.removed != 0)) return;
+    if (!mesh_ || !backend_ || !(force || stats.build.built != 0 || stats.build.removed != 0)) return;
     mesh_->update(invokers, true, cameraEye);
     if (active_) {
         resweepCurrent();
@@ -331,7 +332,7 @@ void SweepInspector::onTerrainPublished(bool force, const WorldStats& stats,
 }
 
 void SweepInspector::resweepCurrent() {
-    if (casts_.empty()) return;
+    if (casts_.empty() || !backend_) return;
     SweepCast& cast = casts_[castIndex_];
     cast.hit = backend_->physics.sweep(cast.shape, cast.from, cast.to);
     cast.hasMesh = mesh_ != nullptr;
@@ -454,9 +455,11 @@ void SweepInspector::appendOverlay(std::vector<Vertex>& lines, const Camera& vie
 void SweepInspector::appendShapes(std::vector<Vertex>& objects) const {
     if (casts_.empty()) return;
     const SweepCast& cast = casts_[castIndex_];
-    const auto meshTint = sweepColor(Vec{1.0, 0.10, 0.32}, 255);
-    const auto backendTint = sweepColor(Vec{0.05, 1.0, 0.85}, 255);
-    const auto startTint = sweepColor(Vec{0.34, 0.42, 0.52}, 255);
+    // Solid bodies must use the ordinary body code 254; 255 is reserved for the
+    // cloud pass in the deferred shader and would composite the shape away.
+    const auto meshTint = sweepColor(Vec{1.0, 0.10, 0.32}, 254);
+    const auto backendTint = sweepColor(Vec{0.05, 1.0, 0.85}, 254);
+    const auto startTint = sweepColor(Vec{0.34, 0.42, 0.52}, 254);
     auto centerOf = [&](const Hit& hit) {
         return hit.state == Hit::State::Contact ? cast.from + (cast.to - cast.from) * hit.fraction : cast.from;
     };
