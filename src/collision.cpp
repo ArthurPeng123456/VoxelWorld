@@ -40,7 +40,7 @@ double Shape::distance(Vec offset) const {
 namespace {
 
 constexpr double epsilon = 1e-6;
-constexpr double sweepTolerance = 0.75;
+constexpr double sweepTolerance = 0.1;
 constexpr int sweepBudget = 12000;
 
 template<class Operation>

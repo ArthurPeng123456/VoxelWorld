@@ -531,7 +531,7 @@ std::array<Vec, 3> frameAt(Vec up) {
 Shape sampleShape(int kind, Vec up) {
     if (kind == 1) return {ShapeKind::Sphere, {0.5, 0, 0}, frameAt(up)};
     // Radius 0.5m + a 1m cylindrical segment gives a 2m total height.
-    if (kind == 2) return {ShapeKind::Capsule, {0.5, 0, 0.5}, frameAt(up)};
+    if (kind == 2) return {ShapeKind::Capsule, {0.25, 0, 1.0}, frameAt(up)};
     return {ShapeKind::Box, {0.5, 0.5, 1.0}, frameAt(up)};
 }
 
