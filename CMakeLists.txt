@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
+
+if(POLICY CMP0144)
+    cmake_policy(SET CMP0144 NEW)
+endif()
+
 project(VoxelWorld LANGUAGES CXX)
 
 # Bullet's ABI and every translation unit must agree on btScalar precision.
@@ -37,36 +42,38 @@ else()
     set(BULLET_INCLUDE_DIRS "${bullet_SOURCE_DIR}/src")
     set(BULLET_LIBRARIES BulletDynamics BulletCollision LinearMath)
 endif()
+# ========== oneTBB：与参考项目同一套本地安装 ==========
+set(TBB_ROOT "D:/software/tbb/tbb/2023.2" CACHE PATH "oneTBB 安装根目录")
+if(NOT TBB_DIR)
+    set(TBB_DIR "${TBB_ROOT}/lib/cmake/tbb" CACHE PATH "TBB CMake package directory" FORCE)
+endif()
 find_package(TBB REQUIRED)
 find_package(Threads REQUIRED)
+
+# 禁止 vcpkg 对 OpenVDB 自动查找依赖
+set(VCPKG_HOOK_OPENPACKAGE_OpenVDB OFF CACHE INTERNAL "")
+set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
+
+# ========== 自动选择 Debug / Release OpenVDB 路径 ==========
+set(VOXEL_OPENVDB_INSTALL_ROOT "D:/UE/openvdb-14.0.0/out/install" CACHE PATH "OpenVDB installation root containing x64-Debug and x64-Release")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_voxel_openvdb_default_root "${VOXEL_OPENVDB_INSTALL_ROOT}/x64-Debug")
+else()
+    set(_voxel_openvdb_default_root "${VOXEL_OPENVDB_INSTALL_ROOT}/x64-Release")
+endif()
+set(VOXEL_OPENVDB_ROOT "${_voxel_openvdb_default_root}" CACHE PATH "OpenVDB installation prefix")
+set(OPENVDB_ROOT "${VOXEL_OPENVDB_ROOT}")
+
+if(NOT EXISTS "${OPENVDB_ROOT}/lib/cmake/OpenVDB/OpenVDBConfig.cmake")
+    message(FATAL_ERROR
+        "OpenVDB CMake package not found: ${OPENVDB_ROOT}/lib/cmake/OpenVDB/OpenVDBConfig.cmake\n"
+        "Build and install OpenVDB, or set -DOPENVDB_ROOT=<install-prefix> / -DVOXEL_OPENVDB_INSTALL_ROOT=<root>.")
+endif()
+
+list(PREPEND CMAKE_PREFIX_PATH "${OPENVDB_ROOT}")
+find_package(OpenVDB CONFIG REQUIRED)
+
 set(VOXEL_OPENVDB_DEBUG_LIBRARY "" CACHE FILEPATH "Matching MSVC Debug library for the bundled OpenVDB")
-if(NOT (MSVC AND VOXEL_OPENVDB_DEBUG_LIBRARY))
-    find_package(OpenVDB CONFIG QUIET)
-endif()
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_MODULE_DIR FindOpenVDB.cmake PATH_SUFFIXES share/openvdb lib/cmake/OpenVDB)
-    if(OPENVDB_MODULE_DIR)
-        list(APPEND CMAKE_MODULE_PATH "${OPENVDB_MODULE_DIR}")
-        find_package(OpenVDB MODULE REQUIRED)
-    endif()
-endif()
-if(NOT TARGET OpenVDB::openvdb)
-    find_path(OPENVDB_INCLUDE_DIR openvdb/openvdb.h REQUIRED)
-    find_library(OPENVDB_LIBRARY openvdb REQUIRED)
-    find_package(Imath CONFIG QUIET)
-    add_library(OpenVDB::openvdb UNKNOWN IMPORTED)
-    set_target_properties(OpenVDB::openvdb PROPERTIES
-        IMPORTED_LOCATION "${OPENVDB_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${OPENVDB_INCLUDE_DIR}")
-    if(TARGET Imath::Imath)
-        target_link_libraries(OpenVDB::openvdb INTERFACE Imath::Imath)
-    else()
-        find_library(ILMBASE_HALF_LIBRARY Half)
-        if(ILMBASE_HALF_LIBRARY)
-            target_link_libraries(OpenVDB::openvdb INTERFACE "${ILMBASE_HALF_LIBRARY}")
-        endif()
-    endif()
-endif()
 
 if(MSVC AND VOXEL_OPENVDB_DEBUG_LIBRARY)
     # OpenVDB's Find module exposes only one library location on Windows.
@@ -160,4 +167,80 @@ elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
 endif()
 if(WIN32)
     add_test(NAME voxel_gpu_precision COMMAND voxel_gpu_precision)
+endif()
+
+# ========== 复制当前配置对应的 OpenVDB dll ==========
+set(OPENVDB_BIN "${OPENVDB_ROOT}/bin")
+file(GLOB OPENVDB_DLLS "${OPENVDB_BIN}/*.dll")
+
+add_custom_command(TARGET voxel_world POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${OPENVDB_DLLS}
+    $<TARGET_FILE_DIR:voxel_world>
+)
+if(WIN32)
+    add_custom_command(TARGET VoxelWorldViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENVDB_DLLS}
+        $<TARGET_FILE_DIR:VoxelWorldViewer>
+    )
+endif()
+
+# ========== oneTBB DLL 自动拷贝（根目录与参考项目一致）==========
+set(TBB_OFFLINE_ROOT "${TBB_ROOT}" CACHE PATH "oneTBB 安装根目录（留空则自动探测）")
+
+set(_tbb_candidate_roots "")
+if(TBB_OFFLINE_ROOT)
+    list(APPEND _tbb_candidate_roots "${TBB_OFFLINE_ROOT}")
+endif()
+if(TBB_DIR)
+    # TBB_DIR 类似 <root>/lib/cmake/tbb，向上三层即安装根
+    get_filename_component(_tbb_root_from_config "${TBB_DIR}/../../.." ABSOLUTE)
+    list(APPEND _tbb_candidate_roots "${_tbb_root_from_config}")
+endif()
+if(DEFINED ENV{ONEAPI_ROOT})
+    list(APPEND _tbb_candidate_roots "$ENV{ONEAPI_ROOT}/tbb/latest")
+endif()
+list(APPEND _tbb_candidate_roots "C:/Program Files (x86)/Intel/oneAPI/tbb/latest")
+
+set(TBB_DLL_DEBUG "")
+set(TBB_DLL_RELEASE "")
+foreach(_root IN LISTS _tbb_candidate_roots)
+    if(_root AND IS_DIRECTORY "${_root}")
+        # 离线版 dll 可能位于 bin/ 或 redist/intel64/vc14/
+        foreach(_sub "bin" "redist/intel64/vc14" "bin/intel64/vc14")
+            if(NOT TBB_DLL_DEBUG AND EXISTS "${_root}/${_sub}/tbb12_debug.dll")
+                set(TBB_DLL_DEBUG "${_root}/${_sub}/tbb12_debug.dll")
+            endif()
+            if(NOT TBB_DLL_RELEASE AND EXISTS "${_root}/${_sub}/tbb12.dll")
+                set(TBB_DLL_RELEASE "${_root}/${_sub}/tbb12.dll")
+            endif()
+        endforeach()
+    endif()
+endforeach()
+
+if(NOT TBB_DLL_DEBUG AND NOT TBB_DLL_RELEASE)
+    message(WARNING
+        "未找到 oneTBB 的 tbb12.dll / tbb12_debug.dll，跳过 DLL 拷贝。"
+        "若运行时报缺少 tbb12*.dll，请用 -DTBB_OFFLINE_ROOT=<oneTBB 安装根目录> 指定。")
+else()
+    if(NOT TBB_DLL_DEBUG)
+        set(TBB_DLL_DEBUG "${TBB_DLL_RELEASE}")
+    endif()
+    if(NOT TBB_DLL_RELEASE)
+        set(TBB_DLL_RELEASE "${TBB_DLL_DEBUG}")
+    endif()
+    message(STATUS "oneTBB DLL: ${TBB_DLL_DEBUG} / ${TBB_DLL_RELEASE}")
+    set(TBB_DLL "$<IF:$<CONFIG:Debug>,${TBB_DLL_DEBUG},${TBB_DLL_RELEASE}>")
+
+    add_custom_command(TARGET voxel_world POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TBB_DLL}" "$<TARGET_FILE_DIR:voxel_world>/"
+        COMMENT "Copy oneTBB dll..."
+    )
+    if(WIN32)
+        add_custom_command(TARGET VoxelWorldViewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TBB_DLL}" "$<TARGET_FILE_DIR:VoxelWorldViewer>/"
+            COMMENT "Copy oneTBB dll for viewer..."
+        )
+    endif()
 endif()
