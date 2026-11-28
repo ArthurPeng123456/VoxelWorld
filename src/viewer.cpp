@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -305,6 +306,53 @@ void appendBeacon(std::vector<Vertex>& batch, Vec surface, double size, bool sel
     }
 }
 
+void appendLine(std::vector<Vertex>& batch, Vec a, Vec b, std::uint32_t material) {
+    batch.push_back(vertex(a, {0, 0, 1}, material));
+    batch.push_back(vertex(b, {0, 0, 1}, material));
+}
+
+void appendShapeLines(std::vector<Vertex>& lines, const Shape& shape, Vec center, std::uint32_t material) {
+    if (shape.kind == ShapeKind::Box) {
+        for (int i = 0; i < 8; ++i) for (int axis = 0; axis < 3; ++axis) {
+            if (i & (1 << axis)) continue;
+            Vec a{(i & 1) ? shape.size.x : -shape.size.x,
+                  (i & 2) ? shape.size.y : -shape.size.y,
+                  (i & 4) ? shape.size.z : -shape.size.z};
+            Vec b = a;
+            b[axis] = shape.size[axis];
+            appendLine(lines, center + shape.direction(a), center + shape.direction(b), material);
+        }
+        return;
+    }
+    constexpr int segments = 32;
+    const double radius = shape.size.x;
+    const double half = shape.kind == ShapeKind::Capsule ? shape.size.z : 0;
+    auto circle = [&](Vec offset, Vec u, Vec v, double start, double span) {
+        for (int i = 0; i < segments; ++i) {
+            const double a = start + span * i / segments, b = start + span * (i + 1) / segments;
+            const Vec p = offset + (u * std::cos(a) + v * std::sin(a)) * radius;
+            const Vec q = offset + (u * std::cos(b) + v * std::sin(b)) * radius;
+            appendLine(lines, center + shape.direction(p), center + shape.direction(q), material);
+        }
+    };
+    if (shape.kind == ShapeKind::Sphere) {
+        circle({}, {1, 0, 0}, {0, 1, 0}, 0, 2 * pi);
+        circle({}, {1, 0, 0}, {0, 0, 1}, 0, 2 * pi);
+        circle({}, {0, 1, 0}, {0, 0, 1}, 0, 2 * pi);
+    } else {
+        for (int side : {-1, 1}) {
+            const Vec offset{0, 0, side * half};
+            circle(offset, {1, 0, 0}, {0, 1, 0}, 0, 2 * pi);
+            circle(offset, {1, 0, 0}, {0, 0, double(side)}, 0, pi);
+            circle(offset, {0, 1, 0}, {0, 0, double(side)}, 0, pi);
+        }
+        for (Vec radial : {Vec{radius, 0, 0}, Vec{-radius, 0, 0}, Vec{0, radius, 0}, Vec{0, -radius, 0}}) {
+            appendLine(lines, center + shape.direction(radial + Vec{0, 0, -half}),
+                       center + shape.direction(radial + Vec{0, 0, half}), material);
+        }
+    }
+}
+
 Vec moveOnPlanet(const Planet& planet, Vec position, Vec tangent, double meters) {
     const double angle = meters / length(position);
     return planet.surface(unit(unit(position) * std::cos(angle) + tangent * std::sin(angle)));
@@ -516,6 +564,7 @@ public:
 
 private:
     struct VisibleBody { std::size_t index; Shape shape; std::uint32_t material; };
+    struct QueryResult { int kind; Vec from, to; Shape shape; Hit hit; };
     struct TerrainPage { std::set<Key> chunks; std::size_t triangles{}; };
     struct PreparedTerrainPage {
         Key key;
@@ -641,6 +690,7 @@ private:
         nextTerrainUpload_ = 0;
         simulationTime_ = 0;
         shapes_.clear();
+        queryResult_.reset();
         controlling_ = manualControl_ = false;
         cameraGround_ = {};
         returning_.assign(std::size_t(opts_.invoker.count), 0);
@@ -904,6 +954,32 @@ private:
         if (showRanges_ && (force || stats.windowsChanged)) refreshRanges();
     }
 
+    static constexpr std::array<const wchar_t*, 4> queryLabels{L"Ray", L"Sphere", L"Capsule", L"Box"};
+
+    void cycleQueryKind() {
+        queryKind_ = (queryKind_ + 1) % 4;
+        updateFooter();
+    }
+
+    void clearQuery() {
+        queryResult_.reset();
+        refreshRanges();
+        updateFooter();
+    }
+
+    void castQuery() {
+        const Camera view = camera();
+        const double distance = surface_ ? surfaceDistance_ * 2 + 5000
+                                         : std::max(5000.0, length(view.eye) - planetRadius + 6000);
+        const Vec to = view.eye + view.forward * distance;
+        const Shape shape = sampleShape(std::max(1, queryKind_), unit(invokers_[selected_]));
+        const Hit hit = queryKind_ == 0 ? world_->physics.ray(view.eye, to)
+                                        : world_->physics.sweep(shape, view.eye, to);
+        queryResult_ = QueryResult{queryKind_, view.eye, to, shape, hit};
+        refreshRanges();
+        updateFooter();
+    }
+
     void refreshRanges() {
         std::vector<Vertex> lines;
         if (showRanges_) {
@@ -918,6 +994,21 @@ private:
                     lines.push_back(vertex(a, {0, 0, 1}, tint));
                     lines.push_back(vertex(b, {0, 0, 1}, tint));
                 }
+            }
+        }
+        if (queryResult_) {
+            const auto& query = *queryResult_;
+            const bool contact = query.hit.state == Hit::State::Contact;
+            const bool unresolved = query.hit.state == Hit::State::Unresolved;
+            const Vec end = contact || unresolved ? query.from + (query.to - query.from) * query.hit.fraction : query.to;
+            appendLine(lines, query.from, end, color({0.2, 0.85, 1}, 255));
+            if (query.kind != 0) appendShapeLines(lines, query.shape, end, color({1, 0.8, 0.2}, 255));
+            if (contact || unresolved) {
+                const Vec point = contact ? query.hit.position : end;
+                const double size = std::max(20.0, length(point - query.from) * 0.02);
+                const auto tint = color(contact ? Vec{1, 0.25, 0.2} : Vec{1, 0.65, 0.1}, 255);
+                for (Vec axis : frameAt(unit(point))) appendLine(lines, point - axis * size, point + axis * size, tint);
+                if (contact) appendLine(lines, point, point + query.hit.normal * (size * 3), color({0.3, 1, 0.35}, 255));
             }
         }
         renderer_->setClipmapLines(lines);
@@ -2322,6 +2413,9 @@ private:
             updateFooter();
         }
         else if (code == 'C') action(FreeView);
+        else if (code == 'X') clearQuery();
+        else if (!freeView_ && code == 'Q') cycleQueryKind();
+        else if (!freeView_ && code == 'E') castQuery();
         else if (code == 'B') action(Drop);
         else if (code == 'R') action(Reset);
         else if (code == VK_SPACE) action(Pause);
@@ -2400,6 +2494,17 @@ private:
         if (fps_ > 0) info << L"   |   " << std::setprecision(0) << fps_ << L" FPS";
         if (paused_) info << L"   |   Paused";
         if (renderer_->isWarp()) info << L"   |   WARP";
+        if (queryResult_) {
+            const auto& q = *queryResult_;
+            info << L"   |   Query " << queryLabels[q.kind] << L": ";
+            if (q.hit.state == Hit::State::Contact) {
+                info << (q.hit.initial ? L"initial contact" : L"hit") << L"  distance " << std::fixed << std::setprecision(1)
+                     << q.hit.fraction * length(q.to - q.from) << L" m  point ("
+                     << q.hit.position.x << L", " << q.hit.position.y << L", " << q.hit.position.z << L")  normal ("
+                     << std::setprecision(2) << q.hit.normal.x << L", " << q.hit.normal.y << L", " << q.hit.normal.z << L")";
+            } else if (q.hit.state == Hit::State::Unresolved) info << L"unresolved";
+            else info << L"miss (loaded chunks only)";
+        }
         status_ = info.str();
         const double spacing = chunkSize / fineCells * world_->voxelDensity();
         std::wostringstream legend;
@@ -2502,7 +2607,7 @@ private:
             ? controlledText.c_str()
             : lodTint_ || showRanges_
             ? lodLegend_.c_str()
-            : L"Drag to orbit / Wheel zoom / Tab Invoker / Space pause / B drop / J shadows / [ ] exposure -/+0.5 EV";
+            : L"Drag to orbit / Wheel zoom / Tab Invoker / Space pause / B drop / J shadows / [ ] exposure / Q query type / E cast / X clear";
         row.bottom = client.bottom - 6;
         DrawTextW(dc, controls, -1, &row, DT_WORDBREAK | DT_NOPREFIX);
         RECT cameraRow{panel.left, panel.top, panel.right, panel.top + 18};
@@ -2658,6 +2763,8 @@ private:
     std::uint32_t lod0Cells_{defaultLod0Cells};
     std::vector<VisibleBody> shapes_;
     std::vector<Vertex> objects_;
+    std::optional<QueryResult> queryResult_;
+    int queryKind_{0};
     std::map<Key, TerrainPage> terrainPages_;
     std::vector<PreparedTerrainPage> preparedTerrain_;
     std::size_t nextTerrainUpload_{};
