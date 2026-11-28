@@ -348,6 +348,38 @@ Viewer 的 `--capture-clipmaps DIRECTORY --invokers 8 --lod0-range 64` 验证增
 
 压力入口保留指定的间隔、range、速度及渲染参数，不自动降低负载。例如 `--capture-invoker-stress results-stress --invokers 256 --lod0-range 32` 使用较小覆盖范围发起 256 点完整数据压测；默认 range=128，range=256 是另一种显著更重的配置，应分开记录，不把 range=32 或仅少数区域驻留的结果作为默认范围的性能结论。全量预热超出机器资源时不算验证通过。`--capture-invokers` 的 10000 状态测试仍不属于全量地形压力测试。
 
+### 推送到 GitHub 分支
+
+首次把本地代码推送到远端的一个新分支（示例远程名 `mine`、分支名 `dev`，按实际替换）：
+
+```powershell
+cd D:\work\VoxelWorld
+git remote add mine https://github.com/ArthurPeng123456/VoxelWorld.git
+git switch -c dev
+git push -u mine dev
+```
+
+- 若已有 `origin` 指向其他仓库，新增独立远程不会覆盖它；不要直接 `git push origin` 到无权限的远端。
+- 新分支基于当前 `main`；推送成功后在 GitHub 网页点 **Compare & pull request** 合并到 `main`。
+- 若远端仓库已初始化（带 README 等）导致 non-fast-forward，先 `git pull mine main --rebase` 再推送。
+
+#### 连接 GitHub 超时（代理）
+
+报错 `Failed to connect to github.com port 443 ... Couldn't connect to server` 时，通常是本机开着 Clash 等系统代理，但 **Git 命令行默认不读取 Windows 系统代理**，直连被阻断。先在代理软件设置里确认本地端口（Clash Verge 混合端口常为 `7897`，旧版 Clash 为 `7890`），再只为 GitHub 配置 Git 代理，不影响其他远端：
+
+```powershell
+# 查看当前代理配置
+git config --global --get http.https://github.com.proxy
+
+# 设置代理（端口改成代理软件实际端口）
+git config --global http.https://github.com.proxy http://127.0.0.1:7897
+
+# 取消代理，恢复直连
+git config --global --unset http.https://github.com.proxy
+```
+
+端口只改 `127.0.0.1:` 后面的数字，`http://` 前缀和 IP 保持不变。代理软件关闭或端口变更后，需要同步更新或取消该配置。可用 `Test-NetConnection 127.0.0.1 -Port 7897` 确认端口仍在监听。
+
 ### 浏览器预览
 
 双击生成的 `VoxelWorld.html` 可离线查看同一份覆盖全星球的多层 Marching Cubes 网格。支持全星球、地表、Invoker 位置切换、LOD 着色和窗口线框。线框使用 OBJ 导出的窗口坐标，包括当时的摄像机 Invoker。此预览展示导出时的地形快照，实时碰撞、动态块更新和 df64 大气由原生查看器执行。预览保留 double 坐标，通过高低位顶点和相机相对消减显示，避免旧的 Int16 格式在地球尺度下溢出。
